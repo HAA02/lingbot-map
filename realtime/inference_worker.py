@@ -47,6 +47,68 @@ def _voxel_downsample(xyz: np.ndarray, rgb: np.ndarray, voxel_size: float = 0.02
     return (xyz_out / c).astype(np.float32), (rgb_out / c).clip(0, 255).astype(np.uint8)
 
 
+def _voxel_fuse_weighted(
+    xyz: np.ndarray, rgb: np.ndarray, conf: np.ndarray,
+    voxel_size: float = 0.025, min_obs: int = 1,
+):
+    """Confidence-weighted voxel fusion — multi-view observations of the same
+    surface collapse into one point at the weighted-mean position, with color
+    drawn from the highest-confidence observation in the cell.
+
+    Args:
+        xyz: (N, 3) world-frame points.
+        rgb: (N, 3) uint8 colors.
+        conf: (N,) per-point depth confidence (e.g., from depth_conf head).
+        voxel_size: cell edge in meters.
+        min_obs: minimum number of observations per voxel to keep (1 = keep all).
+
+    Returns:
+        (M, 3) xyz, (M, 3) rgb, (M,) accumulated weight per voxel.
+    """
+    keys = np.floor(xyz / voxel_size).astype(np.int32)
+    packed = (keys[:, 0].astype(np.int64) * 65536 + keys[:, 1].astype(np.int64)) * 65536 + keys[:, 2].astype(np.int64)
+    _, inv, counts = np.unique(packed, return_inverse=True, return_counts=True)
+    n = len(counts)
+
+    w = np.clip(conf, 1e-3, None).astype(np.float64)
+    sumw = np.zeros(n, dtype=np.float64)
+    sumxyz = np.zeros((n, 3), dtype=np.float64)
+    np.add.at(sumw, inv, w)
+    np.add.at(sumxyz, inv, xyz.astype(np.float64) * w[:, None])
+    xyz_out = sumxyz / sumw[:, None]
+
+    # Color: take the highest-confidence observation in each voxel
+    # (more robust than mean — preserves edge sharpness).
+    # Vectorized argmax-per-group via sort + reduce-last-occurrence.
+    order = np.argsort(w, kind="stable")  # ascending; best (largest w) appears last in each group
+    inv_sorted = inv[order]
+    # For each voxel, the last appearance of inv_sorted == voxel gives the highest-w index.
+    best_idx_in_order = np.full(n, -1, dtype=np.int64)
+    best_idx_in_order[inv_sorted] = np.arange(len(order))  # overwrites earlier with later
+    rgb_out = rgb[order[best_idx_in_order]]
+
+    if min_obs > 1:
+        keep = counts >= min_obs
+        xyz_out = xyz_out[keep]; rgb_out = rgb_out[keep]; sumw = sumw[keep]
+    return xyz_out.astype(np.float32), rgb_out, sumw.astype(np.float32)
+
+
+def _radius_outlier_filter(xyz: np.ndarray, rgb: np.ndarray,
+                           radius: float = 0.05, min_neighbors: int = 4):
+    """Drop points that have fewer than `min_neighbors` other points within
+    `radius`. Removes floating noise from multi-view depth disagreements.
+    Uses scipy cKDTree for C-speed neighbor counting."""
+    if xyz.shape[0] < min_neighbors + 1:
+        return xyz, rgb
+    from scipy.spatial import cKDTree
+    tree = cKDTree(xyz)
+    # count_neighbors against self → each point counts itself too, so we
+    # require min_neighbors + 1 from the query.
+    counts = tree.query_ball_point(xyz, r=radius, return_length=True)
+    keep = counts >= (min_neighbors + 1)
+    return xyz[keep], rgb[keep]
+
+
 def _preprocess_bgr(bgr: np.ndarray, target_w: int = 518, patch: int = 14) -> torch.Tensor:
     """BGR uint8 (H, W, 3) -> RGB float tensor (3, H', W'), values in [0,1].
 
@@ -335,8 +397,8 @@ class InferenceWorker:
         wpc = dc.detach().cpu().numpy() if dc is not None else None
 
         # Demo-style filtering: keep points with depth_conf > conf_threshold (1.5).
-        # Same as viser_wrapper.py's `(conf >= threshold_val) & (conf > 0.1)`.
-        all_xyz, all_rgb = [], []
+        # Carry confidence through to fusion as observation weight.
+        all_xyz, all_rgb, all_conf = [], [], []
         for i in range(N):
             pts = wp[i].reshape(-1, 3)
             cols = thumbs[i].reshape(-1, 3).astype(np.uint8)
@@ -353,15 +415,29 @@ class InferenceWorker:
                     idx, self.max_points_per_frame, replace=False)
             all_xyz.append(pts[idx])
             all_rgb.append(cols[idx])
+            if conf is not None:
+                all_conf.append(conf[idx])
+            else:
+                all_conf.append(np.ones(idx.size, dtype=np.float32))
 
         if not all_xyz:
             return None
-        xyz = np.concatenate(all_xyz, axis=0).astype(np.float32)
-        rgb = np.concatenate(all_rgb, axis=0).astype(np.uint8)
+        xyz  = np.concatenate(all_xyz,  axis=0).astype(np.float32)
+        rgb  = np.concatenate(all_rgb,  axis=0).astype(np.uint8)
+        conf = np.concatenate(all_conf, axis=0).astype(np.float32)
 
-        # Voxel downsample at 8 mm: dedupes overlapping observations from different
-        # frames hitting the same surface, but small enough to preserve detail.
-        xyz, rgb = _voxel_downsample(xyz, rgb, voxel_size=0.008)
+        # Tier 1 — confidence-weighted voxel fusion at 1.5 cm.
+        # Multi-view observations of the same surface collapse to one point.
+        # Keep all voxels (min_obs=1) so unique observations survive; the
+        # radius filter below handles isolated noise instead.
+        n_before = xyz.shape[0]
+        xyz, rgb, weights = _voxel_fuse_weighted(xyz, rgb, conf,
+                                                  voxel_size=0.015, min_obs=1)
+        n_voxel = xyz.shape[0]
+        # Radius outlier filter: drop floaters with <3 neighbors in 4 cm.
+        xyz, rgb = _radius_outlier_filter(xyz, rgb, radius=0.04, min_neighbors=3)
+        log.info("Tier1 fusion: %d → voxel %d → outlier %d points",
+                 n_before, n_voxel, xyz.shape[0])
 
         # No coordinate transform — pass OpenCV world coords directly (same as demo/viser).
         # The Three.js viewer handles orientation via camera positioning.
