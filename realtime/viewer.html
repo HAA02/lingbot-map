@@ -115,6 +115,45 @@ let bounds = null;  // {min:[x,y,z], max:[x,y,z]}
 const camGroup = new THREE.Group();
 scene.add(camGroup);
 let camCount = 0;
+let meshObj = null;   // LBM1 mesh; replaces the point cloud when present
+
+function installMesh(verts, vrgb, faces) {
+  // OpenCV → Three.js: flip Y and Z in vertex positions.
+  const V = verts.length / 3;
+  const pos = new Float32Array(verts.length);
+  const col = new Float32Array(verts.length);
+  let mn = [verts[0], -verts[1], -verts[2]];
+  let mx = [verts[0], -verts[1], -verts[2]];
+  for (let i = 0; i < V; i++) {
+    const x = verts[i*3], y = -verts[i*3+1], z = -verts[i*3+2];
+    pos[i*3] = x; pos[i*3+1] = y; pos[i*3+2] = z;
+    if (x<mn[0]) mn[0]=x; if (y<mn[1]) mn[1]=y; if (z<mn[2]) mn[2]=z;
+    if (x>mx[0]) mx[0]=x; if (y>mx[1]) mx[1]=y; if (z>mx[2]) mx[2]=z;
+    col[i*3]   = _srgbLut[vrgb[i*3]];
+    col[i*3+1] = _srgbLut[vrgb[i*3+1]];
+    col[i*3+2] = _srgbLut[vrgb[i*3+2]];
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g.setIndex(new THREE.BufferAttribute(faces.slice(), 1));
+  g.computeVertexNormals();
+  const mat = new THREE.MeshLambertMaterial({
+    vertexColors: true, side: THREE.DoubleSide, flatShading: false,
+  });
+  if (meshObj) { scene.remove(meshObj); meshObj.geometry.dispose(); }
+  meshObj = new THREE.Mesh(g, mat);
+  scene.add(meshObj);
+  // Add basic lighting if not present
+  if (!scene.userData.lit) {
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(1, 2, 1); scene.add(dir);
+    scene.userData.lit = true;
+  }
+  bounds = {min: mn, max: mx};
+  $('s_pts').textContent = V.toLocaleString() + ' verts';
+}
 
 let camScale = 0.03;
 let thumbsVisible = true;
@@ -341,35 +380,54 @@ function connectWs() {
     const buf = new DataView(ev.data);
     const magic = String.fromCharCode(buf.getUint8(0), buf.getUint8(1), buf.getUint8(2), buf.getUint8(3));
     console.log('[viewer] WS payload', ev.data.byteLength, 'bytes magic=', magic);
-    if (magic !== 'LBP2') { console.warn('unknown magic', magic); return; }
-    const flags   = buf.getUint32(4, true);
-    const numPts  = buf.getUint32(8, true);
-    const numPoses= buf.getUint32(12, true);
-    const seq     = buf.getUint32(16, true);
-    // After header (20B) + xyz (numPts*12B) + rgb (numPts*3B), the byte offset
-    // for `poses` is NOT 4-byte aligned (rgb is uint8). Float32Array views
-    // require aligned offsets, so we copy the trailing region into fresh,
-    // naturally-aligned ArrayBuffers via slice().
-    let off = 20;
-    const xyz = new Float32Array(ev.data, off, numPts*3); off += numPts*3*4;
-    const rgb = new Uint8Array(ev.data, off, numPts*3); off += numPts*3;
-    const posesBytes = numPoses*12*4;
-    const poses = new Float32Array(ev.data.slice(off, off + posesBytes)); off += posesBytes;
-    const K = new Float32Array(ev.data.slice(off, off + 9*4)); off += 9*4;
-
-    // replace_all is the only mode for LBP2 — wipe scene before drawing.
-    while (camGroup.children.length) camGroup.remove(camGroup.children[0]);
-    camCount = 0;
-    trajPositions.length = 0;
-    replacePoints(xyz, rgb);
-    for (let i = 0; i < numPoses; i++) {
-      const tex = latestThumbs[i] || null;
-      addCameraFrustum(poses.subarray(i*12, (i+1)*12), K, camScale, tex);
+    if (magic === 'LBP2') {
+      const flags   = buf.getUint32(4, true);
+      const numPts  = buf.getUint32(8, true);
+      const numPoses= buf.getUint32(12, true);
+      const seq     = buf.getUint32(16, true);
+      let off = 20;
+      const xyz = new Float32Array(ev.data, off, numPts*3); off += numPts*3*4;
+      const rgb = new Uint8Array(ev.data, off, numPts*3); off += numPts*3;
+      const posesBytes = numPoses*12*4;
+      const poses = new Float32Array(ev.data.slice(off, off + posesBytes)); off += posesBytes;
+      const K = new Float32Array(ev.data.slice(off, off + 9*4)); off += 9*4;
+      // replace_all
+      while (camGroup.children.length) camGroup.remove(camGroup.children[0]);
+      if (meshObj) { scene.remove(meshObj); meshObj.geometry.dispose(); meshObj = null; }
+      camCount = 0;
+      trajPositions.length = 0;
+      replacePoints(xyz, rgb);
+      for (let i = 0; i < numPoses; i++) {
+        addCameraFrustum(poses.subarray(i*12, (i+1)*12), K, camScale, latestThumbs[i] || null);
+      }
+    } else if (magic === 'LBM1') {
+      // Mesh: header(24B) + verts f32(V*3) + rgb u8(V*3) + faces u32(F*3) + poses f32(N*12) + K f32(9)
+      const flags   = buf.getUint32(4, true);
+      const numV    = buf.getUint32(8, true);
+      const numF    = buf.getUint32(12, true);
+      const numPoses= buf.getUint32(16, true);
+      const seq     = buf.getUint32(20, true);
+      let off = 24;
+      const verts = new Float32Array(ev.data, off, numV*3); off += numV*3*4;
+      const vrgb  = new Uint8Array(ev.data, off, numV*3); off += numV*3;
+      const faces = new Uint32Array(ev.data.slice(off, off + numF*3*4)); off += numF*3*4;
+      const posesBytes = numPoses*12*4;
+      const poses = new Float32Array(ev.data.slice(off, off + posesBytes)); off += posesBytes;
+      const K = new Float32Array(ev.data.slice(off, off + 9*4)); off += 9*4;
+      while (camGroup.children.length) camGroup.remove(camGroup.children[0]);
+      camCount = 0;
+      trajPositions.length = 0;
+      // Clear point cloud + add mesh
+      usedPoints = 0; geom.setDrawRange(0, 0);
+      installMesh(verts, vrgb, faces);
+      for (let i = 0; i < numPoses; i++) {
+        addCameraFrustum(poses.subarray(i*12, (i+1)*12), K, camScale, latestThumbs[i] || null);
+      }
+    } else {
+      console.warn('unknown magic', magic); return;
     }
-    // Always refit on every payload — replayed selections should snap into view.
     if (bounds) fitView();
     firstPayload = false;
-    console.log('[viewer] rendered pts=', usedPoints, 'cams=', camCount, 'bounds=', bounds);
     lastMsgTs = Date.now();
     msgCount++; fpsN++;
     $('s_pts').textContent = usedPoints.toLocaleString();

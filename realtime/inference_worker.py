@@ -160,6 +160,9 @@ class InferenceWorker:
         max_points_per_frame: int = 30000,
         conf_threshold: float = 1.5,     # demo's absolute conf cutoff (vis_threshold)
         num_scale_frames: int = 16,      # more anchor frames → better global consistency
+        output_mode: str = "mesh",       # "points" (LBP2) or "mesh" (LBM1, Tier 2 TSDF)
+        tsdf_voxel: float = 0.025,       # TSDF voxel size (m)
+        tsdf_trunc: float = 0.10,        # truncation distance (m)
     ) -> None:
         self.broadcast_fn = broadcast_fn
         self.device = device
@@ -170,6 +173,9 @@ class InferenceWorker:
         self.max_points_per_frame = max_points_per_frame
         self.conf_threshold = conf_threshold
         self.num_scale_frames = num_scale_frames
+        self.output_mode = output_mode
+        self.tsdf_voxel = tsdf_voxel
+        self.tsdf_trunc = tsdf_trunc
 
         # Anchor frames pin the world origin + depth scale across ticks: the first
         # `num_scale_frames` frames are kept forever and re-fed as scale frames on
@@ -456,6 +462,44 @@ class InferenceWorker:
             *cam_span, np.round(cam_centroid, 2).tolist(),
             *pts_span, np.round(pts_centroid, 2).tolist(),
         )
+
+        # Tier 2 — TSDF fusion + Marching Cubes mesh
+        if self.output_mode == "mesh":
+            try:
+                from tsdf import build_tsdf_volume, extract_mesh, color_vertices
+                # depth_hw: (N, H, W), wpc: (N, H, W) confidence map
+                depth_hw = depth_np.squeeze(-1) if depth_np.ndim == 4 else depth_np
+                t_tsdf = time.time()
+                vol = build_tsdf_volume(
+                    depth_hw, w2c_np, K_np, wpc,
+                    voxel_size=self.tsdf_voxel, trunc=self.tsdf_trunc,
+                    conf_floor=self.conf_threshold,
+                )
+                verts, faces, normals = extract_mesh(vol, min_weight=1.0)
+                # Color vertices from images: thumbs is (N, H, W, 3) uint8
+                imgs = np.stack(thumbs, axis=0)
+                v_rgb = color_vertices(verts, imgs, w2c_np, K_np)
+                log.info("Tier2 TSDF: verts=%d faces=%d in %.2fs (vol dims=%s)",
+                         verts.shape[0], faces.shape[0], time.time() - t_tsdf,
+                         vol["tsdf"].shape)
+
+                # LBM1 binary: magic + flags + num_verts + num_faces + num_poses + seq
+                #   verts f32(V*3) | rgb u8(V*3) | faces u32(F*3) | poses f32(N*12) | K f32(9)
+                if verts.shape[0] > 0 and faces.shape[0] > 0:
+                    header = struct.pack("<4sIIIII", b"LBM1", 1,
+                                         verts.shape[0], faces.shape[0],
+                                         c2w_np.shape[0], self._frame_seq)
+                    body = (
+                        verts.astype(np.float32).tobytes()
+                        + v_rgb.astype(np.uint8).tobytes()
+                        + faces.astype(np.uint32).tobytes()
+                        + c2w_np.astype(np.float32).tobytes()
+                        + K_np[0].astype(np.float32).tobytes()
+                    )
+                    return header + body
+                log.warning("TSDF produced empty mesh — falling back to LBP2 points")
+            except Exception as e:
+                log.exception("TSDF mesh extraction failed, falling back to LBP2: %s", e)
 
         # Binary v2 — full snapshot for this tick. Viewer must replace its scene.
         #   magic 'LBP2' (4) | flags u32(1=replace) | num_pts u32 | num_poses u32 | seq u32
