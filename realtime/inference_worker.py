@@ -227,12 +227,33 @@ class InferenceWorker:
             await self._task
 
     async def process_video_file(
-        self, path: Path, *, target_frames: int = 32
+        self, path: Path, *, target_frames: int = 32,
+        multi_window_threshold: int = 300, window_overlap: int = 8,
     ) -> tuple[bytes | None, list[bytes], dict]:
-        """Sample `target_frames` evenly from the video, run inference once,
-        broadcast the LBP2 payload + per-frame thumbnails, and return
-        (payload, thumbs_jpeg, info)."""
+        """Sample frames from the video, run inference, broadcast the result.
+
+        For long videos (`total_frames > multi_window_threshold`), runs multiple
+        overlapping inference windows and aligns them via Procrustes registration
+        on the overlapping camera centers (Tier 3). Otherwise single-window path.
+        """
         loop = asyncio.get_running_loop()
+        # Quick probe to decide single vs multi-window
+        meta_probe = await loop.run_in_executor(None, self._probe_video, str(path))
+        total = meta_probe.get("total_frames", 0)
+        use_long = total > multi_window_threshold
+
+        if use_long:
+            # Multi-window: split into K windows of `target_frames` each
+            num_windows = max(2, min(6, total // (target_frames * 2)))
+            payload, thumbs_jpeg, info = await self._process_video_multiwindow(
+                str(path), target_frames=target_frames,
+                num_windows=num_windows, overlap=window_overlap,
+            )
+            info.update(meta_probe)
+            info["mode"] = "multi-window"
+            info["windows"] = num_windows
+            return payload, thumbs_jpeg, info
+
         snap, meta = await loop.run_in_executor(
             None, self._sample_video_sync, str(path), target_frames
         )
@@ -257,6 +278,239 @@ class InferenceWorker:
                 log.warning("broadcast failed: %s", e)
                 info["broadcast_error"] = str(e)
         return payload, thumbs_jpeg, info
+
+    def _probe_video(self, video_path: str) -> dict:
+        cap = cv2.VideoCapture(video_path)
+        info = {
+            "total_frames": int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0),
+            "fps": round(float(cap.get(cv2.CAP_PROP_FPS) or 0.0), 2),
+            "rotation": int(cap.get(cv2.CAP_PROP_ORIENTATION_META) or 0),
+        }
+        cap.release()
+        return info
+
+    async def _process_video_multiwindow(
+        self, video_path: str, target_frames: int, num_windows: int, overlap: int,
+    ) -> tuple[bytes | None, list[bytes], dict]:
+        """Tier 3: Sample windows from the video, infer each, align via Procrustes,
+        and run the final fusion (Tier1 + TSDF if enabled) on the merged data."""
+        loop = asyncio.get_running_loop()
+        info: dict = {}
+
+        # Decide window bounds in raw-frame indices, with overlap
+        meta = self._probe_video(video_path)
+        total = meta["total_frames"]
+        # frame-range of each window
+        # span = window's source frame range; consecutive windows share `overlap` virtual frames
+        # We define virtual-frame indices [0..target_frames*num_windows - overlap*(num_windows-1)]
+        # mapped uniformly into [0..total-1].
+        eff_len = target_frames * num_windows - overlap * (num_windows - 1)
+        virt_indices = np.linspace(0, total - 1, eff_len).astype(int)
+        win_virt_ranges = []
+        for k in range(num_windows):
+            start_v = k * (target_frames - overlap)
+            end_v = start_v + target_frames
+            win_virt_ranges.append((start_v, end_v))
+
+        # Sample per-window: extract `target_frames` real-frame indices for each window
+        windows_data = []
+        thumbs_per_window: list[list[np.ndarray]] = []
+        for k, (s, e) in enumerate(win_virt_ranges):
+            real_idx = [int(virt_indices[i]) for i in range(s, e)]
+            snap = await loop.run_in_executor(
+                None, self._sample_video_by_indices, video_path, real_idx, meta["rotation"]
+            )
+            if not snap:
+                continue
+            win_raw = await loop.run_in_executor(None, self._run_window_raw, snap)
+            if win_raw is None:
+                continue
+            windows_data.append(win_raw)
+            thumbs_per_window.append([t[1] for t in snap])
+
+        if not windows_data:
+            return None, [], {"error": "no windows produced output"}
+        info["windows_succeeded"] = len(windows_data)
+
+        # Align windows via Procrustes on overlap cam centers
+        from registration import chain_windows
+        try:
+            merged = chain_windows(windows_data, overlap=overlap)
+            info["alignment_scales"] = merged.get("scales_to_ref")
+        except Exception as exc:
+            log.exception("multi-window alignment failed: %s", exc)
+            return None, [], {"error": f"alignment failed: {exc}"}
+
+        # Run final fusion (Tier 1 + Tier 2) on merged data
+        payload = await loop.run_in_executor(None, self._fuse_merged, merged)
+
+        # Build thumbs JPEG (drop overlap dupes to match merged frame count)
+        thumbs_flat: list[np.ndarray] = list(thumbs_per_window[0])
+        for k in range(1, len(thumbs_per_window)):
+            thumbs_flat.extend(thumbs_per_window[k][overlap:])
+        thumbs_jpeg: list[bytes] = []
+        for thumb_rgb in thumbs_flat:
+            small = cv2.resize(thumb_rgb, (128, 128), interpolation=cv2.INTER_AREA)
+            bgr = cv2.cvtColor(small, cv2.COLOR_RGB2BGR)
+            ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            thumbs_jpeg.append(buf.tobytes() if ok else b"")
+
+        if payload is not None:
+            try:
+                await self.broadcast_fn(payload, thumbs_jpeg)
+            except Exception as e:
+                log.warning("broadcast failed: %s", e)
+
+        info.update({
+            "frames_used": merged["frame_count"],
+            "payload_bytes": len(payload) if payload else 0,
+            "thumbs_bytes": sum(len(t) for t in thumbs_jpeg),
+        })
+        return payload, thumbs_jpeg, info
+
+    def _sample_video_by_indices(self, video_path: str, indices: list[int], rotation: int):
+        """Like _sample_video_sync but for a specific list of frame indices."""
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return []
+        try:
+            cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1.0)
+        except Exception:
+            pass
+        rot_map = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+        rot_code = rot_map.get(rotation)
+        snap = []
+        seq = 0
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, bgr = cap.read()
+            if not ok or bgr is None:
+                continue
+            if rot_code is not None and rotation in (90, 270) and bgr.shape[1] > bgr.shape[0]:
+                bgr = cv2.rotate(bgr, rot_code)
+            elif rot_code == cv2.ROTATE_180:
+                bgr = cv2.rotate(bgr, rot_code)
+            tensor = _preprocess_bgr(bgr, target_w=self.image_size, patch=self.patch_size)
+            thumb = (tensor.permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            seq += 1
+            snap.append((tensor, thumb, seq))
+        cap.release()
+        return snap
+
+    def _run_window_raw(self, snap):
+        """Run inference on one window; return per-window raw data (no fusion yet).
+        Used by multi-window pipeline before Procrustes alignment.
+        Returns dict or None if depth missing."""
+        if not snap:
+            return None
+        tensors = [t[0] for t in snap]
+        thumbs = [t[1] for t in snap]
+        seqs = [t[2] for t in snap]
+        images = torch.stack(tensors, dim=0).unsqueeze(0).to(self.device)
+        N, _, H, W = images.shape[1:]
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            preds = self.model.inference_streaming(
+                images.squeeze(0),
+                num_scale_frames=self.num_scale_frames,
+                keyframe_interval=1,
+                output_device=None,
+            )
+        for k in list(preds.keys()):
+            if isinstance(preds[k], torch.Tensor) and preds[k].dim() >= 4 and preds[k].shape[0] == 1:
+                preds[k] = preds[k][0]
+        w2c, c2w, K = _poses_from_pose_enc(preds["pose_enc"], (H, W))
+        if w2c.dim() == 4 and w2c.shape[0] == 1: w2c = w2c[0]
+        if c2w.dim() == 4 and c2w.shape[0] == 1: c2w = c2w[0]
+        if K.dim()   == 4 and K.shape[0]   == 1: K   = K[0]
+        w2c_np = w2c.detach().cpu().numpy().astype(np.float32)
+        c2w_np = c2w.detach().cpu().numpy().astype(np.float32)
+        K_np   = K.detach().cpu().numpy().astype(np.float32)
+        depth = preds.get("depth")
+        if depth is None:
+            return None
+        depth_np = depth.detach().cpu().numpy().astype(np.float32)
+        if depth_np.ndim == 3:
+            depth_np = depth_np[..., None]
+        wp = unproject_depth_map_to_point_map(depth_np, w2c_np, K_np)
+        dc = preds.get("depth_conf")
+        wpc = dc.detach().cpu().numpy() if dc is not None else None
+
+        all_xyz, all_rgb, all_conf = [], [], []
+        for i in range(N):
+            pts = wp[i].reshape(-1, 3)
+            cols = thumbs[i].reshape(-1, 3).astype(np.uint8)
+            conf = wpc[i].reshape(-1) if wpc is not None else None
+            mask = conf > self.conf_threshold if conf is not None else np.ones(pts.shape[0], dtype=bool)
+            if mask.sum() == 0:
+                continue
+            idx = np.where(mask)[0]
+            if idx.size > self.max_points_per_frame:
+                idx = np.random.default_rng(int(seqs[i])).choice(idx, self.max_points_per_frame, replace=False)
+            all_xyz.append(pts[idx]); all_rgb.append(cols[idx])
+            all_conf.append(conf[idx] if conf is not None else np.ones(idx.size, dtype=np.float32))
+        if not all_xyz:
+            return None
+        return {
+            "xyz":  np.concatenate(all_xyz,  axis=0).astype(np.float32),
+            "rgb":  np.concatenate(all_rgb,  axis=0).astype(np.uint8),
+            "conf": np.concatenate(all_conf, axis=0).astype(np.float32),
+            "c2w":  c2w_np,
+            "w2c":  w2c_np,
+            "K":    K_np,
+            "depth": depth_np.squeeze(-1),  # (N, H, W)
+            "thumbs": thumbs,
+        }
+
+    def _fuse_merged(self, merged: dict) -> bytes | None:
+        """Run Tier 1 + Tier 2 fusion on a merged multi-window result."""
+        xyz, rgb, conf = merged["xyz"], merged["rgb"], merged["conf"]
+        c2w_np, w2c_np, K_np = merged["c2w"], merged["w2c"], merged["K"]
+        depth_hw = merged["depth"]
+        thumbs = merged["thumbs"]
+
+        # Tier 1 — voxel fusion
+        n_before = xyz.shape[0]
+        xyz, rgb, _ = _voxel_fuse_weighted(xyz, rgb, conf, voxel_size=0.015, min_obs=1)
+        xyz, rgb = _radius_outlier_filter(xyz, rgb, radius=0.04, min_neighbors=3)
+        log.info("Tier1+3 fusion: merged %d → voxel+outlier %d points (windows=%d)",
+                 n_before, xyz.shape[0], merged.get("n_windows", 1))
+
+        seq = 0
+        # Tier 2 — TSDF if enabled
+        if self.output_mode == "mesh":
+            try:
+                from tsdf import build_tsdf_volume, extract_mesh, color_vertices
+                t0 = time.time()
+                vol = build_tsdf_volume(
+                    depth_hw, w2c_np, K_np, None,  # no per-pixel conf in merged path; use 1
+                    voxel_size=self.tsdf_voxel, trunc=self.tsdf_trunc,
+                    conf_floor=0.0,
+                )
+                verts, faces, normals = extract_mesh(vol, min_weight=1.0)
+                imgs = np.stack(thumbs, axis=0)
+                v_rgb = color_vertices(verts, imgs, w2c_np, K_np)
+                log.info("Tier2+3 TSDF: verts=%d faces=%d in %.2fs",
+                         verts.shape[0], faces.shape[0], time.time() - t0)
+                if verts.shape[0] > 0 and faces.shape[0] > 0:
+                    header = struct.pack("<4sIIIII", b"LBM1", 1,
+                                         verts.shape[0], faces.shape[0],
+                                         c2w_np.shape[0], seq)
+                    body = (verts.astype(np.float32).tobytes()
+                            + v_rgb.astype(np.uint8).tobytes()
+                            + faces.astype(np.uint32).tobytes()
+                            + c2w_np.astype(np.float32).tobytes()
+                            + K_np[0].astype(np.float32).tobytes())
+                    return header + body
+                log.warning("TSDF empty mesh → fall back to LBP2")
+            except Exception:
+                log.exception("TSDF failed in merged path; falling back to points")
+
+        # LBP2 point cloud fallback
+        header = struct.pack("<4sIIII", b"LBP2", 1, xyz.shape[0], c2w_np.shape[0], seq)
+        body = (xyz.tobytes() + rgb.tobytes()
+                + c2w_np.astype(np.float32).tobytes()
+                + K_np[0].astype(np.float32).tobytes())
+        return header + body
 
     def _sample_video_sync(self, video_path: str, target_frames: int):
         cap = cv2.VideoCapture(video_path)
