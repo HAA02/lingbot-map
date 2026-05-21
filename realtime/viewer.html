@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>lingbot-map realtime point cloud</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; color: #eee; font: 13px/1.4 system-ui, sans-serif; height: 100%; }
+  #canvas { position: fixed; inset: 0; }
+  header { position: fixed; top: 0; left: 0; right: 0; padding: 6px 12px; background: rgba(0,0,0,0.6); display: flex; gap: 12px; align-items: center; z-index: 5; }
+  header h1 { font-size: 13px; margin: 0; opacity: 0.8; }
+  .stats { position: fixed; bottom: 0; left: 0; right: 0; padding: 6px 12px; background: rgba(0,0,0,0.6); display: flex; gap: 18px; flex-wrap: wrap; z-index: 5; font-size: 12px; }
+  .stats span { opacity: 0.7; }
+  .stats b { color: #fff; font-weight: 600; margin-left: 4px; }
+  .badge { padding: 2px 8px; border-radius: 4px; font-size: 12px; margin-left: auto; }
+  .badge.ok { background: #2a7a2a; }
+  .badge.bad { background: #7a2a2a; }
+  .badge.idle { background: #555; }
+  .badge.wait { background: #7a6a2a; }
+  button { padding: 4px 10px; font-size: 12px; background: #333; color: #eee; border: 1px solid #555; border-radius: 4px; cursor: pointer; }
+  .help { position: fixed; top: 40px; right: 10px; background: rgba(0,0,0,0.7); padding: 6px 10px; border-radius: 4px; font-size: 11px; opacity: 0.7; z-index: 5; max-width: 200px; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<header>
+  <h1>lingbot-map · realtime 3D</h1>
+  <button id="reset">시점 초기화</button>
+  <button id="clear">점군 비우기</button>
+  <button id="toggleCams">카메라 숨기기</button>
+  <button id="toggleThumbs">썸네일 숨기기</button>
+  <label style="font-size:12px;opacity:.8">점크기
+    <input type="range" id="psize" min="0.001" max="0.05" step="0.001" value="0.01" style="vertical-align:middle;width:80px">
+  </label>
+  <select id="picker" style="background:#222;color:#eee;border:1px solid #555;padding:3px 6px;border-radius:4px;font-size:12px;max-width:280px">
+    <option value="">📜 업로드 선택…</option>
+  </select>
+  <span id="ws_badge" class="badge idle">WS 대기</span>
+</header>
+<div class="help">drag: 회전 · wheel: 줌 · shift+drag: 이동</div>
+<div class="stats">
+  <span>WS<b id="s_ws">—</b></span>
+  <span>점<b id="s_pts">0</b></span>
+  <span>카메라<b id="s_cams">0</b></span>
+  <span>마지막<b id="s_age">—</b></span>
+  <span>FPS<b id="s_fps">—</b></span>
+  <span>서버<b id="s_server">—</b></span>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const $ = id => document.getElementById(id);
+const canvas = $('canvas');
+const renderer = new THREE.WebGLRenderer({canvas, antialias: false});
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+// Convert sRGB byte → linear so vertex colors match sRGB-tagged textures.
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+const _srgbLut = new Float32Array(256);
+for (let i = 0; i < 256; i++) _srgbLut[i] = srgbToLinear(i / 255);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.01, 1000);
+camera.position.set(0, 0, 4);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+scene.add(new THREE.AxesHelper(0.5));
+scene.add(new THREE.GridHelper(20, 20, 0x333333, 0x222222));
+
+const MAX_POINTS = 2_000_000;
+const positions = new Float32Array(MAX_POINTS * 3);
+const colors = new Float32Array(MAX_POINTS * 3);
+const geom = new THREE.BufferGeometry();
+geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+geom.setDrawRange(0, 0);
+// world-unit point size (sizeAttenuation true) → closer points appear bigger,
+// matching demo's viser viewer. Updated dynamically from scene span.
+let pointSize = 0.01;
+function makeCircleTex() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(32,32,8, 32,32,30);
+  g.addColorStop(0.0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.7, 'rgba(255,255,255,1)');
+  g.addColorStop(1.0, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(32,32,32,0,Math.PI*2); ctx.fill();
+  return new THREE.CanvasTexture(c);
+}
+const pointTex = makeCircleTex();
+const mat = new THREE.PointsMaterial({
+  size: pointSize, vertexColors: true, sizeAttenuation: true,
+  map: pointTex, alphaTest: 0.4, transparent: true, depthWrite: true,
+});
+const points = new THREE.Points(geom, mat);
+scene.add(points);
+let usedPoints = 0;
+let bounds = null;  // {min:[x,y,z], max:[x,y,z]}
+
+const camGroup = new THREE.Group();
+scene.add(camGroup);
+let camCount = 0;
+
+let camScale = 0.03;
+let thumbsVisible = true;
+const frustumMat = new THREE.LineBasicMaterial({color: 0x44ddff, transparent: true, opacity: 0.18});
+const trajPositions = [];
+const trajGeom = new THREE.BufferGeometry();
+const trajMat = new THREE.LineBasicMaterial({color: 0xffaa33, transparent: true, opacity: 0.7});
+const trajLine = new THREE.Line(trajGeom, trajMat);
+scene.add(trajLine);
+
+function addCameraFrustum(c2w, K, scale=camScale, thumbTex=null) {
+  // OpenCV → Three.js: M = diag(1,-1,-1). Transform c2w as M @ c2w @ M.
+  // R'[i,j] = sign[i]*sign[j]*R[i,j] where sign=[1,-1,-1]; t'[i] = sign[i]*t[i].
+  // Row-major 3x4: indices [0..2]=row0, [3]=t[0], [4..6]=row1, [7]=t[1], [8..10]=row2, [11]=t[2]
+  const R00=c2w[0], R01=-c2w[1], R02=-c2w[2], t0= c2w[3];
+  const R10=-c2w[4], R11= c2w[5], R12= c2w[6], t1=-c2w[7];
+  const R20=-c2w[8], R21= c2w[9], R22= c2w[10],t2=-c2w[11];
+  const m = new THREE.Matrix4();
+  m.set(
+    R00, R01, R02, t0,
+    R10, R11, R12, t1,
+    R20, R21, R22, t2,
+    0, 0, 0, 1
+  );
+  const h = scale, w = scale*0.7;
+  // Frustum opens toward -Z (camera forward in Three.js after M transform)
+  const verts = new Float32Array([
+    0,0,0,  w, h,-scale,
+    0,0,0, -w, h,-scale,
+    0,0,0,  w,-h,-scale,
+    0,0,0, -w,-h,-scale,
+     w, h,-scale,  w,-h,-scale,
+     w,-h,-scale, -w,-h,-scale,
+    -w,-h,-scale, -w, h,-scale,
+    -w, h,-scale,  w, h,-scale,
+  ]);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+  const group = new THREE.Group();
+  const line = new THREE.LineSegments(g, frustumMat);
+  group.add(line);
+  if (thumbTex) {
+    const planeGeom = new THREE.PlaneGeometry(w*1.8, h*1.8);
+    const planeMat = new THREE.MeshBasicMaterial({
+      map: thumbTex, side: THREE.DoubleSide, transparent: true,
+      opacity: 0.55, depthWrite: false,
+    });
+    const plane = new THREE.Mesh(planeGeom, planeMat);
+    plane.userData.isThumb = true;
+    plane.visible = thumbsVisible;
+    plane.position.set(0, 0, -scale);
+    group.add(plane);
+  }
+  group.applyMatrix4(m);
+  camGroup.add(group);
+  camCount++;
+  trajPositions.push(t0, t1, t2);  // already M-transformed
+  trajGeom.setAttribute('position', new THREE.Float32BufferAttribute(trajPositions, 3));
+  trajGeom.computeBoundingSphere();
+}
+
+function fitView() {
+  if (!bounds) return;
+  const cx = (bounds.min[0] + bounds.max[0]) / 2;
+  const cy = (bounds.min[1] + bounds.max[1]) / 2;
+  const cz = (bounds.min[2] + bounds.max[2]) / 2;
+  const dx = bounds.max[0] - bounds.min[0];
+  const dy = bounds.max[1] - bounds.min[1];
+  const dz = bounds.max[2] - bounds.min[2];
+  const span = Math.max(dx, dy, dz, 0.5);
+  camera.position.set(cx + span*0.8, cy + span*0.6, cz + span*1.2);
+  controls.target.set(cx, cy, cz);
+  controls.update();
+}
+
+function replacePoints(xyz, rgb) {
+  // Replace mode: overwrite the entire point cloud and recompute bounds.
+  // OpenCV world → Three.js: M = diag(1,-1,-1): flip Y (down→up) and Z (forward→back).
+  const n = Math.min(xyz.length / 3, MAX_POINTS);
+  if (n === 0) { usedPoints = 0; geom.setDrawRange(0, 0); return 0; }
+  let mn = [xyz[0], -xyz[1], -xyz[2]];
+  let mx = [xyz[0], -xyz[1], -xyz[2]];
+  for (let i = 0; i < n; i++) {
+    const x = xyz[i*3], y = -xyz[i*3+1], z = -xyz[i*3+2];
+    positions[i*3+0] = x; positions[i*3+1] = y; positions[i*3+2] = z;
+    if (x<mn[0]) mn[0]=x; if (y<mn[1]) mn[1]=y; if (z<mn[2]) mn[2]=z;
+    if (x>mx[0]) mx[0]=x; if (y>mx[1]) mx[1]=y; if (z>mx[2]) mx[2]=z;
+    colors[i*3+0] = _srgbLut[rgb[i*3+0]];
+    colors[i*3+1] = _srgbLut[rgb[i*3+1]];
+    colors[i*3+2] = _srgbLut[rgb[i*3+2]];
+  }
+  bounds = {min: mn, max: mx};
+  usedPoints = n;
+  geom.attributes.position.needsUpdate = true;
+  geom.attributes.color.needsUpdate = true;
+  geom.setDrawRange(0, usedPoints);
+  geom.computeBoundingSphere();
+
+  // auto camera-frustum scale based on scene extent (frustum is in world units).
+  // Point size is in screen pixels (sizeAttenuation=false) — no rescale needed.
+  const dx = mx[0]-mn[0], dy = mx[1]-mn[1], dz = mx[2]-mn[2];
+  const span = Math.max(dx, dy, dz, 0.3);
+  // Tie frustum size to cam_span (not pts_span) so cameras don't overwhelm
+  // small phone-motion paths. We approximate cam_span as 1/4 of pts_span here.
+  const newCam = Math.max(0.01, span * 0.012);
+  if (Math.abs(newCam - camScale)/camScale > 0.3) camScale = newCam;
+  // Adapt world-unit point size to scene scale: ~0.3% of span — bigger points
+  // overlap visually so the cloud reads as a surface, not isolated dots.
+  const newPt = Math.max(0.003, span * 0.003);
+  if (!userSetPointSize) { pointSize = newPt; mat.size = pointSize;
+    $('psize').value = pointSize.toFixed(3); }
+  return n;
+}
+let userSetPointSize = false;
+
+$('reset').onclick = fitView;
+$('toggleCams').onclick = () => {
+  camGroup.visible = !camGroup.visible;
+  trajLine.visible = camGroup.visible;
+  $('toggleCams').textContent = camGroup.visible ? '카메라 숨기기' : '카메라 보이기';
+};
+$('toggleThumbs').onclick = () => {
+  thumbsVisible = !thumbsVisible;
+  camGroup.traverse(o => { if (o.userData && o.userData.isThumb) o.visible = thumbsVisible; });
+  $('toggleThumbs').textContent = thumbsVisible ? '썸네일 숨기기' : '썸네일 보이기';
+};
+$('psize').oninput = e => {
+  pointSize = parseFloat(e.target.value);
+  mat.size = pointSize;
+  userSetPointSize = true;
+};
+$('clear').onclick = () => {
+  usedPoints = 0;
+  geom.setDrawRange(0, 0);
+  while (camGroup.children.length) camGroup.remove(camGroup.children[0]);
+  camCount = 0;
+  trajPositions.length = 0;
+  trajGeom.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
+  bounds = null;
+  $('s_pts').textContent = '0';
+  $('s_cams').textContent = '0';
+};
+// auto-fit on first payload
+let firstPayload = true;
+let latestThumbs = [];  // THREE.Texture per frame, sent via JSON sidecar
+
+// ---- Upload picker: list past uploads and replay on select ----
+async function loadPicker() {
+  try {
+    const r = await fetch('/api/uploads').then(r => r.json());
+    const items = r.uploads || [];
+    const sel = $('picker');
+    while (sel.options.length > 1) sel.remove(1);
+    for (const it of items) {
+      const when = new Date(it.ts_ms).toLocaleString('ko-KR', {hour12:false});
+      const opt = document.createElement('option');
+      opt.value = it.id;
+      opt.textContent = `${when} · ${it.video || it.id}`;
+      sel.appendChild(opt);
+    }
+  } catch (e) { console.warn('picker load failed', e); }
+}
+$('picker').addEventListener('change', async e => {
+  const id = e.target.value;
+  if (!id) return;
+  firstPayload = true;       // refit on the replayed payload
+  try {
+    await fetch(`/api/uploads/${id}/replay`, {method: 'POST'});
+  } catch (err) {
+    console.warn('replay failed', err);
+  }
+});
+loadPicker();
+
+window.addEventListener('resize', () => {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+// ---- WebSocket ----
+let lastMsgTs = 0, msgCount = 0, fpsT = performance.now(), fpsN = 0;
+function wsUrl() {
+  const p = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${p}//${location.host}/ws`;
+}
+function connectWs() {
+  const ws = new WebSocket(wsUrl());
+  ws.binaryType = 'arraybuffer';
+  $('s_ws').textContent = 'connecting';
+  $('ws_badge').textContent = 'WS 연결중';
+  $('ws_badge').className = 'badge wait';
+  ws.onopen = () => {
+    $('s_ws').textContent = 'open';
+    $('ws_badge').textContent = 'WS open';
+    $('ws_badge').className = 'badge ok';
+  };
+  ws.onclose = () => {
+    $('s_ws').textContent = 'closed (재연결 1s)';
+    $('ws_badge').textContent = 'WS 끊김';
+    $('ws_badge').className = 'badge bad';
+    setTimeout(connectWs, 1000);
+  };
+  ws.onerror = e => { $('s_ws').textContent = 'error'; };
+  ws.onmessage = ev => {
+    if (typeof ev.data === 'string') {
+      // JSON sidecars: {type:"thumbs", images:[b64...]} or {type:"ping"}
+      try {
+        const j = JSON.parse(ev.data);
+        if (j.type === 'thumbs' && Array.isArray(j.images)) {
+          latestThumbs = j.images.map(b64 => {
+            const img = new Image();
+            img.src = 'data:image/jpeg;base64,' + b64;
+            const tex = new THREE.Texture(img);
+            tex.colorSpace = THREE.SRGBColorSpace;
+            img.onload = () => { tex.needsUpdate = true; };
+            return tex;
+          });
+          console.log('[viewer] thumbs received:', latestThumbs.length);
+        }
+      } catch {}
+      return;
+    }
+    const buf = new DataView(ev.data);
+    const magic = String.fromCharCode(buf.getUint8(0), buf.getUint8(1), buf.getUint8(2), buf.getUint8(3));
+    console.log('[viewer] WS payload', ev.data.byteLength, 'bytes magic=', magic);
+    if (magic !== 'LBP2') { console.warn('unknown magic', magic); return; }
+    const flags   = buf.getUint32(4, true);
+    const numPts  = buf.getUint32(8, true);
+    const numPoses= buf.getUint32(12, true);
+    const seq     = buf.getUint32(16, true);
+    // After header (20B) + xyz (numPts*12B) + rgb (numPts*3B), the byte offset
+    // for `poses` is NOT 4-byte aligned (rgb is uint8). Float32Array views
+    // require aligned offsets, so we copy the trailing region into fresh,
+    // naturally-aligned ArrayBuffers via slice().
+    let off = 20;
+    const xyz = new Float32Array(ev.data, off, numPts*3); off += numPts*3*4;
+    const rgb = new Uint8Array(ev.data, off, numPts*3); off += numPts*3;
+    const posesBytes = numPoses*12*4;
+    const poses = new Float32Array(ev.data.slice(off, off + posesBytes)); off += posesBytes;
+    const K = new Float32Array(ev.data.slice(off, off + 9*4)); off += 9*4;
+
+    // replace_all is the only mode for LBP2 — wipe scene before drawing.
+    while (camGroup.children.length) camGroup.remove(camGroup.children[0]);
+    camCount = 0;
+    trajPositions.length = 0;
+    replacePoints(xyz, rgb);
+    for (let i = 0; i < numPoses; i++) {
+      const tex = latestThumbs[i] || null;
+      addCameraFrustum(poses.subarray(i*12, (i+1)*12), K, camScale, tex);
+    }
+    // Always refit on every payload — replayed selections should snap into view.
+    if (bounds) fitView();
+    firstPayload = false;
+    console.log('[viewer] rendered pts=', usedPoints, 'cams=', camCount, 'bounds=', bounds);
+    lastMsgTs = Date.now();
+    msgCount++; fpsN++;
+    $('s_pts').textContent = usedPoints.toLocaleString();
+    $('s_cams').textContent = camCount;
+  };
+}
+connectWs();
+
+setInterval(() => {
+  if (lastMsgTs) {
+    const age = (Date.now() - lastMsgTs) / 1000;
+    $('s_age').textContent = age.toFixed(1) + 's';
+  }
+  const now = performance.now();
+  const dt = (now - fpsT) / 1000;
+  if (dt > 0) $('s_fps').textContent = (fpsN/dt).toFixed(1);
+  fpsT = now; fpsN = 0;
+  fetch('/health').then(r=>r.json()).then(h => {
+    $('s_server').textContent = `${h.frames_received} fr · ${h.viewers}v · model=${h.model_loaded?'OK':'-'}`;
+  }).catch(()=>{});
+}, 1000);
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>

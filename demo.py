@@ -402,6 +402,11 @@ def main():
                              "actual frames.  Recommended when --keyframe_interval > 1.")
 
     # Visualization
+    parser.add_argument("--export_dir", type=str, default=None,
+                        help="If set, save scene_export.json + sampled PLY to this directory "
+                             "for downstream BIM analysis (skip viser if --no_viewer).")
+    parser.add_argument("--no_viewer", action="store_true",
+                        help="Skip launching the viser viewer (useful with --export_dir on headless servers).")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--conf_threshold", type=float, default=1.5)
     parser.add_argument("--downsample_factor", type=int, default=10)
@@ -579,6 +584,34 @@ def main():
         images_for_post = images
 
     predictions, images_cpu = postprocess(predictions, images_for_post)
+
+    # ── Optional export for downstream BIM analysis ─────────────────────────
+    if args.export_dir:
+        from lingbot_map.export import export_scene
+        export_predictions = dict(predictions)
+        export_predictions["images"] = images_cpu
+        scene_id = (
+            os.path.splitext(os.path.basename(args.video_path))[0]
+            if args.video_path else os.path.basename(os.path.normpath(args.image_folder or "scene"))
+        )
+        export_scene(
+            export_predictions,
+            output_dir=args.export_dir,
+            scene_id=scene_id,
+            image_paths=paths,
+            source_info={
+                "video_path": args.video_path,
+                "image_folder": args.image_folder,
+                "fps": args.fps,
+                "image_size": [args.image_size, args.image_size],
+                "mode": args.mode,
+            },
+        )
+        print(f"[export] scene_export.json + PLY written to {args.export_dir}")
+
+    if args.no_viewer:
+        print(f"Predictions contain keys: {list(predictions.keys())}")
+        return
 
     # ── Visualize ────────────────────────────────────────────────────────────
     try:

@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>lingbot-map · 영상 업로드</title>
+<style>
+  body { margin: 0; padding: 20px; background: #111; color: #eee;
+         font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin-inline: auto; }
+  iframe.viewer { width: 100%; height: 480px; border: 1px solid #333;
+                  border-radius: 6px; background: #000; margin-top: 12px; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  .hint { opacity: 0.7; font-size: 13px; margin-bottom: 16px; }
+  label.btn, button {
+    display: block; width: 100%; padding: 14px;
+    background: #2a5a8a; color: #fff; border: none; border-radius: 6px;
+    text-align: center; font-size: 16px; cursor: pointer; margin: 8px 0;
+  }
+  button:disabled, label.btn.disabled { background: #444; cursor: not-allowed; }
+  label.btn:hover, button:hover:not(:disabled) { background: #3a6aaa; }
+  input[type=file] { display: none; }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .row > * { flex: 1; }
+  input[type=number] {
+    padding: 8px; background: #222; color: #eee; border: 1px solid #444; border-radius: 4px;
+  }
+  pre {
+    background: #000; border: 1px solid #333; padding: 10px; border-radius: 4px;
+    overflow-x: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all;
+  }
+  .links { margin-top: 16px; opacity: 0.8; font-size: 13px; }
+  .links a { color: #88bbff; }
+  .status { padding: 8px 12px; border-radius: 4px; margin: 8px 0; }
+  .status.ok { background: #1f4a1f; }
+  .status.err { background: #4a1f1f; }
+  .status.wait { background: #4a4220; }
+  .progress { width: 100%; height: 6px; background: #222; border-radius: 3px; overflow: hidden; margin-top: 4px; }
+  .progress > div { height: 100%; background: #66aaff; width: 0%; transition: width 0.1s; }
+</style>
+</head>
+<body>
+<h1>lingbot-map · 영상 업로드</h1>
+<div class="hint">
+  핸드폰으로 촬영한 영상을 업로드하면 3D 포인트클라우드로 재구성됩니다.<br>
+  GPU는 업로드 1회당 1회만 사용 — 평시 GPU 부하 없음.
+</div>
+
+<div class="row" style="margin-bottom:8px">
+  <label style="flex:0 0 auto">샘플 프레임:
+    <input type="number" id="target_frames" value="32" min="4" max="128" step="2" style="width:70px">
+  </label>
+  <span id="eta" style="opacity:.7">~5s @ 32f</span>
+</div>
+<label class="btn" id="pickBtn" for="file">📹 영상 선택 (선택 즉시 업로드 시작)</label>
+<input type="file" id="file" accept="video/*" capture="environment" />
+<div id="info" style="display:none">
+  <div class="status" id="filemeta"></div>
+  <div class="progress"><div id="bar"></div></div>
+</div>
+
+<div id="status" class="status" style="display:none"></div>
+<iframe id="viewerFrame" class="viewer" style="display:none" src="about:blank"></iframe>
+<details style="margin-top:8px"><summary>상세 응답</summary>
+  <pre id="result"></pre>
+</details>
+
+<h2 style="font-size:15px; margin-top:24px; opacity:.8">📜 이전 업로드</h2>
+<div id="history" style="font-size:13px"></div>
+
+<div class="links">
+  → 큰 화면으로 보기: <a href="/viewer" target="_blank">/viewer (별창)</a><br>
+  → 서버 상태: <a href="/health" target="_blank">/health</a>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+$('target_frames').addEventListener('input', updateEta);
+function updateEta() {
+  const n = parseInt($('target_frames').value || '32');
+  $('eta').textContent = `~${(n * 0.15).toFixed(1)}s @ ${n}f`;
+}
+
+$('file').addEventListener('change', e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  startUpload(f);
+});
+
+async function startUpload(f) {
+  const n = Math.max(4, Math.min(128, parseInt($('target_frames').value || '32')));
+  const fd = new FormData();
+  fd.append('file', f);
+  $('info').style.display = 'block';
+  $('filemeta').className = 'status ok';
+  $('filemeta').textContent = `${f.name} · ${(f.size/1e6).toFixed(1)} MB`;
+  $('pickBtn').classList.add('disabled');
+  $('status').style.display = 'block';
+  $('status').className = 'status wait';
+  $('status').textContent = `업로드 중 (${(f.size/1e6).toFixed(1)} MB)...`;
+  $('result').style.display = 'none';
+  $('bar').style.width = '0%';
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', `/api/upload-video?target_frames=${n}`);
+  xhr.upload.onprogress = ev => {
+    if (ev.lengthComputable) {
+      const p = (ev.loaded / ev.total * 60);   // first 60% = upload
+      $('bar').style.width = p + '%';
+    }
+  };
+  xhr.upload.onload = () => {
+    $('bar').style.width = '60%';
+    $('status').textContent = `추론 중 (~${(n*0.15).toFixed(1)}s)...`;
+  };
+  xhr.onload = () => {
+    $('bar').style.width = '100%';
+    $('pickBtn').classList.remove('disabled');
+    let data = null;
+    try { data = JSON.parse(xhr.responseText); } catch { data = {raw: xhr.responseText}; }
+    $('result').style.display = 'block';
+    $('result').textContent = JSON.stringify(data, null, 2);
+    if (xhr.status === 200 && data && data.ok) {
+      $('status').className = 'status ok';
+      $('status').textContent = `완료 · ${data.elapsed_s}s · ${data.frames_used}프레임 — 아래 3D 뷰 확인`;
+      const f = $('viewerFrame');
+      f.style.display = 'block';
+      // reload viewer so it picks up the fresh WS payload from this upload
+      f.src = '/viewer?t=' + Date.now();
+      loadHistory();
+    } else {
+      $('status').className = 'status err';
+      $('status').textContent = `실패 (HTTP ${xhr.status}) · ${data?.error || ''}`;
+    }
+  };
+  xhr.onerror = () => {
+    $('pickBtn').classList.remove('disabled');
+    $('status').className = 'status err';
+    $('status').textContent = '네트워크 오류';
+  };
+  xhr.send(fd);
+}
+
+async function loadHistory() {
+  try {
+    const r = await fetch('/api/uploads').then(r => r.json());
+    const items = r.uploads || [];
+    if (!items.length) {
+      $('history').innerHTML = '<div style="opacity:.5">없음</div>';
+      return;
+    }
+    $('history').innerHTML = items.map(it => {
+      const d = new Date(it.ts_ms);
+      const when = d.toLocaleString('ko-KR', {hour12:false});
+      const mb = (it.payload_bytes / 1024).toFixed(0);
+      return `<div style="display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid #222">
+        <span style="flex:1">${when} · ${it.video || it.id} · ${mb} KB</span>
+        <button data-id="${it.id}" class="replay" style="width:auto;padding:6px 10px;margin:0;font-size:12px">▶ 보기</button>
+      </div>`;
+    }).join('');
+    document.querySelectorAll('button.replay').forEach(b => {
+      b.addEventListener('click', () => replay(b.dataset.id));
+    });
+  } catch (e) {
+    $('history').textContent = 'history load failed: ' + e;
+  }
+}
+async function replay(id) {
+  $('status').style.display = 'block';
+  $('status').className = 'status wait';
+  $('status').textContent = `재생 중 (${id})...`;
+  try {
+    const r = await fetch(`/api/uploads/${id}/replay`, {method: 'POST'}).then(r => r.json());
+    if (r.ok) {
+      $('status').className = 'status ok';
+      $('status').textContent = `${id} → 아래 뷰에 표시 (viewers=${r.viewers})`;
+      const f = $('viewerFrame');
+      f.style.display = 'block';
+      f.src = '/viewer?t=' + Date.now();
+    } else {
+      $('status').className = 'status err';
+      $('status').textContent = `재생 실패: ${r.error}`;
+    }
+  } catch (e) {
+    $('status').className = 'status err';
+    $('status').textContent = '오류: ' + e;
+  }
+}
+
+loadHistory();
+</script>
+</body>
+</html>
