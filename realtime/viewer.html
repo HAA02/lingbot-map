@@ -19,6 +19,15 @@
   .badge.wait { background: #7a6a2a; }
   button { padding: 4px 10px; font-size: 12px; background: #333; color: #eee; border: 1px solid #555; border-radius: 4px; cursor: pointer; }
   .help { position: fixed; top: 40px; right: 10px; background: rgba(0,0,0,0.7); padding: 6px 10px; border-radius: 4px; font-size: 11px; opacity: 0.7; z-index: 5; max-width: 200px; }
+  .bim-panel { position: fixed; top: 44px; left: 10px; background: rgba(0,0,0,0.75); padding: 10px 12px; border-radius: 6px; font-size: 12px; z-index: 5; min-width: 240px; }
+  .bim-panel h3 { margin: 0 0 8px 0; font-size: 12px; opacity: .85; display: flex; justify-content: space-between; align-items: center; }
+  .bim-panel .row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+  .bim-panel .row label { width: 50px; opacity: .75; }
+  .bim-panel input[type=range] { flex: 1; }
+  .bim-panel input[type=number] { width: 56px; background: #222; color: #eee; border: 1px solid #444; padding: 2px 4px; border-radius: 3px; font-size: 11px; }
+  .bim-panel select, .bim-panel button { font-size: 11px; }
+  .bim-panel input[type=file] { display: none; }
+  .bim-panel .bim-file-btn { padding: 3px 8px; background: #2a4a7a; }
 </style>
 </head>
 <body>
@@ -38,6 +47,37 @@
   <span id="ws_badge" class="badge idle">WS 대기</span>
 </header>
 <div class="help">drag: 회전 · wheel: 줌 · shift+drag: 이동</div>
+<div class="bim-panel" id="bim_panel">
+  <h3>
+    🏗️ BIM 오버레이
+    <span><label class="bim-file-btn" style="cursor:pointer;border:1px solid #555;border-radius:3px">
+      ＋업로드<input type="file" id="bim_file" accept=".glb,.gltf,.obj"></label></span>
+  </h3>
+  <div class="row">
+    <select id="bim_picker" style="flex:1;background:#222;color:#eee;border:1px solid #555;padding:3px 6px;border-radius:4px;">
+      <option value="">— 모델 선택 —</option>
+    </select>
+    <button id="bim_delete" title="선택된 BIM 삭제" style="padding:3px 6px;background:#7a2a2a">🗑</button>
+  </div>
+  <div class="row"><label>표시</label>
+    <input type="checkbox" id="bim_visible" checked>
+    <label style="width:auto">투명도</label>
+    <input type="range" id="bim_opacity" min="0.05" max="1" step="0.05" value="0.5">
+  </div>
+  <div class="row"><label>Wireframe</label>
+    <input type="checkbox" id="bim_wire">
+    <label style="width:auto;margin-left:8px">자동맞춤</label>
+    <button id="bim_fit" style="padding:2px 6px">🎯 점군에 맞춤</button>
+  </div>
+  <div class="row"><label>TX</label><input type="range" id="bim_tx" min="-10" max="10" step="0.01" value="0"><input type="number" id="bim_tx_n" step="0.01" value="0"></div>
+  <div class="row"><label>TY</label><input type="range" id="bim_ty" min="-10" max="10" step="0.01" value="0"><input type="number" id="bim_ty_n" step="0.01" value="0"></div>
+  <div class="row"><label>TZ</label><input type="range" id="bim_tz" min="-10" max="10" step="0.01" value="0"><input type="number" id="bim_tz_n" step="0.01" value="0"></div>
+  <div class="row"><label>RX°</label><input type="range" id="bim_rx" min="-180" max="180" step="1" value="0"><input type="number" id="bim_rx_n" step="1" value="0"></div>
+  <div class="row"><label>RY°</label><input type="range" id="bim_ry" min="-180" max="180" step="1" value="0"><input type="number" id="bim_ry_n" step="1" value="0"></div>
+  <div class="row"><label>RZ°</label><input type="range" id="bim_rz" min="-180" max="180" step="1" value="0"><input type="number" id="bim_rz_n" step="1" value="0"></div>
+  <div class="row"><label>Scale</label><input type="range" id="bim_scale" min="0.01" max="20" step="0.01" value="1"><input type="number" id="bim_scale_n" step="0.01" value="1"></div>
+  <div class="row" style="opacity:.6;font-size:11px"><span id="bim_status">대기</span></div>
+</div>
 <div class="stats">
   <span>WS<b id="s_ws">—</b></span>
   <span>점<b id="s_pts">0</b></span>
@@ -58,6 +98,8 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 
 const $ = id => document.getElementById(id);
 const canvas = $('canvas');
@@ -434,6 +476,180 @@ function connectWs() {
     $('s_cams').textContent = camCount;
   };
 }
+// ───────────────────────── BIM overlay ─────────────────────────
+const bimGroup = new THREE.Group();
+scene.add(bimGroup);
+let bimRoot = null;        // currently-loaded model root
+let bimMaterials = [];     // collected from the loaded model for opacity/wireframe tweaks
+
+const bimTransform = { tx:0, ty:0, tz:0, rx:0, ry:0, rz:0, scale:1, opacity:0.5, visible:true, wire:false };
+
+function applyBimTransform() {
+  if (!bimRoot) return;
+  bimRoot.position.set(bimTransform.tx, bimTransform.ty, bimTransform.tz);
+  bimRoot.rotation.set(
+    bimTransform.rx * Math.PI/180,
+    bimTransform.ry * Math.PI/180,
+    bimTransform.rz * Math.PI/180,
+  );
+  bimRoot.scale.setScalar(bimTransform.scale);
+  bimRoot.visible = bimTransform.visible;
+  for (const m of bimMaterials) {
+    m.transparent = bimTransform.opacity < 1;
+    m.opacity = bimTransform.opacity;
+    m.wireframe = bimTransform.wire;
+    m.depthWrite = bimTransform.opacity >= 0.95;
+    m.needsUpdate = true;
+  }
+}
+
+function disposeBim() {
+  if (!bimRoot) return;
+  bimGroup.remove(bimRoot);
+  bimRoot.traverse(o => {
+    if (o.isMesh) {
+      o.geometry?.dispose();
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      for (const m of mats) m?.dispose?.();
+    }
+  });
+  bimRoot = null;
+  bimMaterials = [];
+}
+
+async function loadBimById(id) {
+  if (!id) { disposeBim(); return; }
+  $('bim_status').textContent = '로딩 중…';
+  // determine extension via /api/bim/list lookup
+  const list = await fetch('/api/bim/list').then(r => r.json()).catch(() => ({bim:[]}));
+  const meta = (list.bim || []).find(b => b.id === id);
+  if (!meta) { $('bim_status').textContent = '메타데이터 누락'; return; }
+  const url = `/api/bim/${id}/file`;
+  try {
+    let obj;
+    if (meta.ext === '.glb' || meta.ext === '.gltf') {
+      const loader = new GLTFLoader();
+      const gltf = await new Promise((res, rej) => loader.load(url, res, undefined, rej));
+      obj = gltf.scene;
+    } else if (meta.ext === '.obj') {
+      const loader = new OBJLoader();
+      obj = await new Promise((res, rej) => loader.load(url, res, undefined, rej));
+    } else {
+      $('bim_status').textContent = `미지원 확장자: ${meta.ext}`;
+      return;
+    }
+    disposeBim();
+    bimRoot = obj;
+    bimGroup.add(bimRoot);
+    bimMaterials = [];
+    bimRoot.traverse(o => {
+      if (o.isMesh) {
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        for (const m of mats) if (m) bimMaterials.push(m);
+      }
+    });
+    applyBimTransform();
+    $('bim_status').textContent = `로드 완료 (${meta.file}, ${(meta.bytes/1e6).toFixed(1)} MB)`;
+  } catch (e) {
+    console.error('BIM load failed', e);
+    $('bim_status').textContent = `로드 실패: ${e.message || e}`;
+  }
+}
+
+async function refreshBimList() {
+  const r = await fetch('/api/bim/list').then(r => r.json()).catch(() => ({bim:[]}));
+  const sel = $('bim_picker');
+  while (sel.options.length > 1) sel.remove(1);
+  for (const b of (r.bim || [])) {
+    const opt = document.createElement('option');
+    opt.value = b.id;
+    const when = new Date(b.ts_ms).toLocaleString('ko-KR', {hour12:false});
+    opt.textContent = `${when} · ${b.file}`;
+    sel.appendChild(opt);
+  }
+}
+
+// Sync paired range+number inputs
+function pairCtrl(idRange, idNum, key, onChange) {
+  const r = $(idRange), n = $(idNum);
+  const set = (v) => {
+    bimTransform[key] = v; r.value = v; n.value = v; applyBimTransform();
+    if (onChange) onChange();
+  };
+  r.addEventListener('input', e => set(parseFloat(e.target.value)));
+  n.addEventListener('input', e => set(parseFloat(e.target.value)));
+}
+pairCtrl('bim_tx','bim_tx_n','tx');
+pairCtrl('bim_ty','bim_ty_n','ty');
+pairCtrl('bim_tz','bim_tz_n','tz');
+pairCtrl('bim_rx','bim_rx_n','rx');
+pairCtrl('bim_ry','bim_ry_n','ry');
+pairCtrl('bim_rz','bim_rz_n','rz');
+pairCtrl('bim_scale','bim_scale_n','scale');
+
+$('bim_opacity').addEventListener('input', e => {
+  bimTransform.opacity = parseFloat(e.target.value); applyBimTransform();
+});
+$('bim_visible').addEventListener('change', e => {
+  bimTransform.visible = e.target.checked; applyBimTransform();
+});
+$('bim_wire').addEventListener('change', e => {
+  bimTransform.wire = e.target.checked; applyBimTransform();
+});
+$('bim_picker').addEventListener('change', e => loadBimById(e.target.value));
+$('bim_delete').addEventListener('click', async () => {
+  const id = $('bim_picker').value;
+  if (!id) return;
+  if (!confirm(`BIM 삭제: ${id}?`)) return;
+  await fetch(`/api/bim/${id}`, {method:'DELETE'});
+  disposeBim();
+  await refreshBimList();
+  $('bim_picker').value = '';
+});
+$('bim_file').addEventListener('change', async e => {
+  const f = e.target.files?.[0];
+  if (!f) return;
+  $('bim_status').textContent = `업로드 중… (${(f.size/1e6).toFixed(1)} MB)`;
+  const fd = new FormData(); fd.append('file', f);
+  const r = await fetch('/api/bim/upload', {method:'POST', body:fd}).then(r => r.json()).catch(e => ({ok:false, error:e}));
+  if (!r.ok) { $('bim_status').textContent = `업로드 실패: ${r.error}`; return; }
+  await refreshBimList();
+  $('bim_picker').value = r.id;
+  await loadBimById(r.id);
+  e.target.value = '';
+});
+$('bim_fit').addEventListener('click', () => {
+  // Center BIM bounding box on the current point-cloud centroid and scale to match span.
+  if (!bimRoot || !bounds) { $('bim_status').textContent = '점군 또는 BIM 없음'; return; }
+  const bbox = new THREE.Box3().setFromObject(bimRoot);
+  const bimSize = bbox.getSize(new THREE.Vector3());
+  const bimCenter = bbox.getCenter(new THREE.Vector3());
+  const ptsSize = new THREE.Vector3(
+    bounds.max[0]-bounds.min[0], bounds.max[1]-bounds.min[1], bounds.max[2]-bounds.min[2]);
+  const ptsCenter = new THREE.Vector3(
+    (bounds.min[0]+bounds.max[0])/2, (bounds.min[1]+bounds.max[1])/2, (bounds.min[2]+bounds.max[2])/2);
+  const targetSpan = Math.max(ptsSize.x, ptsSize.y, ptsSize.z);
+  const bimSpan = Math.max(bimSize.x, bimSize.y, bimSize.z, 1e-6);
+  // Reset to identity first so bbox computation is in model-local space
+  bimTransform.scale = targetSpan / bimSpan;
+  // After scaling, translate so scaled center sits on point centroid
+  bimTransform.tx = ptsCenter.x - bimCenter.x * bimTransform.scale;
+  bimTransform.ty = ptsCenter.y - bimCenter.y * bimTransform.scale;
+  bimTransform.tz = ptsCenter.z - bimCenter.z * bimTransform.scale;
+  bimTransform.rx = bimTransform.ry = bimTransform.rz = 0;
+  // Sync UI
+  for (const [k, prefix] of [['tx','bim_tx'],['ty','bim_ty'],['tz','bim_tz'],
+                             ['rx','bim_rx'],['ry','bim_ry'],['rz','bim_rz'],['scale','bim_scale']]) {
+    $(prefix).value = bimTransform[k];
+    $(prefix+'_n').value = bimTransform[k];
+  }
+  applyBimTransform();
+  $('bim_status').textContent = `자동맞춤: scale=${bimTransform.scale.toFixed(3)}`;
+});
+
+// Initial fetch
+refreshBimList();
+
 connectWs();
 
 setInterval(() => {

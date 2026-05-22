@@ -18,6 +18,7 @@ import base64
 import json
 import logging
 import os
+import re
 import ssl
 import subprocess
 import time
@@ -151,6 +152,8 @@ async def viewer_page():
 
 UPLOAD_DIR = ROOT / "_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
+BIM_DIR = ROOT / "_bim"
+BIM_DIR.mkdir(exist_ok=True)
 
 
 @app.post("/api/upload-video")
@@ -190,6 +193,73 @@ async def upload_video(file: UploadFile = File(...), target_frames: int = 32):
         "elapsed_s": round(dt, 2),
         **info,
     })
+
+
+@app.post("/api/bim/upload")
+async def upload_bim(file: UploadFile = File(...)):
+    """Upload a BIM model file for projection overlay (glTF/GLB/OBJ)."""
+    ext = Path(file.filename or "model.glb").suffix.lower() or ".glb"
+    allowed = {".glb", ".gltf", ".obj"}
+    if ext not in allowed:
+        return JSONResponse({"ok": False, "error": f"unsupported ext {ext} (allowed: {sorted(allowed)})"},
+                            status_code=400)
+    ts = int(time.time() * 1000)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", Path(file.filename or "model").stem)[:48] or "model"
+    bim_id = f"bim_{ts}_{safe_name}"
+    dest = BIM_DIR / f"{bim_id}{ext}"
+    size = 0
+    with dest.open("wb") as f:
+        while True:
+            chunk = await file.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+            size += len(chunk)
+    log.info("BIM uploaded %s (%.1f MB)", dest.name, size / 1e6)
+    return {"ok": True, "id": bim_id, "file": dest.name, "bytes": size, "ext": ext}
+
+
+@app.get("/api/bim/list")
+async def list_bim():
+    """List uploaded BIM models, newest first."""
+    items = []
+    for ext in (".glb", ".gltf", ".obj"):
+        for p in BIM_DIR.glob(f"bim_*{ext}"):
+            stem = p.stem
+            ts_ms = int(stem.split("_")[1]) if stem.count("_") >= 2 else 0
+            items.append({
+                "id": stem, "file": p.name, "bytes": p.stat().st_size,
+                "ts_ms": ts_ms, "ext": ext,
+            })
+    items.sort(key=lambda x: x["ts_ms"], reverse=True)
+    return {"bim": items}
+
+
+@app.get("/api/bim/{bim_id}/file")
+async def get_bim_file(bim_id: str):
+    """Serve a BIM file by id."""
+    if not bim_id.startswith("bim_") or "/" in bim_id or ".." in bim_id:
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    for ext in (".glb", ".gltf", ".obj"):
+        p = BIM_DIR / f"{bim_id}{ext}"
+        if p.exists():
+            media = {"glb": "model/gltf-binary", "gltf": "model/gltf+json",
+                     "obj": "text/plain"}[ext[1:]]
+            return FileResponse(p, media_type=media,
+                                headers={"Cache-Control": "no-store"})
+    return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+
+
+@app.delete("/api/bim/{bim_id}")
+async def delete_bim(bim_id: str):
+    if not bim_id.startswith("bim_") or "/" in bim_id or ".." in bim_id:
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    removed = []
+    for ext in (".glb", ".gltf", ".obj"):
+        p = BIM_DIR / f"{bim_id}{ext}"
+        if p.exists():
+            p.unlink(); removed.append(p.name)
+    return {"ok": bool(removed), "removed": removed}
 
 
 @app.get("/api/uploads")
