@@ -154,9 +154,9 @@ class InferenceWorker:
         device: str = "cuda",
         image_size: int = 518,
         patch_size: int = 14,
-        window_size: int = 64,         # max frames per inference; whole buffer is used
-        interval_s: float = 2.5,
-        max_buffer: int = 64,
+        window_size: int = 32,         # streaming: 32 frames max per tick (was 64)
+        interval_s: float = 5.0,       # streaming tick interval (was 2.5 — caused pileup)
+        max_buffer: int = 32,
         max_points_per_frame: int = 30000,
         conf_threshold: float = 1.5,     # demo's absolute conf cutoff (vis_threshold)
         num_scale_frames: int = 16,      # more anchor frames → better global consistency
@@ -189,6 +189,7 @@ class InferenceWorker:
         self._lock = asyncio.Lock()
         self._frame_seq = 0
         self._last_emit_seq = -1
+        self._last_push_ts = 0.0
 
         log.info("loading lingbot-map model on %s …", device)
         t0 = time.time()
@@ -217,9 +218,11 @@ class InferenceWorker:
         self._stop = asyncio.Event()
 
     def start(self) -> None:
-        # Streaming loop is disabled in upload mode — model stays warm but no
-        # periodic inference runs. Use `process_video_file` instead.
-        return
+        """Spawn the periodic inference loop. Idempotent."""
+        if self._task is None or self._task.done():
+            self._stop.clear()
+            self._task = asyncio.create_task(self._loop())
+            log.info("inference loop spawned (interval %.1fs)", self.interval_s)
 
     async def stop(self) -> None:
         self._stop.set()
@@ -573,7 +576,16 @@ class InferenceWorker:
         return snap, meta
 
     async def push_frame(self, bgr: np.ndarray) -> None:
-        """Called from the WebRTC track consumer."""
+        """Called from the WebRTC track consumer.
+
+        Throttled to ~10 fps — WebRTC delivers 30 fps but we run inference every
+        few seconds, so preprocessing every frame wastes CPU. The buffer's deque
+        maxlen further trims old frames.
+        """
+        now = time.time()
+        if now - self._last_push_ts < 0.1:
+            return
+        self._last_push_ts = now
         tensor = _preprocess_bgr(bgr, target_w=self.image_size, patch=self.patch_size)
         rgb_thumb = (tensor.permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
         self._frame_seq += 1
@@ -585,20 +597,36 @@ class InferenceWorker:
                 self.buffer.append(item)
 
     async def _loop(self) -> None:
+        """Periodic inference. Skips ticks while one inference is still running
+        to prevent GPU pile-up that previously caused the 100% GPU lockup.
+        Streaming path always emits LBP2 points (TSDF mesh is too slow for live)."""
         log.info("inference loop running (every %.1fs)", self.interval_s)
         loop = asyncio.get_running_loop()
+        busy = False
+        # Force point output during streaming regardless of self.output_mode.
+        prev_mode = self.output_mode
         while not self._stop.is_set():
             await asyncio.sleep(self.interval_s)
+            if busy:
+                log.debug("skip tick — previous inference still running")
+                continue
             async with self._lock:
                 if len(self.anchor) + len(self.buffer) < 4:
                     continue
                 tail_cap = max(0, self.window_size - len(self.anchor))
                 snap = list(self.anchor) + list(self.buffer)[-tail_cap:]
+            busy = True
+            self.output_mode = "points"  # never run TSDF in the live path
             try:
+                t0 = time.time()
                 payload = await loop.run_in_executor(None, self._infer_sync, snap)
+                log.info("tick: N=%d in %.2fs", len(snap), time.time() - t0)
             except Exception as e:
                 log.exception("inference failed: %s", e)
-                continue
+                payload = None
+            finally:
+                self.output_mode = prev_mode
+                busy = False
             if payload is not None:
                 try:
                     await self.broadcast_fn(payload)
