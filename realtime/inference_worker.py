@@ -93,6 +93,19 @@ def _voxel_fuse_weighted(
     return xyz_out.astype(np.float32), rgb_out, sumw.astype(np.float32)
 
 
+def _depth_median_filter(depth_np: np.ndarray, ksize: int = 3) -> np.ndarray:
+    """Apply a per-frame median filter to remove salt-and-pepper noise from
+    estimated depth maps. Shape: (N, H, W) or (N, H, W, 1).
+    Median filter preserves edges far better than gaussian/box."""
+    out = depth_np.copy()
+    is_4d = (out.ndim == 4)
+    if is_4d:
+        out = out[..., 0]  # (N, H, W)
+    for i in range(out.shape[0]):
+        out[i] = cv2.medianBlur(out[i].astype(np.float32), ksize)
+    return out[..., None] if is_4d else out
+
+
 def _radius_outlier_filter(xyz: np.ndarray, rgb: np.ndarray,
                            radius: float = 0.05, min_neighbors: int = 4):
     """Drop points that have fewer than `min_neighbors` other points within
@@ -157,7 +170,7 @@ class InferenceWorker:
         window_size: int = 32,         # streaming: 32 frames max per tick (was 64)
         interval_s: float = 5.0,       # streaming tick interval (was 2.5 — caused pileup)
         max_buffer: int = 32,
-        max_points_per_frame: int = 30000,
+        max_points_per_frame: int = 270000,  # ≈ 518² (full per-frame point map)
         conf_threshold: float = 1.5,     # demo's absolute conf cutoff (vis_threshold)
         num_scale_frames: int = 16,      # more anchor frames → better global consistency
         output_mode: str = "points",     # "points" (LBP2) or "mesh" (LBM1, Tier 2 TSDF)
@@ -434,6 +447,7 @@ class InferenceWorker:
         depth_np = depth.detach().cpu().numpy().astype(np.float32)
         if depth_np.ndim == 3:
             depth_np = depth_np[..., None]
+        depth_np = _depth_median_filter(depth_np, ksize=3)
         wp = unproject_depth_map_to_point_map(depth_np, w2c_np, K_np)
         dc = preds.get("depth_conf")
         wpc = dc.detach().cpu().numpy() if dc is not None else None
@@ -682,6 +696,7 @@ class InferenceWorker:
         depth_np = depth.detach().cpu().numpy().astype(np.float32)
         if depth_np.ndim == 3:
             depth_np = depth_np[..., None]
+        depth_np = _depth_median_filter(depth_np, ksize=3)
         wp = unproject_depth_map_to_point_map(depth_np, w2c_np, K_np)
         dc = preds.get("depth_conf")
         wpc = dc.detach().cpu().numpy() if dc is not None else None
@@ -716,16 +731,17 @@ class InferenceWorker:
         rgb  = np.concatenate(all_rgb,  axis=0).astype(np.uint8)
         conf = np.concatenate(all_conf, axis=0).astype(np.float32)
 
-        # Tier 1 — confidence-weighted voxel fusion at 1.5 cm.
+        # Tier 1 — confidence-weighted voxel fusion at 0.8 cm.
         # Multi-view observations of the same surface collapse to one point.
         # Keep all voxels (min_obs=1) so unique observations survive; the
         # radius filter below handles isolated noise instead.
         n_before = xyz.shape[0]
         xyz, rgb, weights = _voxel_fuse_weighted(xyz, rgb, conf,
-                                                  voxel_size=0.015, min_obs=1)
+                                                  voxel_size=0.008, min_obs=1)
         n_voxel = xyz.shape[0]
-        # Radius outlier filter: drop floaters with <3 neighbors in 4 cm.
-        xyz, rgb = _radius_outlier_filter(xyz, rgb, radius=0.04, min_neighbors=3)
+        # Radius outlier filter: drop floaters with <5 neighbors in 3 cm.
+        # Higher density → stricter neighborhood requirement.
+        xyz, rgb = _radius_outlier_filter(xyz, rgb, radius=0.03, min_neighbors=5)
         log.info("Tier1 fusion: %d → voxel %d → outlier %d points",
                  n_before, n_voxel, xyz.shape[0])
 
