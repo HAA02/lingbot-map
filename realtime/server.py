@@ -250,6 +250,45 @@ async def get_bim_file(bim_id: str):
     return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
 
 
+@app.post("/api/bim/align")
+async def align_bim(payload: dict):
+    """Compute Sim(3) alignment from correspondences via umeyama.
+
+    Body:
+        {
+          "correspondences": [
+            {"bim": [x,y,z], "scan": [x,y,z]},
+            ... (>= 3 pairs)
+          ]
+        }
+    Response: { scale, rotation: [[..]*3], translation: [x,y,z], rmse, quality, n }
+    """
+    try:
+        from lingbot_map.bim.alignment import solve_sim3_umeyama
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"alignment module missing: {e}"}, status_code=500)
+    pairs = payload.get("correspondences", [])
+    if len(pairs) < 3:
+        return JSONResponse({"ok": False, "error": "need >=3 correspondences"}, status_code=400)
+    try:
+        src = np.array([p["bim"]  for p in pairs], dtype=np.float64)   # BIM-local
+        dst = np.array([p["scan"] for p in pairs], dtype=np.float64)   # scan world
+        result = solve_sim3_umeyama(src, dst)
+        return {
+            "ok": True,
+            "scale": float(result.transform.scale),
+            "rotation": result.transform.rotation.tolist(),
+            "translation": result.transform.translation.tolist(),
+            "rmse": float(result.rmse),
+            "quality": result.quality,
+            "n": int(result.n_correspondences),
+            "per_point_residuals": result.per_point_residuals.tolist(),
+        }
+    except Exception as e:
+        log.exception("alignment failed: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
 @app.delete("/api/bim/{bim_id}")
 async def delete_bim(bim_id: str):
     if not bim_id.startswith("bim_") or "/" in bim_id or ".." in bim_id:

@@ -77,6 +77,21 @@
   <div class="row"><label>RZ°</label><input type="range" id="bim_rz" min="-180" max="180" step="1" value="0"><input type="number" id="bim_rz_n" step="1" value="0"></div>
   <div class="row"><label>Scale</label><input type="range" id="bim_scale" min="0.01" max="20" step="0.01" value="1"><input type="number" id="bim_scale_n" step="0.01" value="1"></div>
   <div class="row" style="opacity:.6;font-size:11px"><span id="bim_status">대기</span></div>
+  <hr style="border:0;border-top:1px solid #333;margin:8px 0">
+  <h3 style="margin:0 0 6px 0;font-size:12px;opacity:.85">🎯 대응점 정합</h3>
+  <div class="row" style="font-size:11px;opacity:.7;line-height:1.3;display:block;margin-bottom:4px">
+    Shift+클릭으로 점군과 BIM 짝짓기 (≥3쌍). 점군 먼저, 그 다음 같은 위치의 BIM 클릭.
+  </div>
+  <div class="row">
+    <span>수집:<b id="cor_count" style="margin-left:4px">0</b>쌍</span>
+    <span style="margin-left:8px">대기:<b id="cor_pending" style="margin-left:4px">—</b></span>
+  </div>
+  <div class="row">
+    <button id="cor_solve" style="background:#2a7a2a;flex:1">🧮 정합 계산 & 적용</button>
+    <button id="cor_clear" title="대응점 모두 삭제">↺</button>
+    <button id="cor_undo" title="마지막 항목 삭제">⌫</button>
+  </div>
+  <div class="row" style="opacity:.7;font-size:11px"><span id="cor_status">대기</span></div>
 </div>
 <div class="stats">
   <span>WS<b id="s_ws">—</b></span>
@@ -649,6 +664,167 @@ $('bim_fit').addEventListener('click', () => {
 
 // Initial fetch
 refreshBimList();
+
+// ───────────────────────── Correspondence picking ─────────────────────────
+// User Shift+clicks a scan point, then Shift+clicks the matching BIM point.
+// >=3 pairs → POST /api/bim/align → apply returned (s,R,t) to bimTransform.
+// World-space BIM clicks are converted to BIM-local via the current transform inverse.
+const correspondences = [];  // [{scan:[x,y,z], bim:[x,y,z]}]
+let pendingScan = null;      // last unmatched scan point
+const corMarkers = new THREE.Group();
+scene.add(corMarkers);
+
+const raycaster = new THREE.Raycaster();
+raycaster.params.Points = { threshold: 0.05 };  // world-units near a point
+const ndc = new THREE.Vector2();
+
+function makeMarker(color, pos) {
+  const g = new THREE.SphereGeometry(0.02, 12, 8);
+  const m = new THREE.MeshBasicMaterial({ color, depthTest: false, transparent: true, opacity: 0.9 });
+  const s = new THREE.Mesh(g, m);
+  s.position.copy(pos);
+  s.renderOrder = 999;
+  return s;
+}
+
+function updateCorUi() {
+  $('cor_count').textContent = correspondences.length;
+  $('cor_pending').textContent = pendingScan ? `점군 (${pendingScan.map(v=>v.toFixed(2)).join(',')})` : '—';
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (!e.shiftKey) return;  // only Shift+click triggers picking
+  const rect = canvas.getBoundingClientRect();
+  ndc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  ndc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(ndc, camera);
+
+  if (pendingScan === null) {
+    // Pick on scan geometry — points (geom) or mesh (meshObj)
+    let hit = null;
+    const ptHits = raycaster.intersectObject(points, false);
+    if (ptHits.length) hit = ptHits[0];
+    if (meshObj) {
+      const mHits = raycaster.intersectObject(meshObj, false);
+      if (mHits.length && (!hit || mHits[0].distance < hit.distance)) hit = mHits[0];
+    }
+    if (!hit) { $('cor_status').textContent = '점군에서 가까운 점을 찾지 못함'; return; }
+    pendingScan = [hit.point.x, hit.point.y, hit.point.z];
+    corMarkers.add(makeMarker(0xffcc00, hit.point));
+    $('cor_status').textContent = '이제 같은 위치의 BIM 표면을 Shift+클릭하세요';
+    updateCorUi();
+  } else {
+    // Pick on BIM
+    if (!bimRoot) { $('cor_status').textContent = 'BIM이 로드되지 않음'; return; }
+    const hits = raycaster.intersectObject(bimRoot, true);
+    if (!hits.length) { $('cor_status').textContent = 'BIM에서 가까운 점을 찾지 못함'; return; }
+    const wp = hits[0].point.clone();
+    // Convert world-space BIM hit → BIM-local (the source frame for umeyama).
+    // bimRoot world matrix is composed from bimTransform. We invert it.
+    bimRoot.updateMatrixWorld(true);
+    const inv = new THREE.Matrix4().copy(bimRoot.matrixWorld).invert();
+    const lp = wp.clone().applyMatrix4(inv);
+    correspondences.push({
+      scan: pendingScan,
+      bim: [lp.x, lp.y, lp.z],
+    });
+    corMarkers.add(makeMarker(0x00ccff, wp));
+    pendingScan = null;
+    $('cor_status').textContent = `${correspondences.length}쌍 수집 (≥3 필요)`;
+    updateCorUi();
+  }
+});
+
+function clearCorMarkers() {
+  while (corMarkers.children.length) {
+    const m = corMarkers.children[0];
+    corMarkers.remove(m);
+    m.geometry?.dispose(); m.material?.dispose();
+  }
+}
+
+$('cor_clear').onclick = () => {
+  correspondences.length = 0;
+  pendingScan = null;
+  clearCorMarkers();
+  $('cor_status').textContent = '초기화';
+  updateCorUi();
+};
+$('cor_undo').onclick = () => {
+  if (pendingScan) {
+    pendingScan = null;
+    if (corMarkers.children.length) {
+      const m = corMarkers.children.pop();
+      m.geometry?.dispose(); m.material?.dispose();
+    }
+  } else if (correspondences.length) {
+    correspondences.pop();
+    // remove last two markers (scan + bim)
+    for (let i = 0; i < 2 && corMarkers.children.length; i++) {
+      const m = corMarkers.children.pop();
+      m.geometry?.dispose(); m.material?.dispose();
+    }
+  }
+  $('cor_status').textContent = '되돌림';
+  updateCorUi();
+};
+
+$('cor_solve').onclick = async () => {
+  if (correspondences.length < 3) {
+    $('cor_status').textContent = `최소 3쌍 필요 (현재 ${correspondences.length})`;
+    return;
+  }
+  if (!bimRoot) {
+    $('cor_status').textContent = 'BIM이 로드되지 않음';
+    return;
+  }
+  $('cor_status').textContent = '계산 중…';
+  try {
+    const r = await fetch('/api/bim/align', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ correspondences }),
+    }).then(r => r.json());
+    if (!r.ok) { $('cor_status').textContent = `실패: ${r.error}`; return; }
+    // Apply (s, R, t) to bimRoot: y = s*R @ x + t maps BIM-local → scan world.
+    // In Three.js, that's: matrix = T * R * S applied as bimRoot's local matrix.
+    const s = r.scale;
+    const R = r.rotation;  // 3x3 row-major
+    const t = r.translation;
+    // Compose into Three.js Matrix4 (column-major internally; .set takes row-major)
+    const m = new THREE.Matrix4();
+    m.set(
+      s*R[0][0], s*R[0][1], s*R[0][2], t[0],
+      s*R[1][0], s*R[1][1], s*R[1][2], t[1],
+      s*R[2][0], s*R[2][1], s*R[2][2], t[2],
+      0, 0, 0, 1
+    );
+    // Decompose to position/quaternion/scale → bimRoot
+    const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scl = new THREE.Vector3();
+    m.decompose(pos, quat, scl);
+    bimRoot.position.copy(pos);
+    bimRoot.quaternion.copy(quat);
+    bimRoot.scale.copy(scl);
+    // Sync UI sliders (rotation is shown in Euler degrees)
+    const euler = new THREE.Euler().setFromQuaternion(quat, 'XYZ');
+    bimTransform.tx = pos.x; bimTransform.ty = pos.y; bimTransform.tz = pos.z;
+    bimTransform.rx = euler.x*180/Math.PI;
+    bimTransform.ry = euler.y*180/Math.PI;
+    bimTransform.rz = euler.z*180/Math.PI;
+    bimTransform.scale = scl.x;   // umeyama gives uniform scale; .x == .y == .z
+    for (const [k, prefix] of [['tx','bim_tx'],['ty','bim_ty'],['tz','bim_tz'],
+                               ['rx','bim_rx'],['ry','bim_ry'],['rz','bim_rz'],['scale','bim_scale']]) {
+      $(prefix).value = bimTransform[k];
+      $(prefix+'_n').value = bimTransform[k];
+    }
+    // Materials already attached; just ensure they update
+    for (const mat of bimMaterials) mat.needsUpdate = true;
+    $('cor_status').textContent =
+      `정합 완료: RMSE=${r.rmse.toFixed(3)}m · scale=${s.toFixed(3)} · ${r.quality} (${r.n}쌍)`;
+  } catch (e) {
+    console.error('alignment error', e);
+    $('cor_status').textContent = `오류: ${e.message || e}`;
+  }
+};
 
 connectWs();
 
