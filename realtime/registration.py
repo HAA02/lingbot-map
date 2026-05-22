@@ -65,7 +65,51 @@ def apply_similarity_to_w2c(w2c: np.ndarray, s: float, R: np.ndarray, t: np.ndar
     return closed_form_inverse_se3(c2w44_new)[:, :3, :].astype(np.float32)
 
 
-def chain_windows(windows: list[dict], overlap: int) -> dict:
+def icp_refine_rigid(
+    src: np.ndarray, dst: np.ndarray, *,
+    max_iter: int = 12, reject_pct: float = 70.0, tol: float = 1e-5,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Point-to-point ICP with reciprocal-NN matching and percentile-based outlier
+    rejection. Refines a rigid (R, t) that aligns `src` → `dst`. Scale is held
+    at 1 (use after a Sim(3) seed has already absorbed the scale).
+
+    Returns (R_total, t_total, final_rmse). Both src and dst are (M, 3) arrays.
+    """
+    from scipy.spatial import cKDTree
+    if src.shape[0] < 3 or dst.shape[0] < 3:
+        return np.eye(3, dtype=np.float32), np.zeros(3, dtype=np.float32), float("inf")
+    R_total = np.eye(3, dtype=np.float64)
+    t_total = np.zeros(3, dtype=np.float64)
+    cur = src.astype(np.float64)
+    prev_rmse = float("inf")
+    dst_tree = cKDTree(dst)
+    for _ in range(max_iter):
+        d, idx = dst_tree.query(cur, k=1)
+        thresh = np.percentile(d, reject_pct)
+        mask = d < thresh
+        if mask.sum() < 3:
+            break
+        src_c = cur[mask]
+        dst_c = dst[idx[mask]]
+        src_mean = src_c.mean(0); dst_mean = dst_c.mean(0)
+        H = (src_c - src_mean).T @ (dst_c - dst_mean)
+        U, _, Vt = np.linalg.svd(H)
+        if np.linalg.det(Vt.T @ U.T) < 0:
+            Vt[-1] *= -1
+        R_step = Vt.T @ U.T
+        t_step = dst_mean - R_step @ src_mean
+        cur = (R_step @ cur.T).T + t_step
+        # Compose into running transform
+        R_total = R_step @ R_total
+        t_total = R_step @ t_total + t_step
+        rmse = float(np.sqrt((d[mask] ** 2).mean()))
+        if abs(prev_rmse - rmse) < tol:
+            break
+        prev_rmse = rmse
+    return R_total.astype(np.float32), t_total.astype(np.float32), float(prev_rmse)
+
+
+def chain_windows(windows: list[dict], overlap: int, *, use_icp: bool = True) -> dict:
     """Align a list of per-window result dicts into a common frame.
 
     Each window dict must contain:
@@ -98,23 +142,62 @@ def chain_windows(windows: list[dict], overlap: int) -> dict:
     for k in range(1, len(windows)):
         ref = aligned[-1]
         new = windows[k]
-        # Overlap correspondences
-        src = new["c2w"][:overlap, :3, 3]   # first overlap of new window (in its local frame)
-        dst = ref["c2w"][-overlap:, :3, 3]  # last overlap of previous (already in cumulative frame)
+        # 1) Procrustes on overlap cam centers (Sim3, absorbs scale + coarse pose).
+        src = new["c2w"][:overlap, :3, 3]
+        dst = ref["c2w"][-overlap:, :3, 3]
         s_k, R_k, t_k = procrustes_align(src, dst)
-        # Compose with running cumulative (we already have ref in target frame)
-        # We just need the transform from new-local → ref's (already-aligned) frame.
+        # Apply Procrustes to new window
+        xyz_new = apply_similarity_to_points(new["xyz"], s_k, R_k, t_k)
+        c2w_new = apply_similarity_to_c2w(new["c2w"], s_k, R_k, t_k)
+        w2c_new = apply_similarity_to_w2c(new["w2c"], s_k, R_k, t_k)
+
+        # 2) ICP refinement on overlap-region surface points (rigid).
+        # Take points belonging to overlap frames of each window for surface-level
+        # alignment that goes beyond cam-center fit.
+        icp_R, icp_t, icp_rmse = np.eye(3, dtype=np.float32), np.zeros(3, dtype=np.float32), float("nan")
+        if use_icp:
+            # Subsample to keep ICP fast: up to 8000 points from each overlap region.
+            # Heuristic: points from a window with conf in top-50%.
+            try:
+                # ref overlap points (last `overlap` cam frames worth)
+                # We use ALL points of the ref window as the target — surface coverage.
+                ref_pts = ref["xyz"]
+                new_pts = xyz_new
+                if ref_pts.shape[0] > 8000:
+                    idx = np.random.default_rng(k * 13).choice(ref_pts.shape[0], 8000, replace=False)
+                    ref_pts = ref_pts[idx]
+                if new_pts.shape[0] > 8000:
+                    idx = np.random.default_rng(k * 17).choice(new_pts.shape[0], 8000, replace=False)
+                    new_pts = new_pts[idx]
+                icp_R, icp_t, icp_rmse = icp_refine_rigid(new_pts, ref_pts, max_iter=15, reject_pct=70.0)
+                # Apply ICP correction to xyz and c2w
+                xyz_new = (xyz_new @ icp_R.T) + icp_t
+                # c2w: rotation gets premultiplied; translation = R @ t_old + t_step
+                R_old = c2w_new[:, :3, :3]
+                t_old = c2w_new[:, :3, 3]
+                c2w_new = c2w_new.copy()
+                c2w_new[:, :3, :3] = icp_R @ R_old
+                c2w_new[:, :3, 3]  = (t_old @ icp_R.T) + icp_t
+                # w2c: recompute via inverse
+                from lingbot_map.utils.geometry import closed_form_inverse_se3
+                N = c2w_new.shape[0]
+                c44 = np.tile(np.eye(4, dtype=np.float32)[None], (N, 1, 1))
+                c44[:, :3, :4] = c2w_new
+                w2c_new = closed_form_inverse_se3(c44)[:, :3, :].astype(np.float32)
+            except Exception:
+                pass
+
         new_aligned = {
-            "c2w":  apply_similarity_to_c2w(new["c2w"], s_k, R_k, t_k),
-            "w2c":  apply_similarity_to_w2c(new["w2c"], s_k, R_k, t_k),
-            "xyz":  apply_similarity_to_points(new["xyz"], s_k, R_k, t_k),
+            "c2w":  c2w_new,
+            "w2c":  w2c_new,
+            "xyz":  xyz_new,
             "rgb":  new["rgb"],
             "conf": new["conf"],
-            # Depth values are in camera frame, unchanged by world-space similarity.
             "depth":  new["depth"],
             "thumbs": new["thumbs"],
             "K":      new["K"],
             "scale_to_ref": s_k,
+            "icp_rmse": icp_rmse,
         }
         aligned.append(new_aligned)
 

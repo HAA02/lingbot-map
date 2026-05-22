@@ -160,9 +160,9 @@ class InferenceWorker:
         max_points_per_frame: int = 30000,
         conf_threshold: float = 1.5,     # demo's absolute conf cutoff (vis_threshold)
         num_scale_frames: int = 16,      # more anchor frames → better global consistency
-        output_mode: str = "mesh",       # "points" (LBP2) or "mesh" (LBM1, Tier 2 TSDF)
-        tsdf_voxel: float = 0.025,       # TSDF voxel size (m)
-        tsdf_trunc: float = 0.10,        # truncation distance (m)
+        output_mode: str = "points",     # "points" (LBP2) or "mesh" (LBM1, Tier 2 TSDF)
+        tsdf_voxel: float = 0.012,       # TSDF voxel size (m): 1.2 cm for sharper surfaces
+        tsdf_trunc: float = 0.04,        # truncation band (m): ≈ 3×voxel; thin shells, not slabs
     ) -> None:
         self.broadcast_fn = broadcast_fn
         self.device = device
@@ -230,8 +230,8 @@ class InferenceWorker:
             await self._task
 
     async def process_video_file(
-        self, path: Path, *, target_frames: int = 32,
-        multi_window_threshold: int = 300, window_overlap: int = 8,
+        self, path: Path, *, target_frames: int = 48,
+        multi_window_threshold: int = 300, window_overlap: int = 16,
     ) -> tuple[bytes | None, list[bytes], dict]:
         """Sample frames from the video, run inference, broadcast the result.
 
@@ -247,7 +247,7 @@ class InferenceWorker:
 
         if use_long:
             # Multi-window: split into K windows of `target_frames` each
-            num_windows = max(2, min(6, total // (target_frames * 2)))
+            num_windows = max(2, min(4, total // (target_frames * 2)))
             payload, thumbs_jpeg, info = await self._process_video_multiwindow(
                 str(path), target_frames=target_frames,
                 num_windows=num_windows, overlap=window_overlap,
@@ -453,6 +453,8 @@ class InferenceWorker:
             all_conf.append(conf[idx] if conf is not None else np.ones(idx.size, dtype=np.float32))
         if not all_xyz:
             return None
+        log.info("window: N_input=%d c2w.shape=%s xyz=%d",
+                 N, c2w_np.shape, sum(a.shape[0] for a in all_xyz))
         return {
             "xyz":  np.concatenate(all_xyz,  axis=0).astype(np.float32),
             "rgb":  np.concatenate(all_rgb,  axis=0).astype(np.uint8),
@@ -460,7 +462,7 @@ class InferenceWorker:
             "c2w":  c2w_np,
             "w2c":  w2c_np,
             "K":    K_np,
-            "depth": depth_np.squeeze(-1),  # (N, H, W)
+            "depth": depth_np.squeeze(-1),
             "thumbs": thumbs,
         }
 

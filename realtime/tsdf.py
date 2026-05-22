@@ -56,8 +56,9 @@ def build_tsdf_volume(
     mx = cam_centers.max(axis=0) + margin
 
     dims = np.ceil((mx - mn) / voxel_size).astype(np.int32)
-    # Safety cap: avoid runaway memory (e.g., bad depth gives 10m fan in a 0.5m scene).
-    dims = np.clip(dims, 16, 350)
+    # Safety cap: avoid runaway memory. 600 per axis × 0.012m = 7.2m scene OK;
+    # at 600³ = 216M voxels × 8B (tsdf+weight f32 each) = 1.7 GB peak. Fits.
+    dims = np.clip(dims, 16, 600)
     Dx, Dy, Dz = int(dims[0]), int(dims[1]), int(dims[2])
     origin = mn.astype(np.float32)
 

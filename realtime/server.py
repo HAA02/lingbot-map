@@ -157,7 +157,7 @@ BIM_DIR.mkdir(exist_ok=True)
 
 
 @app.post("/api/upload-video")
-async def upload_video(file: UploadFile = File(...), target_frames: int = 32):
+async def upload_video(file: UploadFile = File(...), target_frames: int = 48):
     if STATE.worker is None:
         return JSONResponse({"ok": False, "error": "model not loaded"}, status_code=503)
     ext = Path(file.filename or "video.mp4").suffix.lower() or ".mp4"
@@ -504,8 +504,9 @@ async def on_startup():
     if not Path(model_path).exists():
         log.warning("LINGBOT_MODEL not found at %s — running in transport-only mode", model_path)
         return
-    log.info("starting inference worker (model=%s)", model_path)
-    STATE.worker = InferenceWorker(model_path, broadcast_point_cloud)
+    out_mode = os.environ.get("LINGBOT_OUTPUT_MODE", "points")  # "points" | "mesh"
+    log.info("starting inference worker (model=%s, output_mode=%s)", model_path, out_mode)
+    STATE.worker = InferenceWorker(model_path, broadcast_point_cloud, output_mode=out_mode)
     STATE.worker.start()
 
 
