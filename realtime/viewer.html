@@ -140,32 +140,72 @@ scene.add(new THREE.GridHelper(20, 20, 0x333333, 0x222222));
 const MAX_POINTS = 2_000_000;
 const positions = new Float32Array(MAX_POINTS * 3);
 const colors = new Float32Array(MAX_POINTS * 3);
+const normals  = new Float32Array(MAX_POINTS * 3);  // Phase A: per-point normals
 const geom = new THREE.BufferGeometry();
 geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+geom.setAttribute('color',    new THREE.BufferAttribute(colors,    3));
+geom.setAttribute('normal',   new THREE.BufferAttribute(normals,   3));
 geom.setDrawRange(0, 0);
-// world-unit point size (sizeAttenuation true) → closer points appear bigger,
-// matching demo's viser viewer. Updated dynamically from scene span.
-let pointSize = 0.01;
-function makeCircleTex() {
-  const c = document.createElement('canvas');
-  c.width = c.height = 64;
-  const ctx = c.getContext('2d');
-  const g = ctx.createRadialGradient(32,32,8, 32,32,30);
-  g.addColorStop(0.0, 'rgba(255,255,255,1)');
-  g.addColorStop(0.7, 'rgba(255,255,255,1)');
-  g.addColorStop(1.0, 'rgba(255,255,255,0)');
-  ctx.fillStyle = g;
-  ctx.beginPath(); ctx.arc(32,32,32,0,Math.PI*2); ctx.fill();
-  return new THREE.CanvasTexture(c);
-}
-const pointTex = makeCircleTex();
-const mat = new THREE.PointsMaterial({
-  size: pointSize, vertexColors: true, sizeAttenuation: true,
-  map: pointTex, alphaTest: 0.4, transparent: true, depthWrite: true,
+let pointSize = 0.01;     // world-unit splat radius
+let hasNormals = false;   // toggled true when LBP3 received
+
+// Phase A — surfel splat shader: each point becomes a disk that fades by
+// (1 − distance_to_center) and is back-face-culled by the dot product of the
+// point normal with the view vector. Disks at glancing angles fade out so
+// the surface reads cleanly instead of looking like 360° foam.
+const splatMat = new THREE.ShaderMaterial({
+  transparent: true,
+  depthTest: true,
+  depthWrite: true,
+  vertexColors: true,
+  uniforms: {
+    uSize:       { value: pointSize },
+    uViewportH:  { value: window.innerHeight },
+    uNormalCull: { value: 0.15 },   // cos(82°): below this → discard
+  },
+  vertexShader: /* glsl */`
+    attribute vec3 color;
+    attribute vec3 normal;
+    varying vec3 vColor;
+    varying vec3 vNormal;
+    varying vec3 vViewDir;
+    uniform float uSize;
+    uniform float uViewportH;
+    void main() {
+      vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+      gl_Position = projectionMatrix * mvPos;
+      // World-unit size projected to screen pixels via perspective.
+      gl_PointSize = uSize * uViewportH * projectionMatrix[1][1] / -mvPos.z;
+      vColor = color;
+      vNormal = normalize(normalMatrix * normal);
+      vViewDir = normalize(-mvPos.xyz);
+    }
+  `,
+  fragmentShader: /* glsl */`
+    precision mediump float;
+    varying vec3 vColor;
+    varying vec3 vNormal;
+    varying vec3 vViewDir;
+    uniform float uNormalCull;
+    void main() {
+      vec2 d = gl_PointCoord * 2.0 - 1.0;
+      float r2 = dot(d, d);
+      if (r2 > 1.0) discard;                       // round disk
+      float facing = abs(dot(vNormal, vViewDir));
+      if (facing < uNormalCull) discard;           // back-face cull
+      float alpha = (1.0 - r2) * (0.6 + 0.4 * facing);
+      // Soft lambert + ambient so disks read as surface
+      float light = 0.55 + 0.45 * facing;
+      gl_FragColor = vec4(vColor * light, alpha);
+    }
+  `,
 });
-const points = new THREE.Points(geom, mat);
+const points = new THREE.Points(geom, splatMat);
 scene.add(points);
+
+window.addEventListener('resize', () => {
+  splatMat.uniforms.uViewportH.value = window.innerHeight;
+});
 let usedPoints = 0;
 let bounds = null;  // {min:[x,y,z], max:[x,y,z]}
 
@@ -286,13 +326,15 @@ function fitView() {
   controls.update();
 }
 
-function replacePoints(xyz, rgb) {
+function replacePoints(xyz, rgb, nrm) {
   // Replace mode: overwrite the entire point cloud and recompute bounds.
   // OpenCV world → Three.js: M = diag(1,-1,-1): flip Y (down→up) and Z (forward→back).
+  // `nrm` (optional Float32Array) is per-point normal in OpenCV world; same flip applied.
   const n = Math.min(xyz.length / 3, MAX_POINTS);
   if (n === 0) { usedPoints = 0; geom.setDrawRange(0, 0); return 0; }
   let mn = [xyz[0], -xyz[1], -xyz[2]];
   let mx = [xyz[0], -xyz[1], -xyz[2]];
+  hasNormals = !!nrm;
   for (let i = 0; i < n; i++) {
     const x = xyz[i*3], y = -xyz[i*3+1], z = -xyz[i*3+2];
     positions[i*3+0] = x; positions[i*3+1] = y; positions[i*3+2] = z;
@@ -301,13 +343,24 @@ function replacePoints(xyz, rgb) {
     colors[i*3+0] = _srgbLut[rgb[i*3+0]];
     colors[i*3+1] = _srgbLut[rgb[i*3+1]];
     colors[i*3+2] = _srgbLut[rgb[i*3+2]];
+    if (nrm) {
+      normals[i*3+0] =  nrm[i*3+0];
+      normals[i*3+1] = -nrm[i*3+1];
+      normals[i*3+2] = -nrm[i*3+2];
+    } else {
+      // No normals → set to view-aligned (z) so shader treats them as billboards.
+      normals[i*3+0] = 0; normals[i*3+1] = 0; normals[i*3+2] = 1;
+    }
   }
   bounds = {min: mn, max: mx};
   usedPoints = n;
   geom.attributes.position.needsUpdate = true;
   geom.attributes.color.needsUpdate = true;
+  geom.attributes.normal.needsUpdate = true;
   geom.setDrawRange(0, usedPoints);
   geom.computeBoundingSphere();
+  // Disable back-face cull when normals are unknown (LBP2 path).
+  splatMat.uniforms.uNormalCull.value = hasNormals ? 0.15 : -1.0;
 
   // auto camera-frustum scale based on scene extent (frustum is in world units).
   // Point size is in screen pixels (sizeAttenuation=false) — no rescale needed.
@@ -320,7 +373,7 @@ function replacePoints(xyz, rgb) {
   // Adapt world-unit point size to scene scale: ~0.3% of span — bigger points
   // overlap visually so the cloud reads as a surface, not isolated dots.
   const newPt = Math.max(0.003, span * 0.003);
-  if (!userSetPointSize) { pointSize = newPt; mat.size = pointSize;
+  if (!userSetPointSize) { pointSize = newPt; splatMat.uniforms.uSize.value = pointSize;
     $('psize').value = pointSize.toFixed(3); }
   return n;
 }
@@ -339,7 +392,7 @@ $('toggleThumbs').onclick = () => {
 };
 $('psize').oninput = e => {
   pointSize = parseFloat(e.target.value);
-  mat.size = pointSize;
+  splatMat.uniforms.uSize.value = pointSize;
   userSetPointSize = true;
 };
 $('clear').onclick = () => {
@@ -437,7 +490,7 @@ function connectWs() {
     const buf = new DataView(ev.data);
     const magic = String.fromCharCode(buf.getUint8(0), buf.getUint8(1), buf.getUint8(2), buf.getUint8(3));
     console.log('[viewer] WS payload', ev.data.byteLength, 'bytes magic=', magic);
-    if (magic === 'LBP2') {
+    if (magic === 'LBP2' || magic === 'LBP3') {
       const flags   = buf.getUint32(4, true);
       const numPts  = buf.getUint32(8, true);
       const numPoses= buf.getUint32(12, true);
@@ -445,6 +498,12 @@ function connectWs() {
       let off = 20;
       const xyz = new Float32Array(ev.data, off, numPts*3); off += numPts*3*4;
       const rgb = new Uint8Array(ev.data, off, numPts*3); off += numPts*3;
+      let nrm = null;
+      if (magic === 'LBP3') {
+        // copy-into aligned buffer; rgb u8 region leaves the next offset unaligned for f32 view
+        nrm = new Float32Array(ev.data.slice(off, off + numPts*3*4));
+        off += numPts*3*4;
+      }
       const posesBytes = numPoses*12*4;
       const poses = new Float32Array(ev.data.slice(off, off + posesBytes)); off += posesBytes;
       const K = new Float32Array(ev.data.slice(off, off + 9*4)); off += 9*4;
@@ -453,7 +512,7 @@ function connectWs() {
       if (meshObj) { scene.remove(meshObj); meshObj.geometry.dispose(); meshObj = null; }
       camCount = 0;
       trajPositions.length = 0;
-      replacePoints(xyz, rgb);
+      replacePoints(xyz, rgb, nrm);
       for (let i = 0; i < numPoses; i++) {
         addCameraFrustum(poses.subarray(i*12, (i+1)*12), K, camScale, latestThumbs[i] || null);
       }

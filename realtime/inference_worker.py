@@ -106,6 +106,39 @@ def _depth_median_filter(depth_np: np.ndarray, ksize: int = 3) -> np.ndarray:
     return out[..., None] if is_4d else out
 
 
+def _estimate_normals_pca(xyz: np.ndarray, k: int = 20,
+                          orient_toward: np.ndarray | None = None) -> np.ndarray:
+    """Estimate per-point surface normals via PCA on k-nearest neighbors.
+
+    Args:
+        xyz: (N, 3) point positions.
+        k: number of neighbors for PCA (including self).
+        orient_toward: optional (3,) world point — flip normals so they point
+            toward this location (e.g., camera centroid for inside-out scans).
+    Returns:
+        normals: (N, 3) unit vectors.
+    """
+    if xyz.shape[0] < k + 1:
+        return np.zeros_like(xyz)
+    from scipy.spatial import cKDTree
+    tree = cKDTree(xyz)
+    _, idx = tree.query(xyz, k=k)
+    nbrs = xyz[idx]                                # (N, k, 3)
+    centroids = nbrs.mean(axis=1, keepdims=True)   # (N, 1, 3)
+    centered = nbrs - centroids                    # (N, k, 3)
+    # Batched covariance: (N, 3, 3)
+    cov = np.einsum("nki,nkj->nij", centered, centered) / float(k)
+    # Eigendecomposition: smallest eigenvalue's eigenvector ≈ surface normal
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    normals = eigvecs[:, :, 0].astype(np.float32)  # already sorted ascending
+    # Orient consistently
+    if orient_toward is not None:
+        to = (orient_toward[None, :] - xyz).astype(np.float32)
+        flip = (to * normals).sum(axis=1) < 0
+        normals[flip] *= -1
+    return normals
+
+
 def _radius_outlier_filter(xyz: np.ndarray, rgb: np.ndarray,
                            radius: float = 0.05, min_neighbors: int = 4):
     """Drop points that have fewer than `min_neighbors` other points within
@@ -524,9 +557,16 @@ class InferenceWorker:
             except Exception:
                 log.exception("TSDF failed in merged path; falling back to points")
 
-        # LBP2 point cloud fallback
-        header = struct.pack("<4sIIII", b"LBP2", 1, xyz.shape[0], c2w_np.shape[0], seq)
+        # Phase A — per-point normals for surfel splat rendering
+        cam_centroid = c2w_np[:, :, 3].mean(axis=0)
+        t_n = time.time()
+        normals = _estimate_normals_pca(xyz, k=20, orient_toward=cam_centroid)
+        log.info("Phase A(merged): normals %d in %.2fs", normals.shape[0], time.time() - t_n)
+
+        # LBP3 with normals
+        header = struct.pack("<4sIIII", b"LBP3", 1, xyz.shape[0], c2w_np.shape[0], seq)
         body = (xyz.tobytes() + rgb.tobytes()
+                + normals.astype(np.float32).tobytes()
                 + c2w_np.astype(np.float32).tobytes()
                 + K_np[0].astype(np.float32).tobytes())
         return header + body
@@ -801,15 +841,23 @@ class InferenceWorker:
             except Exception as e:
                 log.exception("TSDF mesh extraction failed, falling back to LBP2: %s", e)
 
-        # Binary v2 — full snapshot for this tick. Viewer must replace its scene.
-        #   magic 'LBP2' (4) | flags u32(1=replace) | num_pts u32 | num_poses u32 | seq u32
-        #   xyz f32 (num_pts*3) | rgb u8 (num_pts*3)
-        #   poses f32 (num_poses*12 row-major 3x4 c2w) | K0 f32 9
+        # Phase A — compute per-point normals via PCA on k-NN for surfel/splat rendering.
+        # Orient normals toward camera centroid (inside-out scan convention).
+        cam_centroid = c2w_np[:, :, 3].mean(axis=0)
+        t_n = time.time()
+        normals = _estimate_normals_pca(xyz, k=20, orient_toward=cam_centroid)
+        log.info("Phase A: normals %d in %.2fs", normals.shape[0], time.time() - t_n)
+
+        # Binary v3 (LBP3) — points + colors + normals for oriented disk splat rendering.
+        #   magic 'LBP3'(4) | flags u32 | num_pts u32 | num_poses u32 | seq u32
+        #   xyz f32(N*3) | rgb u8(N*3) | normal f32(N*3)
+        #   poses f32(M*12) | K f32(9)
         flags = 1
-        header = struct.pack("<4sIIII", b"LBP2", flags, xyz.shape[0], c2w_np.shape[0], self._frame_seq)
+        header = struct.pack("<4sIIII", b"LBP3", flags, xyz.shape[0], c2w_np.shape[0], self._frame_seq)
         body = (
             xyz.tobytes()
             + rgb.tobytes()
+            + normals.astype(np.float32).tobytes()
             + c2w_np.astype(np.float32).tobytes()
             + K_np[0].astype(np.float32).tobytes()
         )
