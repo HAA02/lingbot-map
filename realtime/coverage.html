@@ -1398,8 +1398,10 @@ function renderAlignmentCandidates(doc=state.alignmentCandidates) {
   const rows = items.length
     ? `<div class="candidate-list">${items.map((c, i) => `
         <div class="candidate" data-candidate-index="${i}">
-          <b>${esc(c.source)} · ${esc(c.quality || '-')} · ${Math.round(Number(c.score || 0) * 100)}%</b>
+          <b>${esc(c.source)} · ${esc((c.alignment && c.alignment.quality) || c.quality || '-')} · ${Math.round(Number(c.score || 0) * 100)}%</b>
           <span>${esc(c.confidence || '-')} · ${c.can_save ? '저장 가능' : '미리보기만'} · ${esc(c.upload_id || '')}</span>
+          ${c.corroboration?.ok ? `<span>기하 검증: 표면거리 median ${formatMeters(c.corroboration.median_nn_m)} · inlier ${Math.round(Number(c.corroboration.inlier_ratio || 0) * 100)}%${c.icp_refined ? ' · ICP 보정됨' : ''}${c.corroborated ? ' · ✓통과' : ' · 게이트 미달'}</span>` : ''}
+          ${Array.isArray(c.anchor_residuals_m) && c.anchor_residuals_m.length ? `<span>anchor 잔차: ${c.anchor_residuals_m.map(formatMeters).join(', ')}</span>` : ''}
           <span>${esc(c.reason || '')}</span>
           <span>${Number.isFinite(Number(c.center_distance_m)) ? `center ${formatMeters(c.center_distance_m)}` : ''}</span>
           ${c.can_save ? `<button data-save-candidate-index="${i}" class="primary">이 후보를 정합으로 저장</button>` : ''}
