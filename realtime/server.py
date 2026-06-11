@@ -1633,6 +1633,27 @@ def _model_surface_samples(objects: list[dict]) -> np.ndarray:
     return np.vstack(pts)
 
 
+def _model_surface_samples_with_radius(objects: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+    """Sample points plus per-sample surface radius (centerline->surface correction)."""
+    pts = []
+    rads = []
+    for obj in objects:
+        samples, _ts = _object_samples(obj)
+        if not samples.size:
+            continue
+        r = float(obj.get("diameter_m") or 0.0) * 0.5
+        if obj.get("is_linear"):
+            r = min(r, 0.4)
+        else:
+            # bbox 기반 point 객체는 중심 거리에 외형이 일부 반영되므로 보수적으로
+            r = min(r * 0.5, 0.2)
+        pts.append(samples)
+        rads.append(np.full(len(samples), max(0.0, r), dtype=np.float64))
+    if not pts:
+        return np.empty((0, 3), dtype=np.float64), np.empty((0,), dtype=np.float64)
+    return np.vstack(pts), np.concatenate(rads)
+
+
 def _corroborate_alignment(
     scan_points: np.ndarray,
     model_tree,
@@ -1640,8 +1661,10 @@ def _corroborate_alignment(
     *,
     inlier_m: float = 0.30,
     max_points: int = 40_000,
+    sample_radii: np.ndarray | None = None,
 ) -> dict:
     """Score a candidate transform by NN distance of aligned scan points to model samples.
+    With sample_radii, centerline distances are reduced to surface distances.
     Verification only: never mutates the transform."""
     if scan_points.size == 0 or model_tree is None:
         return {"ok": False, "reason": "no scan points or model samples"}
@@ -1650,13 +1673,17 @@ def _corroborate_alignment(
         idx = np.linspace(0, len(pts) - 1, max_points).astype(int)
         pts = pts[idx]
     aligned = _apply_sim3(pts, alignment)
-    d, _ = model_tree.query(aligned, k=1, workers=-1)
+    d, nn_idx = model_tree.query(aligned, k=1, workers=-1)
+    if sample_radii is not None and len(sample_radii):
+        # 표면 거리: 중심선 거리 d가 반경 r과 같을 때(표면 위)만 0. 내부/원거리 모두 벌점.
+        d = np.abs(d - sample_radii[np.asarray(nn_idx, dtype=np.int64)])
     return {
         "ok": True,
         "n_points": int(len(pts)),
         "median_nn_m": round(float(np.median(d)), 4),
         "inlier_ratio": round(float((d <= inlier_m).mean()), 4),
         "inlier_threshold_m": inlier_m,
+        "radius_corrected": bool(sample_radii is not None and len(sample_radii)),
     }
 
 
@@ -1736,7 +1763,7 @@ def _auto_place_candidates(
         vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
         R0 = np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
 
-    samples = _model_surface_samples(model_objects)
+    samples, sample_radii = _model_surface_samples_with_radius(model_objects)
     if samples.size == 0:
         return [], ["model has no geometry samples"]
     from scipy.spatial import cKDTree
@@ -1779,7 +1806,7 @@ def _auto_place_candidates(
             R = rz(a) @ R0
             t = cgrid - scale * (R @ scan_c)
             al = {"scale": scale, "rotation": R.tolist(), "translation": t.tolist()}
-            sc = _corroborate_alignment(sub, tree, al, max_points=3000)
+            sc = _corroborate_alignment(sub, tree, al, max_points=3000, sample_radii=sample_radii)
             if sc.get("ok"):
                 scored.append((sc, al, a))
     if not scored:
@@ -1808,13 +1835,14 @@ def _auto_place_candidates(
             for d in ([0.4, 0, 0], [-0.4, 0, 0], [0, 0.4, 0], [0, -0.4, 0], [0, 0, 0.25], [0, 0, -0.25]):
                 a2 = dict(al)
                 a2["translation"] = (np.asarray(al["translation"]) + d).tolist()
-                s2 = _corroborate_alignment(sub, tree, a2, max_points=3000)
+                s2 = _corroborate_alignment(sub, tree, a2, max_points=3000, sample_radii=sample_radii)
                 if s2["median_nn_m"] < cur["median_nn_m"]:
                     al, cur, improved = a2, s2, True
             if not improved:
                 break
-        final = _corroborate_alignment(sub, tree, al, max_points=20_000)
-        quality = "yellow" if (final.get("median_nn_m", 9e9) <= 0.50 and final.get("inlier_ratio", 0.0) >= 0.20) else "red"
+        final = _corroborate_alignment(sub, tree, al, max_points=20_000, sample_radii=sample_radii)
+        # 표면 거리 척도 기준 캘리브레이션: +3m 오배치가 yellow를 통과하지 못하는 값
+        quality = "yellow" if (final.get("median_nn_m", 9e9) <= 0.25 and final.get("inlier_ratio", 0.0) >= 0.50) else "red"
         alignment = {
             "quality": quality,
             "stable": False,
@@ -2227,8 +2255,9 @@ async def alignment_candidates(upload_id: str, payload: dict):
                     log.warning("candidate corroboration scan load failed: %s", e)
                 model_tree = None
                 model_samples = np.empty((0, 3))
+                model_radii = None
                 if scan_pts is not None and scan_pts.size:
-                    model_samples = _model_surface_samples(model_objects)
+                    model_samples, model_radii = _model_surface_samples_with_radius(model_objects)
                     try:
                         from scipy.spatial import cKDTree
                         model_tree = cKDTree(model_samples) if model_samples.size else None
@@ -2242,11 +2271,11 @@ async def alignment_candidates(upload_id: str, payload: dict):
                     cal = cand.get("alignment") or {}
                     if model_tree is None:
                         continue
-                    score = _corroborate_alignment(scan_pts, model_tree, cal)
+                    score = _corroborate_alignment(scan_pts, model_tree, cal, sample_radii=model_radii)
                     if score.get("ok"):
                         refined = _icp_refine_alignment(scan_pts, model_samples, model_tree, cal)
                         if refined is not None:
-                            r_score = _corroborate_alignment(scan_pts, model_tree, refined)
+                            r_score = _corroborate_alignment(scan_pts, model_tree, refined, sample_radii=model_radii)
                             if r_score.get("ok") and r_score["median_nn_m"] < score["median_nn_m"]:
                                 cal = {**cal, "rotation": refined["rotation"], "translation": refined["translation"], "note": refined["note"]}
                                 cand["alignment"] = cal
@@ -2256,7 +2285,7 @@ async def alignment_candidates(upload_id: str, payload: dict):
                     corroborated = (
                         bool(score.get("ok"))
                         and score.get("median_nn_m", 1e9) <= 0.20
-                        and score.get("inlier_ratio", 0.0) >= 0.35
+                        and score.get("inlier_ratio", 0.0) >= 0.50
                     )
                     cand["corroborated"] = corroborated
                     anchor_ok = False
