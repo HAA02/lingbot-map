@@ -16,6 +16,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import json
 import sys
 import urllib.error
@@ -190,6 +191,107 @@ def check_alignment_candidates(base_url: str, model: str, upload: str) -> None:
         check("anchor" in warnings.lower(), "high repetition risk should require anchors")
 
 
+def check_auto_place(base_url: str, model: str, upload: str) -> None:
+    """자동배치 회귀: 중력정렬 후보 생성, 게이트, 잘못된 후보 저장 거부."""
+    data = request(
+        base_url,
+        f"/api/uploads/{upload}/alignment/candidates",
+        method="POST",
+        payload={"model_id": model, "auto_place": True, "dry_run": True},
+    ).json()
+    check(data.get("ok") is True, "auto_place candidates did not return ok")
+    autos = [c for c in data.get("candidates") or [] if c.get("source") == "auto_geometric"]
+    check(len(autos) >= 1, "auto_place produced no auto_geometric candidates")
+    for cand in autos:
+        alignment = cand.get("alignment") or {}
+        quality = alignment.get("quality")
+        check(quality in {"yellow", "red"}, f"auto candidate quality must be yellow/red, got {quality!r}")
+        # 자동 후보는 green을 사칭할 수 없다 (green은 대응점 기반 정합 전용)
+        check(quality != "green", "auto candidate must never claim green quality")
+        corr = cand.get("corroboration") or {}
+        check(corr.get("ok") is True, "auto candidate missing corroboration metrics")
+        if cand.get("can_save"):
+            check(quality == "yellow", "saveable auto candidate must be yellow")
+            check(
+                float(corr.get("median_nn_m") or 9e9) <= 0.25
+                and float(corr.get("inlier_ratio") or 0.0) >= 0.50,
+                "saveable auto candidate violates corroboration gate",
+            )
+        # 중력 정렬: rotation이 scan up을 +Z로 보내는지의 근사 검증은 서버 책임 —
+        # 여기서는 scale=1(metric 기본)만 확인한다
+        check(abs(float(alignment.get("scale") or 0.0) - 1.0) < 1e-6, "auto candidate scale must default to 1.0 (metric)")
+    # 존재하지 않는 후보 저장은 409
+    bogus = request(
+        base_url,
+        f"/api/uploads/{upload}/alignment",
+        method="POST",
+        payload={"model_id": model, "candidate_id": "auto:999"},
+        expect={409},
+    ).json()
+    check(bogus.get("status") == "candidate_not_saveable", "bogus candidate save must be candidate_not_saveable")
+
+
+class StaleFixture:
+    """stale-red 게이트용 픽스처를 설치하고 기존 상태를 보존/복원한다.
+    smoke가 데모/실사용 정합 상태와 무관하게 결정적이 되도록 한다."""
+
+    def __init__(self, uploads_dir: str, upload: str, model: str) -> None:
+        import pathlib
+        self.dir = pathlib.Path(uploads_dir)
+        self.upload = upload
+        self.model = model
+        self.names = [
+            f"{upload}.{model}.alignment.json",
+            f"{upload}.alignment.json",
+            f"{upload}.{model}.coverage.json",
+            f"{upload}.coverage.json",
+        ]
+        self.saved: dict[str, bytes | None] = {}
+
+    def __enter__(self):
+        if not self.dir.exists():
+            self.skipped = True
+            return self
+        self.skipped = False
+        red_alignment = {
+            "ok": True,
+            "upload_id": self.upload,
+            "model_id": self.model,
+            "alignment": {
+                "quality": "red", "stable": False, "rmse_m": None, "scale": 1.0,
+                "rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "translation": [0, 0, 0],
+                "n": 0, "note": "smoke fixture: need >=4 correspondences", "pairs": [],
+            },
+            "generated_at": "smoke-fixture",
+        }
+        red_coverage = {
+            "ok": True,
+            "upload_id": self.upload,
+            "model_id": self.model,
+            "alignment": red_alignment["alignment"],
+            "status_counts": {"not_observed": 1},
+            "objects": [],
+            "generated_at": "smoke-fixture",
+        }
+        payloads = [red_alignment, red_alignment, red_coverage, red_coverage]
+        for name, payload in zip(self.names, payloads):
+            path = self.dir / name
+            self.saved[name] = path.read_bytes() if path.exists() else None
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        return self
+
+    def __exit__(self, *exc):
+        if self.skipped:
+            return False
+        for name, blob in self.saved.items():
+            path = self.dir / name
+            if blob is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(blob)
+        return False
+
+
 def check_stale_red_upload(base_url: str, model: str, upload: str) -> None:
     status = request(
         base_url,
@@ -225,9 +327,14 @@ def check_stale_red_upload(base_url: str, model: str, upload: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8768")
-    parser.add_argument("--model", default="pxx")
+    parser.add_argument("--model", default="pipe_duct")
     parser.add_argument("--upload", default="upload_1779439687108")
     parser.add_argument("--stale-upload", default="upload_1779442357085")
+    parser.add_argument(
+        "--uploads-dir",
+        default=str(Path(__file__).resolve().parent.parent / "realtime" / "_uploads"),
+        help="픽스처 설치 경로 (서버 호스트에서 실행 시)",
+    )
     args = parser.parse_args()
 
     steps = [
@@ -235,11 +342,18 @@ def main() -> int:
         ("models manifest", lambda: check_models(args.base_url, args.model)),
         ("unaligned upload gate", lambda: check_unaligned_upload(args.base_url, args.model, args.upload)),
         ("alignment candidates", lambda: check_alignment_candidates(args.base_url, args.model, args.upload)),
-        ("stale red gate", lambda: check_stale_red_upload(args.base_url, args.model, args.stale_upload)),
     ]
     for label, fn in steps:
         fn()
         print(f"PASS {label}")
+    with StaleFixture(args.uploads_dir, args.stale_upload, args.model) as fx:
+        if fx.skipped:
+            print("SKIP stale red gate (uploads dir not found; remote server?)")
+        else:
+            check_stale_red_upload(args.base_url, args.model, args.stale_upload)
+            print("PASS stale red gate")
+        check_auto_place(args.base_url, args.model, args.stale_upload)
+        print("PASS auto place gate")
     print("OK coverage web smoke")
     return 0
 
