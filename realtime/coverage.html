@@ -1,0 +1,2277 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lingbot-map · model coverage</title>
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#0b0f13; color:#e7edf4; font:13px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
+  #canvas { position:fixed; inset:0; display:block; }
+  .topbar { position:fixed; left:0; right:0; top:0; min-height:48px; display:flex; align-items:center; gap:8px; padding:8px 12px; background:rgba(12,17,23,.92); border-bottom:1px solid #26313d; z-index:10; }
+  .topbar h1 { margin:0 10px 0 0; font-size:14px; white-space:nowrap; }
+  select, button, textarea, input { background:#18212b; color:#e7edf4; border:1px solid #3a4a5c; border-radius:5px; font:12px system-ui, sans-serif; }
+  select { padding:6px 8px; max-width:260px; }
+  button { padding:6px 10px; cursor:pointer; }
+  button.primary { background:#1f6f45; border-color:#2b8a58; }
+  button.warn { background:#6f5520; border-color:#9a782b; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .badge { padding:4px 8px; border-radius:999px; background:#24303c; color:#b8c4d1; white-space:nowrap; }
+  .badge.good { background:#143924; color:#9af0bd; }
+  .badge.warn { background:#3b3015; color:#ffe08a; }
+  .badge.bad { background:#3b171b; color:#ffb4b4; }
+  .panel { position:fixed; top:64px; bottom:124px; left:12px; width:360px; overflow:auto; background:rgba(13,18,24,.9); border:1px solid #26313d; border-radius:8px; padding:12px; z-index:9; }
+  .panel h2 { margin:0 0 10px; font-size:14px; }
+  .section { border-top:1px solid #26313d; padding-top:10px; margin-top:12px; }
+  .metric { display:flex; justify-content:space-between; gap:12px; padding:4px 0; }
+  .metric span:first-child { color:#9fb0c1; }
+  .metric b { text-align:right; }
+  .legend { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin:8px 0; }
+  .legend label { display:flex; align-items:center; gap:6px; color:#cbd5e1; }
+  .swatch { width:12px; height:12px; border-radius:3px; display:inline-block; }
+  .toolbar-label { display:flex; align-items:center; gap:5px; color:#b8c4d1; white-space:nowrap; font-size:12px; }
+  .toolbar-label input[type=range] { width:88px; accent-color:#5aa7ff; }
+  textarea { width:100%; min-height:88px; resize:vertical; padding:8px; box-sizing:border-box; }
+  .row { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .row button { flex:1 1 auto; }
+  .pair-list { max-height:94px; overflow:auto; margin-top:8px; border:1px solid #26313d; border-radius:6px; background:rgba(4,8,12,.35); }
+  .pair-list div { display:flex; justify-content:space-between; gap:8px; padding:5px 7px; border-bottom:1px solid rgba(38,49,61,.65); color:#cbd5e1; font-size:11px; }
+  .pair-list div:last-child { border-bottom:0; }
+  .pair-list .bad { color:#ffb4b4; }
+  .mono { font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:11px; word-break:break-all; }
+  .residual-list { max-height:120px; overflow:auto; margin-top:6px; border:1px solid #26313d; border-radius:6px; background:rgba(4,8,12,.35); }
+  .residual-list div { display:grid; grid-template-columns:34px 1fr auto; gap:6px; padding:5px 7px; border-bottom:1px solid rgba(38,49,61,.65); font-size:11px; color:#cbd5e1; }
+  .residual-list div:last-child { border-bottom:0; }
+  .residual-list .bad { color:#ffb4b4; }
+  .candidate-list { display:flex; flex-direction:column; gap:6px; max-height:180px; overflow:auto; }
+  .candidate { display:grid; grid-template-columns:1fr auto; gap:2px 8px; padding:7px; border:1px solid #26313d; border-radius:6px; background:rgba(20,28,37,.72); cursor:pointer; }
+  .candidate:hover { border-color:#5aa7ff; }
+  .candidate b { font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .candidate span { color:#9fb0c1; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .candidate .status-dot { width:9px; height:9px; border-radius:50%; margin-top:4px; }
+  .candidate button { grid-column:1/3; margin-top:4px; padding:5px 7px; font-size:11px; }
+  .notice { display:grid; gap:3px; padding:8px; margin:8px 0; border:1px solid #26313d; border-radius:6px; background:rgba(20,28,37,.72); }
+  .notice b { font-size:12px; }
+  .notice span { color:#cbd5e1; font-size:12px; }
+  .notice.good { border-color:#276846; background:rgba(20,57,36,.45); }
+  .notice.warn { border-color:#6f5520; background:rgba(59,48,21,.46); }
+  .notice.bad { border-color:#6b3036; background:rgba(59,23,27,.46); }
+  .check-list { display:flex; flex-direction:column; gap:5px; margin:8px 0; }
+  .check { display:grid; grid-template-columns:12px 1fr auto; gap:7px; align-items:center; padding:6px 7px; border:1px solid #26313d; border-radius:6px; background:rgba(4,8,12,.28); }
+  .check i { width:9px; height:9px; border-radius:50%; display:block; background:#7b8794; }
+  .check b { font-size:12px; text-align:left; }
+  .check span { color:#9fb0c1; font-size:11px; text-align:right; }
+  .check.pass i { background:#31d27c; }
+  .check.warn i { background:#f2c94c; }
+  .check.block i { background:#ff6b6b; }
+  .check.pending i { background:#7b8794; }
+  .evidence-strip { display:flex; gap:6px; overflow-x:auto; padding:6px 0 2px; }
+  .evidence-thumb { flex:0 0 auto; width:78px; height:58px; border:1px solid #3a4a5c; border-radius:5px; overflow:hidden; position:relative; background:#111923; cursor:pointer; }
+  .evidence-thumb:hover { border-color:#5aa7ff; }
+  .evidence-thumb img { width:100%; height:100%; object-fit:cover; display:block; }
+  .evidence-thumb span { position:absolute; left:3px; bottom:2px; background:rgba(0,0,0,.7); padding:1px 4px; border-radius:3px; font-size:10px; }
+  .keyframe-links { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+  .keyframe-links a { color:#88bbff; border:1px solid #3a4a5c; border-radius:4px; padding:3px 6px; text-decoration:none; font-size:11px; background:#141c25; }
+  .keyframe-links a:hover { border-color:#5aa7ff; }
+  .help { color:#9fb0c1; font-size:12px; margin:6px 0; }
+  .timeline { position:fixed; left:0; right:0; bottom:0; height:112px; background:rgba(12,17,23,.94); border-top:1px solid #26313d; z-index:10; display:flex; align-items:center; gap:8px; padding:8px 12px; overflow-x:auto; }
+  .thumb { flex:0 0 auto; width:96px; height:72px; border:2px solid transparent; border-radius:6px; overflow:hidden; background:#111923; cursor:pointer; position:relative; }
+  .thumb.active { border-color:#5aa7ff; }
+  .thumb img { width:100%; height:100%; object-fit:cover; display:block; }
+  .thumb span { position:absolute; left:3px; bottom:2px; background:rgba(0,0,0,.65); padding:1px 4px; border-radius:3px; font-size:10px; line-height:1.15; white-space:normal; }
+  .floating-help { position:fixed; right:12px; top:64px; background:rgba(13,18,24,.8); border:1px solid #26313d; border-radius:6px; padding:8px 10px; color:#9fb0c1; z-index:9; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div class="topbar">
+  <h1>모델 기준 촬영 evidence</h1>
+  <select id="modelSelect"><option value="">모델 선택...</option></select>
+  <select id="uploadSelect"><option value="">업로드 선택...</option></select>
+  <button id="loadBtn" class="primary">불러오기</button>
+  <button id="analyzeBtn" class="warn">coverage 분석</button>
+  <button id="reportBtn">리포트</button>
+  <button id="fitBtn">화면 맞춤</button>
+  <button id="toggleModelBtn">모델</button>
+  <button id="toggleProxyBtn">객체 evidence</button>
+  <button id="togglePathBtn">경로</button>
+  <button id="toggleTimelineBtn">썸네일</button>
+  <button id="toggleScanBtn">스캔 GLB</button>
+  <button id="togglePointCloudBtn">점군</button>
+  <label class="toolbar-label">모델 투명도 <input id="modelOpacity" type="range" min="0.05" max="1" value="0.26" step="0.01"></label>
+  <span id="statusBadge" class="badge">대기</span>
+</div>
+
+<aside class="panel">
+  <h2>검토 정보</h2>
+  <div class="metric"><span>모델</span><b id="mModel">-</b></div>
+  <div class="metric"><span>manifest</span><b id="mManifest">-</b></div>
+  <div class="metric"><span>GUID 매핑률</span><b id="mGuid">-</b></div>
+  <div class="metric"><span>기준 형상</span><b id="mBasis">-</b></div>
+  <div class="metric"><span>객체 수</span><b id="mObjects">-</b></div>
+  <div class="metric"><span>업로드</span><b id="mUpload">-</b></div>
+  <div class="metric"><span>payload</span><b id="mPayload">-</b></div>
+  <div class="metric"><span>pose/thumb</span><b id="mPose">-</b></div>
+  <div class="metric"><span>alignment</span><b id="mAlign">-</b></div>
+  <div class="metric"><span>선택 frame</span><b id="mFrame">-</b></div>
+
+  <div class="section">
+    <h2>상태 필터</h2>
+    <div class="legend" id="legend"></div>
+  </div>
+
+  <div class="section">
+    <h2>준비 상태</h2>
+    <div id="readinessInfo" class="help">모델과 업로드를 불러오면 분석 준비 상태가 표시됩니다.</div>
+  </div>
+
+  <div class="section">
+    <h2>정합 품질</h2>
+    <div id="alignmentInfo" class="help">대응점을 저장하면 정합 품질과 residual이 표시됩니다.</div>
+  </div>
+
+  <div class="section">
+    <h2>자동 정합 후보</h2>
+    <div class="help">자동 배치가 원칙입니다: 중력 정렬 + metric scale 기하 탐색으로 배치 가설을 만들고, 미리보기 확인 후 명시적으로 저장합니다. 대응점을 1개만 찍어두면 그 모델 좌표를 시작 힌트로 사용해 탐색을 좁힙니다.</div>
+    <div class="row">
+      <button id="autoPlaceBtn" class="primary">자동 배치</button>
+      <button id="candidateBtn">후보 계산</button>
+    </div>
+    <div id="candidateInfo" class="help">후보 계산 전</div>
+  </div>
+
+  <div class="section">
+    <h2>coverage 상태</h2>
+    <div id="statusCounts" class="help">분석 결과 없음</div>
+  </div>
+
+  <div class="section">
+    <h2>90% 품질 리포트</h2>
+    <div id="qualityReportInfo" class="help">coverage 결과가 있으면 자동 품질 게이트를 표시합니다.</div>
+  </div>
+
+  <div class="section">
+    <h2>검수 기록</h2>
+    <div id="reviewInfo" class="help">수동 검수 기록 없음</div>
+    <textarea id="reviewNotes" spellcheck="false" placeholder="검수 메모"></textarea>
+    <div class="row">
+      <button id="saveReviewNotesBtn">메모 저장</button>
+      <button id="resetReviewBtn">검수 초기화</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>분석 옵션</h2>
+    <div class="metric"><span>거리 임계값(m)</span><b><input id="optDistance" type="number" min="0.01" max="2" step="0.01" value="0.10" style="width:70px"></b></div>
+    <div class="metric"><span>최소 support frame</span><b><input id="optMinSupport" type="number" min="1" max="20" step="1" value="3" style="width:70px"></b></div>
+    <div class="metric"><span>최소 geometry</span><b><input id="optMinConsistency" type="number" min="0" max="1" step="0.05" value="0.60" style="width:70px"></b></div>
+    <label class="toolbar-label" style="margin:6px 0"><input id="optRequireVisibility" type="checkbox" checked> frustum visibility 요구</label>
+    <div class="metric"><span>최대 시야 깊이(m)</span><b><input id="optVisibilityDepth" type="number" min="0.5" max="100" step="0.5" value="15" style="width:70px"></b></div>
+    <div class="metric"><span>시야 margin(px)</span><b><input id="optVisibilityMargin" type="number" min="0" max="512" step="8" value="32" style="width:70px"></b></div>
+  </div>
+
+  <div class="section">
+    <h2>선택 프레임 후보</h2>
+    <div id="frameInfo" class="help">프레임을 선택하면 해당 시점의 객체 후보가 표시됩니다.</div>
+  </div>
+
+  <div class="section">
+    <h2>선택 객체</h2>
+    <div id="objectInfo" class="help">객체 proxy를 클릭하면 상세 정보가 표시됩니다.</div>
+  </div>
+
+  <div class="section">
+    <h2>수동 정합 입력</h2>
+    <div class="help">스캔 GLB와 모델 proxy에서 같은 물리 위치를 순서대로 클릭합니다. 최소 4개, 운영 기준 6개 이상을 권장합니다.</div>
+    <div class="row">
+      <button id="pickPairBtn">대응점 찍기</button>
+      <button id="saveAlignmentBtn">정합 저장</button>
+      <button id="undoPairBtn">마지막 삭제</button>
+      <button id="resetPairsBtn">초기화</button>
+    </div>
+    <div class="metric"><span>대응점</span><b id="pairCount">0개 · 최소 4개 필요</b></div>
+    <div id="pickHint" class="help">대응점 찍기를 켜면 스캔 GLB -> 모델 proxy 순서로 클릭합니다.</div>
+    <div id="pairList" class="pair-list"></div>
+    <textarea id="pairsInput" spellcheck="false">[]</textarea>
+    <div class="help">좌표 JSON은 직접 수정할 수 있습니다. 분석 시 JSON 값이 다시 검증됩니다.</div>
+  </div>
+</aside>
+
+<div class="floating-help">drag: 회전 · wheel: 줌 · shift+drag: 이동 · 객체/프레임 클릭 가능</div>
+<div class="timeline" id="timeline"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+
+// PXX.glb 등이 KHR_draco_mesh_compression 압축이므로 DRACOLoader 필수
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath('https://unpkg.com/three@0.160.0/examples/jsm/libs/draco/gltf/');
+function makeGltfLoader() {
+  const l = new GLTFLoader();
+  l.setDRACOLoader(dracoLoader);
+  return l;
+}
+
+const $ = id => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const renderer = new THREE.WebGLRenderer({ canvas: $('canvas'), antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0f13);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.01, 5000);
+camera.up.set(0, 0, 1);
+camera.position.set(8, -8, 8);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+scene.add(new THREE.AmbientLight(0xffffff, 0.75));
+const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+sun.position.set(6, 10, 8);
+scene.add(sun);
+const grid = new THREE.GridHelper(80, 80, 0x304050, 0x1b2631);
+grid.rotation.x = Math.PI / 2;
+scene.add(grid);
+scene.add(new THREE.AxesHelper(1));
+
+const groups = {
+  model: new THREE.Group(),
+  proxy: new THREE.Group(),
+  path: new THREE.Group(),
+  scan: new THREE.Group(),
+  pointCloud: new THREE.Group(),
+  pairs: new THREE.Group(),
+  selection: new THREE.Group(),
+};
+Object.values(groups).forEach(g => scene.add(g));
+
+const state = {
+  models: [],
+  uploads: [],
+  model: null,
+  objects: [],
+  upload: null,
+  scan: null,
+  coverage: null,
+  glbMeshesByGuid: null,
+  readiness: null,
+  qualityReport: null,
+  coverageReview: null,
+  alignmentCandidates: null,
+  selectedFrame: -1,
+  selectedObject: null,
+  visibility: {
+    observed: true,
+    likely_observed: true,
+    uncertain: true,
+    not_observed: false,
+    out_of_scope: false,
+  },
+  pairs: [],
+  pickMode: false,
+  pendingPair: null,
+  pointCloudLoaded: false,
+  modelOpacity: 0.26,
+  timelineVisible: true,
+};
+
+const STATUS = {
+  observed: { label: 'observed', color: 0x31d27c },
+  likely_observed: { label: 'likely', color: 0xf2c94c },
+  uncertain: { label: 'uncertain', color: 0xff8a4c },
+  not_observed: { label: 'not', color: 0x7b8794 },
+  out_of_scope: { label: 'out', color: 0x3f4650 },
+  default: { label: 'base', color: 0x6a8fb4 },
+};
+
+const PAIR_COLORS = {
+  scan: 0x32d4ff,
+  model: 0xff5fbf,
+  pending: 0xffd166,
+  link: 0xf6f7fb,
+};
+
+function setStatus(text, kind='') {
+  $('statusBadge').textContent = text;
+  $('statusBadge').className = `badge ${kind}`;
+}
+
+function formatSeconds(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return '';
+  const min = Math.floor(n / 60);
+  const sec = n - min * 60;
+  return `${min}:${sec.toFixed(2).padStart(5, '0')}`;
+}
+
+function frameTime(frame) {
+  const values = state.scan?.frame_timestamps_s || [];
+  const direct = Number(values[frame]);
+  if (Number.isFinite(direct)) return direct;
+  const count = Math.max(state.scan?.poses?.length || 0, state.scan?.thumb_count || 0);
+  const duration = Number(state.scan?.video_duration_s);
+  if (Number.isFinite(duration) && duration > 0 && count > 1 && frame >= 0) {
+    return duration * frame / (count - 1);
+  }
+  return null;
+}
+
+function frameLabel(frame, html=false) {
+  const time = formatSeconds(frameTime(frame));
+  if (!time) return `#${frame}`;
+  return html ? `#${frame}<br>${time}` : `#${frame} · ${time}`;
+}
+
+function manifestSummary(model) {
+  if (!model) return '-';
+  if (model.manifest_valid) {
+    return `valid · proxy ${model.fallback_geometry_count ?? 0}`;
+  }
+  const reasons = [];
+  if (!model.glb_bytes) reasons.push('GLB 없음');
+  if (!model.metadata_bytes) reasons.push('PAG 없음');
+  if (!model.object_count) reasons.push('객체 없음');
+  return `invalid${reasons.length ? ` · ${reasons.join(', ')}` : ''}`;
+}
+
+function modelBasisSummary(model) {
+  if (!model) return '-';
+  if (model.coverage_geometry_source === 'pag_proxy') return 'PAG proxy 기준';
+  if (model.coverage_geometry_source === 'glb_guid_mesh') return 'GLB GUID mesh 기준';
+  if (model.coverage_geometry_source === 'hybrid_glb_proxy') return `하이브리드 · GLB mesh ${model.guid_mapped_count ?? 0} / proxy ${model.fallback_geometry_count ?? 0}`;
+  return model.fallback_geometry || '-';
+}
+
+function modelManifestOk() {
+  return Boolean(state.model?.manifest_valid);
+}
+
+function canSaveAlignment() {
+  return modelManifestOk() && Boolean(state.upload) && state.pairs.length >= 4;
+}
+
+function canAnalyzeCoverage() {
+  return modelManifestOk() && Boolean(state.upload) && (savedAlignmentReady() || state.pairs.length >= 4);
+}
+
+function updateActionAvailability() {
+  const ok = modelManifestOk();
+  $('analyzeBtn').disabled = !canAnalyzeCoverage();
+  $('saveAlignmentBtn').disabled = !canSaveAlignment();
+  $('pickPairBtn').disabled = !ok || !state.upload;
+  $('candidateBtn').disabled = !ok || !state.upload;
+}
+
+function clearGroup(group) {
+  while (group.children.length) {
+    const o = group.children[0];
+    group.remove(o);
+    o.traverse?.(n => {
+      n.geometry?.dispose?.();
+      const mats = Array.isArray(n.material) ? n.material : [n.material];
+      mats.forEach(m => m?.dispose?.());
+    });
+  }
+}
+
+function identityGroupTransform(group) {
+  group.matrixAutoUpdate = true;
+  group.position.set(0, 0, 0);
+  group.rotation.set(0, 0, 0);
+  group.scale.set(1, 1, 1);
+  group.updateMatrix();
+  group.updateMatrixWorld(true);
+}
+
+function sim3Matrix(alignment) {
+  if (!alignment?.rotation || !alignment?.translation) return null;
+  const r = alignment.rotation;
+  const s = alignment.scale ?? 1;
+  const t = alignment.translation;
+  return new THREE.Matrix4().set(
+    s * r[0][0], s * r[0][1], s * r[0][2], t[0],
+    s * r[1][0], s * r[1][1], s * r[1][2], t[1],
+    s * r[2][0], s * r[2][1], s * r[2][2], t[2],
+    0, 0, 0, 1,
+  );
+}
+
+function usableAlignment() {
+  const a = state.coverage?.alignment;
+  if (!a || a.quality === 'red' || !a.rotation || !a.translation) return null;
+  return a;
+}
+
+function savedAlignmentReady() {
+  const a = state.coverage?.alignment;
+  return Boolean(a && !state.coverage?.auto_candidate && a.quality !== 'red' && a.rotation && a.translation);
+}
+
+function applyScanOverlayTransform() {
+  const m = sim3Matrix(usableAlignment());
+  if (!m) {
+    identityGroupTransform(groups.scan);
+    identityGroupTransform(groups.pointCloud);
+    return;
+  }
+  for (const group of [groups.scan, groups.pointCloud]) {
+    group.matrixAutoUpdate = false;
+    group.matrix.copy(m);
+    group.matrixWorldNeedsUpdate = true;
+    group.updateMatrixWorld(true);
+  }
+}
+
+function applyModelOpacity(opacity=state.modelOpacity) {
+  state.modelOpacity = Number(opacity);
+  groups.model.traverse(o => {
+    if (!o.isMesh) return;
+    if (o.userData && o.userData._statusColored) return;
+    const mats = Array.isArray(o.material) ? o.material : [o.material];
+    for (const m of mats) {
+      m.transparent = state.modelOpacity < 1;
+      m.opacity = state.modelOpacity;
+      m.depthWrite = state.modelOpacity >= 0.95;
+      m.needsUpdate = true;
+    }
+  });
+}
+
+function makeMat(status, opacity=0.95) {
+  const c = STATUS[status] || STATUS.default;
+  return new THREE.MeshStandardMaterial({
+    color: c.color,
+    transparent: opacity < 1,
+    opacity,
+    roughness: 0.7,
+    metalness: 0.0,
+    depthWrite: opacity >= 0.9,
+  });
+}
+
+function makeLineMat(status) {
+  const c = STATUS[status] || STATUS.default;
+  return new THREE.LineBasicMaterial({ color: c.color, transparent: true, opacity: status === 'not_observed' ? 0.28 : 0.95 });
+}
+
+function poseToMatrix(c2w, alignment=null) {
+  const R00=c2w[0], R01=-c2w[1], R02=-c2w[2], t0= c2w[3];
+  const R10=-c2w[4], R11= c2w[5], R12= c2w[6], t1=-c2w[7];
+  const R20=-c2w[8], R21= c2w[9], R22= c2w[10],t2=-c2w[11];
+  const R = new THREE.Matrix3().set(R00,R01,R02, R10,R11,R12, R20,R21,R22);
+  const t = new THREE.Vector3(t0, t1, t2);
+  if (alignment && alignment.rotation && alignment.translation) {
+    const A = new THREE.Matrix3().set(
+      alignment.rotation[0][0], alignment.rotation[0][1], alignment.rotation[0][2],
+      alignment.rotation[1][0], alignment.rotation[1][1], alignment.rotation[1][2],
+      alignment.rotation[2][0], alignment.rotation[2][1], alignment.rotation[2][2],
+    );
+    const s = alignment.scale ?? 1;
+    const at = new THREE.Vector3(...alignment.translation);
+    t.applyMatrix3(A).multiplyScalar(s).add(at);
+    const e = R.elements.slice();
+    const cols = [
+      new THREE.Vector3(e[0], e[1], e[2]).applyMatrix3(A),
+      new THREE.Vector3(e[3], e[4], e[5]).applyMatrix3(A),
+      new THREE.Vector3(e[6], e[7], e[8]).applyMatrix3(A),
+    ];
+    R.set(cols[0].x, cols[1].x, cols[2].x, cols[0].y, cols[1].y, cols[2].y, cols[0].z, cols[1].z, cols[2].z);
+  }
+  const m = new THREE.Matrix4();
+  const e = R.elements;
+  m.set(e[0], e[3], e[6], t.x, e[1], e[4], e[7], t.y, e[2], e[5], e[8], t.z, 0,0,0,1);
+  return { matrix: m, position: t };
+}
+
+function selectedFramePose(frame=state.selectedFrame) {
+  if (frame < 0 || !state.scan?.poses?.[frame]) return null;
+  const alignment = usableAlignment();
+  if (!alignment) return null;
+  return poseToMatrix(state.scan.poses[frame], alignment);
+}
+
+function focusFrame(frame=state.selectedFrame) {
+  const pose = selectedFramePose(frame);
+  if (!pose) return false;
+  const forward = new THREE.Vector3(0, 0, -1).transformDirection(pose.matrix).normalize();
+  const up = new THREE.Vector3(0, 1, 0).transformDirection(pose.matrix).normalize();
+  const side = new THREE.Vector3().crossVectors(forward, up).normalize();
+  const pos = pose.position;
+  controls.target.copy(pos.clone().add(forward.clone().multiplyScalar(0.8)));
+  camera.position.copy(
+    pos.clone()
+      .add(forward.clone().multiplyScalar(-1.4))
+      .add(up.clone().multiplyScalar(0.55))
+      .add(side.clone().multiplyScalar(0.25))
+  );
+  controls.update();
+  return true;
+}
+
+function drawPath() {
+  clearGroup(groups.path);
+  if (!state.scan?.poses?.length) return;
+  const alignment = usableAlignment();
+  if (!alignment) return;
+  const poses = state.scan.poses;
+  const pathPositions = [];
+  const pts = [];
+  const frustumMat = new THREE.LineBasicMaterial({ color: 0x5aa7ff, transparent: true, opacity: 0.35 });
+  const activeMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 });
+  const stride = Math.max(1, Math.floor(poses.length / 40));
+  for (let i = 0; i < poses.length; i++) {
+    const { matrix, position } = poseToMatrix(poses[i], alignment);
+    pathPositions.push(position.clone());
+    pts.push(position.x, position.y, position.z);
+    if (i % stride !== 0 && i !== poses.length - 1) continue;
+    const s = 0.18, w = 0.13, h = 0.16;
+    const verts = new Float32Array([
+      0,0,0,  w,h,-s, 0,0,0, -w,h,-s, 0,0,0, w,-h,-s, 0,0,0, -w,-h,-s,
+      w,h,-s, w,-h,-s, w,-h,-s, -w,-h,-s, -w,-h,-s, -w,h,-s, -w,h,-s, w,h,-s,
+    ]);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+    const line = new THREE.LineSegments(g, i === state.selectedFrame ? activeMat : frustumMat);
+    line.applyMatrix4(matrix);
+    line.userData.frameIndex = i;
+    groups.path.add(line);
+    const dot = new THREE.Mesh(
+      new THREE.SphereGeometry(i === state.selectedFrame ? 0.055 : 0.035, 12, 8),
+      new THREE.MeshBasicMaterial({ color: i === state.selectedFrame ? 0xffffff : 0x5aa7ff })
+    );
+    dot.position.copy(position);
+    dot.userData.frameIndex = i;
+    groups.path.add(dot);
+  }
+  const tg = new THREE.BufferGeometry();
+  tg.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  groups.path.add(new THREE.Line(tg, new THREE.LineBasicMaterial({ color: 0xffb347, transparent: true, opacity: 0.8 })));
+  if (pathPositions.length) {
+    const start = new THREE.Mesh(
+      new THREE.SphereGeometry(0.085, 16, 10),
+      new THREE.MeshBasicMaterial({ color: 0x31d27c, depthTest: false })
+    );
+    start.position.copy(pathPositions[0]);
+    start.userData.frameIndex = 0;
+    const end = new THREE.Mesh(
+      new THREE.BoxGeometry(0.14, 0.14, 0.14),
+      new THREE.MeshBasicMaterial({ color: 0xff5f6d, depthTest: false })
+    );
+    end.position.copy(pathPositions[pathPositions.length - 1]);
+    end.userData.frameIndex = pathPositions.length - 1;
+    groups.path.add(start, end);
+  }
+}
+
+function roundPoint(v) {
+  return [v.x, v.y, v.z].map(x => Number(x.toFixed(4)));
+}
+
+function pairPointToVector(p) {
+  return new THREE.Vector3(Number(p[0]), Number(p[1]), Number(p[2]));
+}
+
+function makePairMarker(point, color, radius=0.055) {
+  const marker = new THREE.Mesh(
+    new THREE.SphereGeometry(radius, 16, 10),
+    new THREE.MeshBasicMaterial({ color, depthTest: false })
+  );
+  marker.position.copy(point);
+  return marker;
+}
+
+function drawPairs() {
+  clearGroup(groups.pairs);
+  state.pairs.forEach((pair, i) => {
+    const scan = pairPointToVector(pair.scan);
+    groups.scan.localToWorld(scan);
+    const model = pairPointToVector(pair.model);
+    const scanMarker = makePairMarker(scan, PAIR_COLORS.scan, 0.045);
+    const modelMarker = makePairMarker(model, PAIR_COLORS.model, 0.055);
+    scanMarker.userData.pairIndex = i;
+    modelMarker.userData.pairIndex = i;
+    const g = new THREE.BufferGeometry().setFromPoints([scan, model]);
+    const line = new THREE.Line(g, new THREE.LineBasicMaterial({ color: PAIR_COLORS.link, transparent: true, opacity: 0.45, depthTest: false }));
+    groups.pairs.add(scanMarker, modelMarker, line);
+  });
+  if (state.pendingPair?.scan) {
+    const pendingPoint = pairPointToVector(state.pendingPair.scan);
+    groups.scan.localToWorld(pendingPoint);
+    const pending = makePairMarker(pendingPoint, PAIR_COLORS.pending, 0.07);
+    groups.pairs.add(pending);
+  }
+}
+
+function updatePairUi() {
+  const count = state.pairs.length;
+  const enough = count >= 4;
+  $('pairCount').textContent = `${count}개${enough ? ' · 분석 가능' : ' · 최소 4개 필요'}`;
+  $('pickPairBtn').textContent = state.pickMode ? '대응점 찍기 중' : '대응점 찍기';
+  $('pickPairBtn').className = state.pickMode ? 'primary' : '';
+  $('pickHint').textContent = state.pendingPair?.scan
+    ? '모델 proxy에서 같은 위치를 클릭하면 대응점이 저장됩니다.'
+    : (state.pickMode ? '스캔 GLB 또는 점군에서 기준점을 먼저 클릭하세요.' : '대응점 찍기를 켜면 스캔 GLB/점군 -> 모델 proxy 순서로 클릭합니다.');
+  const list = $('pairList');
+  const alignment = currentAlignment();
+  const residuals = Array.isArray(alignment?.per_point_residuals) ? alignment.per_point_residuals : [];
+  const threshold = residualThreshold(alignment);
+  const maxIdx = residuals.reduce((best, value, idx) => {
+    if (!Number.isFinite(Number(value))) return best;
+    return best < 0 || Number(value) > Number(residuals[best]) ? idx : best;
+  }, -1);
+  list.innerHTML = state.pairs.map((pair, i) => {
+    const s = pair.scan.map(v => Number(v).toFixed(2)).join(', ');
+    const m = pair.model.map(v => Number(v).toFixed(2)).join(', ');
+    const residual = Number(residuals[i]);
+    const r = Number.isFinite(residual) ? ` · r ${formatMeters(residual)}` : '';
+    const bad = Number.isFinite(residual) && (i === maxIdx || residual > threshold);
+    return `<div class="${bad ? 'bad' : ''}"><span>#${i + 1}${r}</span><span>S ${s}</span><span>M ${m}</span></div>`;
+  }).join('');
+  updateActionAvailability();
+  renderAlignmentInfo();
+}
+
+function syncPairsInput() {
+  $('pairsInput').value = JSON.stringify(state.pairs.map(p => ({ scan: p.scan, model: p.model })), null, 2);
+  updatePairUi();
+}
+
+function readPairsInput() {
+  let parsed = [];
+  try { parsed = JSON.parse($('pairsInput').value || '[]'); }
+  catch (err) { throw new Error('대응점 JSON 형식이 올바르지 않습니다.'); }
+  if (!Array.isArray(parsed)) throw new Error('대응점 JSON은 배열이어야 합니다.');
+  state.pairs = parsed.map((pair, i) => {
+    if (!Array.isArray(pair.scan) || !Array.isArray(pair.model) || pair.scan.length !== 3 || pair.model.length !== 3) {
+      throw new Error(`#${i + 1} 대응점은 scan/model 3D 좌표가 필요합니다.`);
+    }
+    const scan = pair.scan.map(Number);
+    const model = pair.model.map(Number);
+    if (!scan.every(Number.isFinite) || !model.every(Number.isFinite)) {
+      throw new Error(`#${i + 1} 대응점 좌표가 숫자가 아닙니다.`);
+    }
+    return {
+      scan,
+      model,
+    };
+  });
+  state.pendingPair = null;
+  drawPairs();
+  updatePairUi();
+  return state.pairs;
+}
+
+function resetAlignmentPairs() {
+  state.pairs = [];
+  state.pendingPair = null;
+  syncPairsInput();
+  drawPairs();
+}
+
+function drawSelectionMarker(obj) {
+  clearGroup(groups.selection);
+  if (!obj) return;
+  const mat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.95, depthTest: false });
+  const dotMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.95, depthTest: false, wireframe: true });
+  if (obj.start && obj.end) {
+    const start = new THREE.Vector3(...obj.start);
+    const end = new THREE.Vector3(...obj.end);
+    const g = new THREE.BufferGeometry().setFromPoints([start, end]);
+    groups.selection.add(new THREE.Line(g, mat));
+    for (const p of [start, end]) {
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(0.11, 16, 10), dotMat.clone());
+      dot.position.copy(p);
+      groups.selection.add(dot);
+    }
+    return;
+  }
+  if (obj.bbox) {
+    const box = new THREE.Box3(
+      new THREE.Vector3(...obj.bbox[0]),
+      new THREE.Vector3(...obj.bbox[1])
+    );
+    const helper = new THREE.Box3Helper(box, 0xffffff);
+    helper.material.depthTest = false;
+    helper.material.transparent = true;
+    helper.material.opacity = 0.95;
+    groups.selection.add(helper);
+    return;
+  }
+  if (obj.center) {
+    const marker = new THREE.Mesh(new THREE.SphereGeometry(0.18, 24, 12), dotMat);
+    marker.position.set(obj.center[0], obj.center[1], obj.center[2]);
+    groups.selection.add(marker);
+  }
+}
+
+function objectStatus(guid) {
+  return state.coverage?.objects?.find(o => o.guid === guid)?.status || 'default';
+}
+
+function coverageObject(guid) {
+  return state.coverage?.objects?.find(o => o.guid === guid) || null;
+}
+
+function glbNodeGuid(mesh) {
+  let p = mesh;
+  while (p) {
+    const ud = p.userData || {};
+    const g = ud.UniqueId || ud.uniqueId || ud.IfcGUID || ud.ifcGuid || ud.guid || ud.GUID;
+    if (g) return String(g);
+    p = p.parent;
+  }
+  return null;
+}
+
+// FR-A2: GUID로 매핑된 객체는 실제 GLB mesh 노드를 coverage 상태색으로 칠한다.
+function colorGlbMeshes() {
+  if (!state.glbMeshesByGuid) return;
+  for (const [guid, meshes] of state.glbMeshesByGuid) {
+    const cov = coverageObject(guid);
+    const status = cov?.status || 'default';
+    const filtered = status !== 'default' && state.visibility[status] === false;
+    for (const o of meshes) {
+      if (status === 'default' || filtered) {
+        // GLB mesh는 기준 모델 자체이므로 필터 시 숨기지 않고 중립 컨텍스트로 유지한다.
+        if (o.userData._neutralMat) o.material = o.userData._neutralMat;
+        o.userData._statusColored = false;
+        o.visible = true;
+      } else {
+        o.material = makeMat(status, 0.92);
+        o.userData._statusColored = true;
+        o.visible = true;
+      }
+    }
+  }
+}
+
+function drawProxyObjects() {
+  clearGroup(groups.proxy);
+  for (const obj of state.objects) {
+    if (state.glbMeshesByGuid && state.glbMeshesByGuid.has(obj.guid)) continue;
+    const cov = coverageObject(obj.guid);
+    const status = cov?.status || 'default';
+    const visible = status === 'default' ? true : state.visibility[status] !== false;
+    if (!visible) continue;
+    let node = null;
+    if (obj.start && obj.end) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute([...obj.start, ...obj.end], 3));
+      node = new THREE.Line(g, makeLineMat(status));
+    } else {
+      const center = obj.center || (obj.bbox ? [
+        (obj.bbox[0][0] + obj.bbox[1][0]) / 2,
+        (obj.bbox[0][1] + obj.bbox[1][1]) / 2,
+        (obj.bbox[0][2] + obj.bbox[1][2]) / 2,
+      ] : null);
+      if (!center) continue;
+      const radius = Math.max(0.035, Math.min(0.18, obj.diameter_m || 0.08));
+      node = new THREE.Mesh(new THREE.SphereGeometry(radius, 12, 8), makeMat(status, status === 'default' ? 0.45 : 0.95));
+      node.position.set(center[0], center[1], center[2]);
+    }
+    node.userData.guid = obj.guid;
+    node.userData.object = obj;
+    node.userData.coverage = cov;
+    groups.proxy.add(node);
+  }
+  colorGlbMeshes();
+}
+
+async function loadModel(id) {
+  if (!id) return;
+  setStatus('모델 로딩...', 'warn');
+  clearGroup(groups.model);
+  clearGroup(groups.proxy);
+  clearGroup(groups.selection);
+  state.model = state.models.find(m => m.model_id === id);
+  updateActionAvailability();
+  $('mModel').textContent = state.model?.name || id;
+  $('mManifest').textContent = manifestSummary(state.model);
+  $('mGuid').textContent = state.model ? `${Math.round((state.model.guid_mapping_ratio || 0) * 100)}%` : '-';
+  $('mBasis').textContent = modelBasisSummary(state.model);
+  try {
+    const objectsResp = await fetch(`/api/models/${id}/objects`).then(r => r.json());
+    state.objects = objectsResp.objects || [];
+    $('mObjects').textContent = state.objects.length.toLocaleString();
+    if (state.model?.glb_url) {
+      const loader = makeGltfLoader();
+      const gltf = await new Promise((resolve, reject) => loader.load(state.model.glb_url, resolve, undefined, reject));
+      const root = gltf.scene;
+      state.glbMeshesByGuid = new Map();
+      root.traverse(o => {
+        if (o.isMesh) {
+          const mats = Array.isArray(o.material) ? o.material : [o.material];
+          o.material = mats.map(m => {
+            const nm = m.clone();
+            nm.transparent = true;
+            nm.opacity = state.modelOpacity;
+            nm.depthWrite = false;
+            return nm;
+          });
+          if (o.material.length === 1) o.material = o.material[0];
+          o.userData._neutralMat = o.material;
+          const guid = glbNodeGuid(o);
+          if (guid) {
+            o.userData._guid = guid;
+            if (!state.glbMeshesByGuid.has(guid)) state.glbMeshesByGuid.set(guid, []);
+            state.glbMeshesByGuid.get(guid).push(o);
+          }
+        }
+      });
+      // F4: GLB는 glTF Y-up으로 저장되어 있으므로 Z-up 장면(PAG 미터)에 맞춰 +90°(X) 회전.
+      // 검증: PAG_m = 0.3048*GLB_ft (이동0·축동일) — docs/glb-auto-mapping-review.md
+      root.rotation.x = Math.PI / 2;
+      groups.model.add(root);
+      applyModelOpacity(state.modelOpacity);
+    }
+    drawProxyObjects();
+    fitView();
+    if (modelManifestOk()) {
+      if (state.model?.coverage_geometry_source === 'pag_proxy') {
+        setStatus('모델 로딩 완료 · PAG proxy 기준', 'warn');
+      } else if (state.model?.coverage_geometry_source === 'hybrid_glb_proxy') {
+        setStatus(`모델 로딩 완료 · 하이브리드 (GLB mesh ${state.model.guid_mapped_count ?? 0} + proxy)`, 'good');
+      } else {
+        setStatus('모델 로딩 완료', 'good');
+      }
+    } else {
+      setStatus('manifest invalid: coverage 분석 불가', 'bad');
+    }
+  } catch (err) {
+    console.error(err);
+    setStatus(`모델 로딩 실패: ${err.message || err}`, 'bad');
+    updateActionAvailability();
+  }
+}
+
+function buildTimeline() {
+  const el = $('timeline');
+  el.innerHTML = '';
+  el.style.display = state.timelineVisible ? 'flex' : 'none';
+  const thumbs = state.scan?.thumbs || [];
+  thumbs.forEach((b64, i) => {
+    const div = document.createElement('div');
+    div.className = 'thumb' + (i === state.selectedFrame ? ' active' : '');
+    div.dataset.frame = String(i);
+    div.innerHTML = `<img src="data:image/jpeg;base64,${b64}" alt=""><span>${frameLabel(i, true)}</span>`;
+    div.onclick = () => selectFrame(i);
+    el.appendChild(div);
+  });
+}
+
+function setTimelineVisible(visible) {
+  state.timelineVisible = Boolean(visible);
+  $('timeline').style.display = state.timelineVisible ? 'flex' : 'none';
+  $('toggleTimelineBtn').className = state.timelineVisible ? 'primary' : '';
+}
+
+function selectFrame(i) {
+  state.selectedFrame = i;
+  $('mFrame').textContent = i >= 0 ? frameLabel(i) : '-';
+  buildTimeline();
+  const active = $('timeline').querySelector(`.thumb[data-frame="${i}"]`);
+  active?.scrollIntoView?.({ block: 'nearest', inline: 'center' });
+  drawPath();
+  focusFrame(i);
+  updateFrameInfo();
+}
+
+async function loadUpload(id) {
+  if (!id) return;
+  setStatus('업로드 로딩...', 'warn');
+  state.upload = state.uploads.find(u => u.id === id);
+  state.pointCloudLoaded = false;
+  clearGroup(groups.pointCloud);
+  identityGroupTransform(groups.pointCloud);
+  groups.pointCloud.visible = false;
+  $('mUpload').textContent = id;
+  try {
+    const scan = await fetch(`/api/uploads/${id}/scan?variant=mesh&include_thumbs=true`).then(r => r.json());
+    if (!scan.ok) throw new Error(scan.error || 'scan load failed');
+    state.scan = scan;
+    $('mPayload').textContent = `${scan.magic} · ${(scan.count || 0).toLocaleString()}`;
+    const duration = formatSeconds(scan.video_duration_s);
+    $('mPose').textContent = `${scan.poses?.length || 0} / ${scan.thumb_count || 0}${duration ? ` · ${duration}` : ''}`;
+    if (scan.mesh_glb_url) await loadScanGlb(scan.mesh_glb_url);
+    selectFrame(0);
+    setStatus('업로드 로딩 완료', 'good');
+  } catch (err) {
+    console.error(err);
+    setStatus(`업로드 로딩 실패: ${err.message || err}`, 'bad');
+  }
+}
+
+function makePointCloud(scan) {
+  const pts = scan.points || [];
+  if (!pts.length) throw new Error('point sample is empty');
+  const colors = scan.colors || [];
+  const pos = new Float32Array(pts.length * 3);
+  const col = new Float32Array(pts.length * 3);
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    pos[i * 3 + 0] = Number(p[0]);
+    pos[i * 3 + 1] = -Number(p[1]);
+    pos[i * 3 + 2] = -Number(p[2]);
+    const c = colors[i] || [235, 238, 240];
+    col[i * 3 + 0] = Number(c[0]) / 255;
+    col[i * 3 + 1] = Number(c[1]) / 255;
+    col[i * 3 + 2] = Number(c[2]) / 255;
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geom.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  const mat = new THREE.PointsMaterial({
+    size: 0.025,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.92,
+    sizeAttenuation: true,
+    depthWrite: false,
+  });
+  return new THREE.Points(geom, mat);
+}
+
+async function loadPointCloudOverlay() {
+  if (!state.upload) return false;
+  if (state.pointCloudLoaded) return true;
+  setStatus('점군 로딩...', 'warn');
+  clearGroup(groups.pointCloud);
+  try {
+    let scan = await fetch(`/api/uploads/${state.upload.id}/scan?variant=detail&include_points=true&include_thumbs=false&max_points=120000`).then(r => r.json());
+    if (!scan.ok || !scan.points?.length) {
+      scan = await fetch(`/api/uploads/${state.upload.id}/scan?variant=mesh&include_points=true&include_thumbs=false&max_points=120000`).then(r => r.json());
+    }
+    if (!scan.ok) throw new Error(scan.error || 'point cloud load failed');
+    groups.pointCloud.add(makePointCloud(scan));
+    state.pointCloudLoaded = true;
+    applyScanOverlayTransform();
+    const aligned = Boolean(usableAlignment());
+    setStatus(
+      aligned
+        ? `점군 로딩 완료 · ${(scan.points?.length || 0).toLocaleString()} pts`
+        : `점군 raw 로딩 완료 · 정합 전 모델 위치 아님`,
+      aligned ? 'good' : 'warn',
+    );
+    return true;
+  } catch (err) {
+    console.error(err);
+    setStatus(`점군 로딩 실패: ${err.message || err}`, 'bad');
+    return false;
+  }
+}
+
+async function loadScanGlb(url) {
+  clearGroup(groups.scan);
+  identityGroupTransform(groups.scan);
+  try {
+    const loader = makeGltfLoader();
+    const gltf = await new Promise((resolve, reject) => loader.load(url, resolve, undefined, reject));
+    const root = gltf.scene;
+    root.traverse(o => {
+      if (o.isMesh) {
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        for (const m of mats) {
+          m.transparent = true;
+          m.opacity = 0.28;
+          m.depthWrite = false;
+        }
+      }
+    });
+    groups.scan.add(root);
+    groups.scan.visible = false;
+    applyScanOverlayTransform();
+  } catch (err) {
+    console.warn('scan glb load failed', err);
+  }
+}
+
+function docModelId(doc) {
+  return doc?.model_id || doc?.model?.model_id || doc?.model?.id || null;
+}
+
+function isCurrentModelDoc(doc) {
+  if (!state.model) return true;
+  return docModelId(doc) === state.model.model_id;
+}
+
+function nextActionLabel(action) {
+  return ({
+    fix_model_manifest: '모델 manifest 수정',
+    upload_or_process_video: '영상 처리 필요',
+    add_alignment_pairs: '대응점 추가/정합 저장',
+    run_coverage_analysis: 'coverage 분석 실행',
+    review_coverage: 'coverage 검토 가능',
+  })[action] || action || '-';
+}
+
+function checkStateClass(state) {
+  return ({
+    pass: 'pass',
+    warn: 'warn',
+    block: 'block',
+    pending: 'pending',
+  })[state] || 'pending';
+}
+
+function renderChecks(checks) {
+  if (!Array.isArray(checks) || !checks.length) return '';
+  return `<div class="check-list">${checks.map(check => `
+    <div class="check ${checkStateClass(check.state)}">
+      <i></i>
+      <b>${esc(check.label || check.id || '-')}</b>
+      <span>${esc(check.detail || check.state || '-')}</span>
+    </div>
+  `).join('')}</div>`;
+}
+
+function renderReadiness() {
+  const el = $('readinessInfo');
+  const r = state.readiness;
+  if (!el) return;
+  if (!r) {
+    el.textContent = '모델과 업로드를 불러오면 분석 준비 상태가 표시됩니다.';
+    return;
+  }
+  const kind = r.status === 'ready' ? 'good' : r.status === 'needs_analysis' ? 'warn' : 'bad';
+  const warnings = (r.warnings || []).slice(0, 4).map(w => `<div class="help">${esc(w)}</div>`).join('');
+  const coord = r.coordinate || {};
+  const coordinateNotice = coord.alignment_required
+    ? `<div class="notice bad"><b>정합 전 표시</b><span>모델은 BIM Z-up 좌표, scan/경로는 영상 재구성 local 좌표입니다. 화면에서 떨어져 보이는 것이 정상이며, 대응점 저장 전에는 촬영 부위를 확정하지 않습니다.</span></div>`
+    : `<div class="notice good"><b>모델 좌표 정합됨</b><span>scan/경로가 저장된 Sim(3) 정합으로 BIM 모델 좌표에 변환되어 있습니다.</span></div>`;
+  const coordHelp = !coord.state
+    ? ''
+    : coord.alignment_required
+      ? '<div class="help">정합 전: 현재 scan/경로는 BIM 모델 좌표가 아니라 영상 재구성 local 좌표입니다.</div>'
+      : `<div class="help">정합 후 scan 범위: ${esc(formatSpan(coord.aligned_scan_bounds))}</div>`;
+  el.innerHTML = `
+    <div class="metric"><span>상태</span><b class="badge ${kind}">${esc(r.status)}</b></div>
+    <div class="metric"><span>다음 조치</span><b>${esc(nextActionLabel(r.next_action))}</b></div>
+    <div class="metric"><span>기준 형상</span><b>${esc(modelBasisSummary(r.model))}</b></div>
+    <div class="metric"><span>scan</span><b>${r.scan?.ok ? `${esc(r.scan.magic)} · ${Number(r.scan.point_count || 0).toLocaleString()} pts` : '없음'}</b></div>
+    <div class="metric"><span>pose/thumb</span><b>${r.scan?.pose_count ?? 0} / ${r.scan?.thumb_count ?? 0}</b></div>
+    <div class="metric"><span>scan GLB</span><b>${r.scan?.mesh_glb ? '있음' : '없음'}</b></div>
+    <div class="metric"><span>source frame</span><b>${r.scan?.has_source_ids ? 'source_ids' : 'nearest pose fallback'}</b></div>
+    <div class="metric"><span>좌표 상태</span><b>${esc(coordinateStateLabel(coord.state))}</b></div>
+    <div class="metric"><span>뷰어 축</span><b>BIM Z-up</b></div>
+    <div class="metric"><span>scan 범위</span><b>${esc(formatSpan(coord.raw_scan_bounds))}</b></div>
+    <div class="metric"><span>model 범위</span><b>${esc(formatSpan(coord.model_bounds))}</b></div>
+    <div class="metric"><span>alignment</span><b>${esc(r.alignment?.quality || r.alignment?.state || '-')}</b></div>
+    <div class="metric"><span>auto 후보</span><b>${esc(r.auto_alignment?.state || '-')} · ${r.auto_alignment?.candidate_count ?? 0} · risk ${esc(r.auto_alignment?.repetition_risk || '-')}</b></div>
+    <div class="metric"><span>coverage</span><b>${esc(r.coverage?.state || '-')}</b></div>
+    ${coordinateNotice}
+    ${renderChecks(r.checks)}
+    ${coordHelp}
+    ${warnings}
+  `;
+  updateActionAvailability();
+}
+
+async function loadReadiness() {
+  if (!state.upload || !state.model) return false;
+  try {
+    const r = await fetch(`/api/uploads/${state.upload.id}/coverage/status?model_id=${state.model.model_id}`);
+    const j = await r.json();
+    if (!r.ok || !j.ok) {
+      state.readiness = { status: j.status || 'error', next_action: j.status || 'error', warnings: [j.error || String(r.status)] };
+    } else {
+      state.readiness = j;
+    }
+  } catch (err) {
+    state.readiness = { status: 'error', next_action: 'error', warnings: [String(err)] };
+  }
+  renderReadiness();
+  return state.readiness?.status === 'ready';
+}
+
+function qualityStatusLabel(status) {
+  return ({
+    blocked: '차단',
+    needs_evidence_review: 'evidence 보강 필요',
+    ready_for_manual_review: '수동 검수 가능',
+  })[status] || status || '-';
+}
+
+function renderQualityReport() {
+  const el = $('qualityReportInfo');
+  if (!el) return;
+  const report = state.qualityReport;
+  if (!report) {
+    el.textContent = 'coverage 결과가 있으면 자동 품질 게이트를 표시합니다.';
+    return;
+  }
+  if (!report.ok) {
+    el.innerHTML = `<div class="notice bad"><b>리포트 로드 실패</b><span>${esc(report.error || '-')}</span></div>`;
+    return;
+  }
+  const statusKind = report.status === 'ready_for_manual_review' ? 'warn' : report.status === 'blocked' ? 'bad' : 'warn';
+  const summary = report.summary || {};
+  const blockers = (report.blockers || []).map(b => `<div class="help">blocker: ${esc(b.message || b.id)}</div>`).join('');
+  const warnings = (report.warnings || []).slice(0, 4).map(w => `<div class="help">warn: ${esc(w.message || w.id)}</div>`).join('');
+  const criteria = (report.criteria || []).map(c => ({
+    id: c.id,
+    label: c.label,
+    state: c.state,
+    detail: c.detail,
+  }));
+  el.innerHTML = `
+    <div class="metric"><span>상태</span><b class="badge ${statusKind}">${esc(qualityStatusLabel(report.status))}</b></div>
+    <div class="metric"><span>자동 게이트</span><b>${report.automated_gate_passed ? '통과' : '미통과'}</b></div>
+    <div class="metric"><span>수동 게이트</span><b>${report.manual_gate_passed ? '통과' : '미통과'}</b></div>
+    <div class="metric"><span>최종 90%</span><b>${report.passed_90 ? '통과' : '수동 검수 필요'}</b></div>
+    <div class="metric"><span>observed evidence</span><b>${summary.observed_with_evidence ?? 0} / ${summary.observed_count ?? 0} · ${formatRatio(summary.observed_evidence_ratio)}</b></div>
+    <div class="metric"><span>support >=3</span><b>${summary.observed_support_ge3 ?? 0} / ${summary.observed_count ?? 0} · ${formatRatio(summary.observed_support_ratio)}</b></div>
+    <div class="metric"><span>object review</span><b>${summary.observed_review_accepted ?? 0} / ${summary.observed_count ?? 0} · ${formatRatio(summary.observed_review_acceptance_ratio)}</b></div>
+    <div class="metric"><span>frame review</span><b>${summary.frame_review_accepted ?? 0} / ${summary.frame_reviewed ?? 0} · ${formatRatio(summary.frame_review_acceptance_ratio)}</b></div>
+    ${renderChecks(criteria)}
+    ${blockers}
+    ${warnings}
+  `;
+}
+
+async function loadQualityReport() {
+  if (!state.upload || !state.model) {
+    state.qualityReport = null;
+    renderQualityReport();
+    return false;
+  }
+  try {
+    const r = await fetch(`/api/uploads/${state.upload.id}/coverage/report?model_id=${state.model.model_id}`);
+    const j = await r.json();
+    state.qualityReport = j;
+    renderQualityReport();
+    return Boolean(r.ok && j.ok);
+  } catch (err) {
+    state.qualityReport = { ok: false, error: String(err) };
+    renderQualityReport();
+    return false;
+  }
+}
+
+async function loadCoverageReview() {
+  if (!state.upload || !state.model) {
+    state.coverageReview = null;
+    renderCoverageReviewControls();
+    return false;
+  }
+  try {
+    const r = await fetch(`/api/uploads/${state.upload.id}/coverage/review?model_id=${state.model.model_id}`);
+    const j = await r.json();
+    state.coverageReview = r.ok && j.ok ? j : null;
+    renderCoverageReviewControls();
+    return Boolean(state.coverageReview);
+  } catch (err) {
+    console.warn('coverage review load failed', err);
+    state.coverageReview = null;
+    renderCoverageReviewControls();
+    return false;
+  }
+}
+
+function renderCoverageReviewControls() {
+  const el = $('reviewInfo');
+  if (!el) return;
+  const review = state.coverageReview;
+  const objectReviews = review?.object_reviews || {};
+  const frameReviews = review?.frame_reviews || {};
+  const objectAccepted = Object.values(objectReviews).filter(x => x?.accepted === true).length;
+  const objectRejected = Object.values(objectReviews).filter(x => x?.accepted === false).length;
+  const frameAccepted = Object.values(frameReviews).filter(x => x?.accepted === true).length;
+  const frameRejected = Object.values(frameReviews).filter(x => x?.accepted === false).length;
+  el.innerHTML = `
+    <div class="metric"><span>object 확인/불일치</span><b>${objectAccepted} / ${objectRejected}</b></div>
+    <div class="metric"><span>frame 확인/불일치</span><b>${frameAccepted} / ${frameRejected}</b></div>
+    <div class="metric"><span>updated</span><b>${esc(review?.updated_at || '-')}</b></div>
+  `;
+  if ($('reviewNotes') && document.activeElement !== $('reviewNotes')) {
+    $('reviewNotes').value = review?.notes || '';
+  }
+}
+
+function objectReview(guid) {
+  return state.coverageReview?.object_reviews?.[guid] || null;
+}
+
+function frameReview(frame) {
+  return state.coverageReview?.frame_reviews?.[String(frame)] || null;
+}
+
+function reviewLabel(review) {
+  if (!review || review.accepted === undefined || review.accepted === null) return '미검수';
+  return review.accepted ? '확인됨' : '불일치';
+}
+
+async function saveCoverageReviewPatch(patch) {
+  if (!state.upload || !state.model) return false;
+  const r = await fetch(`/api/uploads/${state.upload.id}/coverage/review`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ model_id: state.model.model_id, ...patch }),
+  });
+  const j = await r.json();
+  if (!r.ok || !j.ok) {
+    setStatus(`검수 저장 실패: ${j.error || r.status}`, 'bad');
+    return false;
+  }
+  state.coverageReview = j;
+  renderCoverageReviewControls();
+  await loadQualityReport();
+  updateFrameInfo();
+  if (state.selectedObject) {
+    const cov = coverageObject(state.selectedObject.guid);
+    showObject(state.selectedObject, cov, { selectEvidenceFrame: false });
+  }
+  setStatus('검수 기록 저장 완료', 'good');
+  return true;
+}
+
+async function saveReviewNotes() {
+  await saveCoverageReviewPatch({ notes: $('reviewNotes')?.value || '' });
+}
+
+async function resetCoverageReview() {
+  if (!state.upload || !state.model) return;
+  if (!confirm('이 업로드의 수동 검수 기록을 모두 초기화할까요?')) return;
+  const r = await fetch(`/api/uploads/${state.upload.id}/coverage/review`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ model_id: state.model.model_id, replace: true }),
+  });
+  const j = await r.json();
+  if (!r.ok || !j.ok) {
+    setStatus(`검수 초기화 실패: ${j.error || r.status}`, 'bad');
+    return;
+  }
+  state.coverageReview = j;
+  renderCoverageReviewControls();
+  await loadQualityReport();
+  updateFrameInfo();
+  if (state.selectedObject) {
+    const cov = coverageObject(state.selectedObject.guid);
+    showObject(state.selectedObject, cov, { selectEvidenceFrame: false });
+  }
+  setStatus('검수 기록 초기화 완료', 'good');
+}
+
+async function markSelectedObjectReview(accepted) {
+  const obj = state.selectedObject;
+  if (!obj?.guid) return;
+  const cov = coverageObject(obj.guid);
+  const frame = state.selectedFrame >= 0
+    ? state.selectedFrame
+    : Number((cov?.evidence_thumb_ids || cov?.support_frames || [])[0]);
+  await saveCoverageReviewPatch({
+    object_reviews: {
+      [obj.guid]: {
+        accepted,
+        frame: Number.isInteger(frame) ? frame : null,
+        note: accepted ? 'evidence keyframe 확인' : 'evidence/keyframe 불일치',
+      },
+    },
+  });
+}
+
+async function clearSelectedObjectReview() {
+  const obj = state.selectedObject;
+  if (!obj?.guid) return;
+  await saveCoverageReviewPatch({ object_reviews: { [obj.guid]: null } });
+}
+
+async function markSelectedFrameReview(accepted) {
+  const frame = state.selectedFrame;
+  if (!Number.isInteger(frame) || frame < 0) return;
+  await saveCoverageReviewPatch({
+    frame_reviews: {
+      [frame]: {
+        accepted,
+        frame,
+        note: accepted ? '모델 위치와 keyframe 위치 확인' : '모델 위치와 keyframe 위치 불일치',
+      },
+    },
+  });
+}
+
+async function clearSelectedFrameReview() {
+  const frame = state.selectedFrame;
+  if (!Number.isInteger(frame) || frame < 0) return;
+  await saveCoverageReviewPatch({ frame_reviews: { [frame]: null } });
+}
+
+async function loadCoverage() {
+  if (!state.upload || !state.model) return false;
+  const r = await fetch(`/api/uploads/${state.upload.id}/coverage?model_id=${state.model.model_id}`);
+  if (!r.ok) return false;
+  const doc = await r.json();
+  if (!isCurrentModelDoc(doc)) {
+    setStatus('coverage 모델 불일치: 다시 분석 필요', 'bad');
+    return false;
+  }
+  state.coverage = doc;
+  if (Array.isArray(state.coverage?.alignment?.pairs)) {
+    state.pairs = state.coverage.alignment.pairs.map(pair => ({ scan: pair.scan, model: pair.model }));
+    state.pendingPair = null;
+    syncPairsInput();
+  }
+  applyScanOverlayTransform();
+  updateCoverageUi();
+  drawProxyObjects();
+  drawPath();
+  drawPairs();
+  await loadCoverageReview();
+  await loadQualityReport();
+  focusFrame();
+  return true;
+}
+
+async function loadAlignment() {
+  if (!state.upload || !state.model) return false;
+  const r = await fetch(`/api/uploads/${state.upload.id}/alignment?model_id=${state.model.model_id}`);
+  if (!r.ok) return false;
+  const j = await r.json();
+  if (!j.ok || !j.alignment) return false;
+  if (!isCurrentModelDoc(j)) {
+    setStatus('정합 모델 불일치: 다시 저장 필요', 'bad');
+    return false;
+  }
+  state.coverage = { ...(state.coverage || {}), alignment: j.alignment, auto_candidate: null };
+  if (Array.isArray(j.alignment.pairs)) {
+    state.pairs = j.alignment.pairs.map(pair => ({ scan: pair.scan, model: pair.model }));
+    state.pendingPair = null;
+    syncPairsInput();
+  }
+  applyScanOverlayTransform();
+  updateCoverageUi();
+  drawPath();
+  drawPairs();
+  focusFrame();
+  return Boolean(usableAlignment());
+}
+
+function candidateStatusLabel(status) {
+  return ({
+    needs_anchor: 'anchor 필요',
+    ambiguous_alignment: '후보 모호',
+    auto_alignment_candidate: '후보 있음',
+    needs_alignment: '정합 보강 필요',
+    missing: '후보 없음',
+  })[status] || status || '-';
+}
+
+function renderAlignmentCandidates(doc=state.alignmentCandidates) {
+  const el = $('candidateInfo');
+  if (!el) return;
+  if (!doc) {
+    el.textContent = '후보 계산 전';
+    return;
+  }
+  if (!doc.ok) {
+    el.innerHTML = `<div class="help">${esc(doc.error || '후보 없음')}</div>`;
+    return;
+  }
+  const risk = doc.repetition_risk || {};
+  const warnings = (doc.warnings || []).slice(0, 4).map(w => `<div class="help">${esc(w)}</div>`).join('');
+  const items = doc.candidates || [];
+  const rows = items.length
+    ? `<div class="candidate-list">${items.map((c, i) => `
+        <div class="candidate" data-candidate-index="${i}">
+          <b>${esc(c.source)} · ${esc(c.quality || '-')} · ${Math.round(Number(c.score || 0) * 100)}%</b>
+          <span>${esc(c.confidence || '-')} · ${c.can_save ? '저장 가능' : '미리보기만'} · ${esc(c.upload_id || '')}</span>
+          <span>${esc(c.reason || '')}</span>
+          <span>${Number.isFinite(Number(c.center_distance_m)) ? `center ${formatMeters(c.center_distance_m)}` : ''}</span>
+          ${c.can_save ? `<button data-save-candidate-index="${i}" class="primary">이 후보를 정합으로 저장</button>` : ''}
+        </div>
+      `).join('')}</div>`
+    : '<div class="help">후보 없음 · 대응점 또는 현장 anchor가 필요합니다.</div>';
+  el.innerHTML = `
+    <div class="metric"><span>상태</span><b>${esc(candidateStatusLabel(doc.status))}</b></div>
+    <div class="metric"><span>anchor</span><b>${doc.anchor_count ?? 0}개</b></div>
+    <div class="metric"><span>반복 위험</span><b>${esc(risk.level || '-')} · ${risk.max_category_count ?? 0}</b></div>
+    ${rows}
+    ${warnings}
+  `;
+  el.querySelectorAll('[data-candidate-index]').forEach(node => {
+    node.onclick = () => previewAlignmentCandidate(Number(node.dataset.candidateIndex));
+  });
+  el.querySelectorAll('[data-save-candidate-index]').forEach(node => {
+    node.onclick = event => {
+      event.stopPropagation();
+      saveAlignmentCandidate(Number(node.dataset.saveCandidateIndex));
+    };
+  });
+}
+
+async function loadAlignmentCandidates() {
+  if (!state.upload || !state.model) return false;
+  try {
+    const r = await fetch(`/api/uploads/${state.upload.id}/alignment/candidates?model_id=${state.model.model_id}`);
+    if (!r.ok) {
+      state.alignmentCandidates = null;
+      renderAlignmentCandidates();
+      return false;
+    }
+    const j = await r.json();
+    state.alignmentCandidates = j;
+    renderAlignmentCandidates(j);
+    return true;
+  } catch (err) {
+    state.alignmentCandidates = { ok: false, error: String(err) };
+    renderAlignmentCandidates();
+    return false;
+  }
+}
+
+async function autoPlaceAlignment() {
+  if (!state.upload || !state.model) return;
+  if (!modelManifestOk()) {
+    setStatus('manifest invalid: 자동 배치 불가', 'bad');
+    return;
+  }
+  let hint;
+  if (state.pairs.length === 1 && Array.isArray(state.pairs[0]?.model)) hint = state.pairs[0].model;
+  setStatus(hint ? '자동 배치 탐색 중... (시작 힌트 사용)' : '자동 배치 탐색 중... (중력 정렬 · metric scale)', 'warn');
+  const r = await fetch(`/api/uploads/${state.upload.id}/alignment/candidates`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      model_id: state.model.model_id,
+      auto_place: true,
+      start_hint: hint,
+      max_candidates: 3,
+    }),
+  });
+  const j = await r.json();
+  state.alignmentCandidates = j;
+  renderAlignmentCandidates(j);
+  if (!r.ok || !j.ok) {
+    setStatus(`자동 배치 실패: ${j.error || r.status}`, 'bad');
+    return;
+  }
+  const autos = (j.candidates || []).filter(c => c.source === 'auto_geometric');
+  if (autos.length) {
+    const idx = (j.candidates || []).indexOf(autos[0]);
+    previewAlignmentCandidate(idx >= 0 ? idx : 0);
+    setStatus(`자동 배치 후보 ${autos.length}개 · 1순위 미리보기 적용 · 확인 후 저장하세요`, 'warn');
+  } else {
+    setStatus('자동 배치 후보 없음 · 대응점 또는 시작 힌트가 필요합니다', 'bad');
+  }
+}
+
+async function computeAlignmentCandidates() {
+  if (!state.upload || !state.model) return;
+  if (!modelManifestOk()) {
+    setStatus('manifest invalid: 후보 계산 불가', 'bad');
+    return;
+  }
+  let pairs = [];
+  try { pairs = readPairsInput(); }
+  catch (err) { alert(err.message || '대응점 JSON을 확인하세요'); return; }
+  setStatus('정합 후보 계산 중...', 'warn');
+  const r = await fetch(`/api/uploads/${state.upload.id}/alignment/candidates`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      model_id: state.model.model_id,
+      alignment: { pairs },
+      max_candidates: 5,
+    }),
+  });
+  const j = await r.json();
+  state.alignmentCandidates = j;
+  renderAlignmentCandidates(j);
+  await loadReadiness();
+  if (!r.ok || !j.ok) {
+    setStatus(`후보 계산 실패: ${j.error || r.status}`, 'bad');
+    return;
+  }
+  const kind = j.status === 'auto_alignment_candidate' || j.status === 'ambiguous_alignment' ? 'warn' : 'bad';
+  setStatus(`정합 후보: ${candidateStatusLabel(j.status)} · ${j.candidates?.length || 0}개`, kind);
+}
+
+function previewAlignmentCandidate(index) {
+  const cand = state.alignmentCandidates?.candidates?.[index];
+  if (!cand?.alignment) return;
+  state.coverage = {
+    ...(state.coverage || {}),
+    alignment: cand.alignment,
+    auto_candidate: {
+      id: cand.id,
+      source: cand.source,
+      score: cand.score,
+      confidence: cand.confidence,
+      can_save: cand.can_save,
+    },
+  };
+  applyScanOverlayTransform();
+  updateCoverageUi();
+  drawPath();
+  drawPairs();
+  focusFrame();
+  setStatus(`후보 미리보기 · ${cand.source} · 저장된 정합 아님`, 'warn');
+}
+
+async function saveAlignmentCandidate(index) {
+  const cand = state.alignmentCandidates?.candidates?.[index];
+  if (!cand?.can_save || !cand?.alignment) {
+    setStatus('이 후보는 저장할 수 없습니다. 대응점/anchor를 보강하세요', 'bad');
+    return;
+  }
+  const pairs = Array.isArray(cand.alignment.pairs) ? cand.alignment.pairs : [];
+  setStatus('후보 정합 저장 중...', 'warn');
+  // 대응점이 충분하면 pairs로 재계산 저장, 아니면 검증된 후보를 candidate_id로 저장
+  const body = pairs.length >= 4
+    ? { model_id: state.model.model_id, alignment: { pairs } }
+    : { model_id: state.model.model_id, candidate_id: cand.id };
+  const r = await fetch(`/api/uploads/${state.upload.id}/alignment`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const j = await r.json();
+  if (!r.ok || !j.ok) {
+    setStatus(`후보 저장 실패: ${j.error || r.status}`, 'bad');
+    return;
+  }
+  state.coverage = { ...(state.coverage || {}), alignment: j.alignment, auto_candidate: null };
+  if (Array.isArray(j.alignment?.pairs)) {
+    state.pairs = j.alignment.pairs.map(pair => ({ scan: pair.scan, model: pair.model }));
+    syncPairsInput();
+  }
+  applyScanOverlayTransform();
+  updateCoverageUi();
+  drawPath();
+  drawPairs();
+  await loadReadiness();
+  await loadCoverageReview();
+  await loadQualityReport();
+  setStatus(`후보 정합 저장 완료 · ${j.alignment?.quality || '-'}`, j.alignment?.quality === 'red' ? 'warn' : 'good');
+}
+
+function updateCoverageUi() {
+  const c = state.coverage;
+  renderAlignmentInfo();
+  if (!c) {
+    $('mAlign').textContent = state.upload && state.model ? '정합 필요' : '-';
+    $('statusCounts').innerHTML = state.upload && state.model
+      ? '<div class="metric"><span>상태</span><b>정합 필요</b></div><div class="help">이 업로드는 현재 모델 좌표계로 정합된 결과가 없습니다. 대응점 4개 이상을 저장한 뒤 coverage 분석을 실행해야 촬영 부위를 표시할 수 있습니다.</div>'
+      : '분석 결과 없음';
+    return;
+  }
+  $('mAlign').textContent = alignmentSummary(c.alignment);
+  const candidateHtml = c.auto_candidate
+    ? `<div class="help">자동 후보 미리보기 · ${esc(c.auto_candidate.source || '')} · score ${Math.round(Number(c.auto_candidate.score || 0) * 100)}%. 저장된 정합이 아니므로 coverage observed 판정에는 사용하지 않습니다.</div>`
+    : '';
+  if (c.alignment?.quality === 'red') {
+    $('statusCounts').innerHTML = candidateHtml + '<div class="metric"><span>상태</span><b>정합 불충분</b></div><div class="help">red 품질 정합은 모델 기준 촬영 부위로 사용할 수 없습니다. 대응점을 보강한 뒤 다시 분석하세요.</div>' + alignmentWarning(c.alignment);
+    renderAlignmentInfo();
+    updateFrameInfo();
+    return;
+  }
+  if (c.alignment?.stable === false) {
+    $('statusCounts').innerHTML = candidateHtml + '<div class="metric"><span>상태</span><b>정합 불안정</b></div>' + alignmentWarning(c.alignment);
+    renderAlignmentInfo();
+    updateFrameInfo();
+    return;
+  }
+  const entries = Object.entries(c.status_counts || {});
+  const opt = c.options || {};
+  const optionsHtml = Object.keys(opt).length
+    ? `<div class="help">옵션 · 거리 ${opt.distance_threshold_m ?? '-'}m · support ${opt.min_support_frames ?? '-'} · geometry ${opt.min_geometry_consistency ?? '-'} · visibility ${opt.require_visibility ? 'on' : 'off'} · alignment ${esc(opt.alignment_source || '-')}</div>`
+    : '';
+  $('statusCounts').innerHTML = entries.length
+    ? candidateHtml + entries.map(([k,v]) => `<div class="metric"><span>${k}</span><b>${v}</b></div>`).join('') + optionsHtml
+    : candidateHtml + (c.alignment ? '정합만 로드됨 · coverage 분석 필요' : '분석 결과 없음');
+  renderAlignmentInfo();
+  updateFrameInfo();
+}
+
+function numberInputValue(id, fallback, min, max) {
+  const raw = Number($(id)?.value);
+  const value = Number.isFinite(raw) ? raw : fallback;
+  return Math.max(min, Math.min(max, value));
+}
+
+function readCoverageOptions() {
+  return {
+    distance_threshold_m: numberInputValue('optDistance', 0.10, 0.01, 2.0),
+    min_support_frames: Math.round(numberInputValue('optMinSupport', 3, 1, 20)),
+    min_geometry_consistency: numberInputValue('optMinConsistency', 0.60, 0, 1),
+    require_visibility: Boolean($('optRequireVisibility')?.checked),
+    visibility_max_depth_m: numberInputValue('optVisibilityDepth', 15.0, 0.5, 100.0),
+    visibility_margin_px: numberInputValue('optVisibilityMargin', 32.0, 0, 512),
+  };
+}
+
+async function saveAlignment() {
+  if (!state.upload || !state.model) return;
+  if (!modelManifestOk()) {
+    setStatus('manifest invalid: 정합 저장 불가', 'bad');
+    return;
+  }
+  let pairs = [];
+  try { pairs = readPairsInput(); }
+  catch (err) { alert(err.message || '대응점 JSON을 확인하세요'); return; }
+  if (pairs.length < 4) {
+    setStatus('정합 저장 전 대응점 4개 이상 필요', 'bad');
+    updateCoverageUi();
+    return;
+  }
+  setStatus('정합 저장 중...', 'warn');
+  const r = await fetch(`/api/uploads/${state.upload.id}/alignment`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      model_id: state.model.model_id,
+      alignment: { pairs },
+    }),
+  });
+  const j = await r.json();
+  if (!r.ok || !j.ok) {
+    setStatus(`정합 저장 실패: ${j.error || r.status}`, 'bad');
+    return;
+  }
+  state.coverage = { ...(state.coverage || {}), alignment: j.alignment, auto_candidate: null };
+  if (Array.isArray(j.alignment?.pairs)) {
+    state.pairs = j.alignment.pairs.map(pair => ({ scan: pair.scan, model: pair.model }));
+    syncPairsInput();
+  }
+  applyScanOverlayTransform();
+  updateCoverageUi();
+  drawPath();
+  drawPairs();
+  await loadReadiness();
+  await loadCoverageReview();
+  await loadQualityReport();
+  setStatus(`정합 저장 완료 · ${j.alignment?.quality || '-'}`, j.alignment?.quality === 'red' ? 'warn' : 'good');
+}
+
+async function analyzeCoverage() {
+  if (!state.upload || !state.model) return;
+  if (!modelManifestOk()) {
+    setStatus('manifest invalid: coverage 분석 불가', 'bad');
+    return;
+  }
+  let pairs = [];
+  try { pairs = readPairsInput(); }
+  catch (err) { alert(err.message || '대응점 JSON을 확인하세요'); return; }
+  const useSavedAlignment = pairs.length < 4 && savedAlignmentReady();
+  if (pairs.length > 0 && pairs.length < 4 && !useSavedAlignment) {
+    setStatus('coverage 분석 전 대응점 4개 이상 필요', 'bad');
+    state.coverage = state.coverage || null;
+    updateCoverageUi();
+    return;
+  }
+  if (!pairs.length && !useSavedAlignment) {
+    setStatus('coverage 분석 전 저장된 정합 또는 대응점 4개 이상 필요', 'bad');
+    state.coverage = state.coverage || null;
+    updateCoverageUi();
+    return;
+  }
+  setStatus(useSavedAlignment ? '저장 정합으로 coverage 분석 중...' : 'coverage 분석 중...', 'warn');
+  const body = {
+    model_id: state.model.model_id,
+    coverage_options: readCoverageOptions(),
+  };
+  if (!useSavedAlignment) body.alignment = { pairs };
+  const r = await fetch(`/api/uploads/${state.upload.id}/coverage/analyze`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const j = await r.json();
+  if (!r.ok || !j.ok) {
+    const kind = j.status === 'needs_alignment' ? 'warn' : 'bad';
+    setStatus(`분석 실패: ${j.error || r.status}`, kind);
+    return;
+  }
+  state.coverage = j;
+  if (Array.isArray(j.alignment?.pairs)) {
+    state.pairs = j.alignment.pairs.map(pair => ({ scan: pair.scan, model: pair.model }));
+    syncPairsInput();
+  }
+  applyScanOverlayTransform();
+  updateCoverageUi();
+  drawProxyObjects();
+  drawPath();
+  drawPairs();
+  await loadReadiness();
+  await loadCoverageReview();
+  await loadQualityReport();
+  focusFrame();
+  setStatus('coverage 분석 완료', 'good');
+}
+
+function fitView() {
+  const box = new THREE.Box3();
+  for (const g of Object.values(groups)) {
+    if (g.visible !== false && g.children.length) box.expandByObject(g);
+  }
+  if (box.isEmpty()) return;
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  const span = Math.max(size.x, size.y, size.z, 1);
+  camera.position.set(center.x + span * 0.75, center.y - span * 0.85, center.z + span * 0.65);
+  controls.target.copy(center);
+  controls.update();
+}
+
+function buildLegend() {
+  const el = $('legend');
+  el.innerHTML = '';
+  for (const key of ['observed','likely_observed','uncertain','not_observed','out_of_scope']) {
+    const c = STATUS[key];
+    const label = document.createElement('label');
+    label.innerHTML = `<input type="checkbox" ${state.visibility[key] ? 'checked' : ''}> <span class="swatch" style="background:#${c.color.toString(16).padStart(6,'0')}"></span> ${c.label}`;
+    const input = label.querySelector('input');
+    input.onchange = () => { state.visibility[key] = input.checked; drawProxyObjects(); };
+    el.appendChild(label);
+  }
+}
+
+const raycaster = new THREE.Raycaster();
+raycaster.params.Line = { threshold: 0.15 };
+raycaster.params.Points = { threshold: 0.10 };
+const mouse = new THREE.Vector2();
+
+function setMouseFromEvent(e) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+}
+
+function hasScanPickGeometry() {
+  return groups.scan.children.length || groups.pointCloud.children.length;
+}
+
+async function setPickMode(enabled) {
+  state.pickMode = Boolean(enabled);
+  state.pendingPair = null;
+  if (state.pickMode) {
+    if (!hasScanPickGeometry() && state.upload) {
+      setStatus('대응점 입력용 점군 자동 로딩...', 'warn');
+      await loadPointCloudOverlay();
+    }
+    if (!hasScanPickGeometry() || !groups.proxy.children.length) {
+      state.pickMode = false;
+      setStatus('모델과 스캔 GLB/점군을 먼저 불러오세요', 'bad');
+    } else {
+      groups.scan.visible = true;
+      groups.pointCloud.visible = true;
+      groups.proxy.visible = true;
+      setStatus('스캔 GLB 또는 점군에서 기준점을 클릭하세요', 'warn');
+    }
+  }
+  updatePairUi();
+  drawPairs();
+}
+
+function pickHitsFrom(group) {
+  group.updateMatrixWorld(true);
+  return raycaster.intersectObjects(group.children, true);
+}
+
+function pickHitsFromScanOverlay() {
+  for (const group of [groups.scan, groups.pointCloud]) {
+    if (!group.children.length || group.visible === false) continue;
+    const hits = pickHitsFrom(group);
+    if (hits.length) return { group, hits };
+  }
+  return { group: null, hits: [] };
+}
+
+function handleAlignmentPick(e) {
+  setMouseFromEvent(e);
+  if (!state.pendingPair?.scan) {
+    const { group, hits } = pickHitsFromScanOverlay();
+    if (!hits.length) {
+      setStatus('스캔 GLB 또는 점군 표면을 먼저 클릭하세요', 'warn');
+      return;
+    }
+    const raw = group.worldToLocal(hits[0].point.clone());
+    state.pendingPair = { scan: roundPoint(raw) };
+    drawPairs();
+    updatePairUi();
+    setStatus('이제 모델 proxy에서 같은 위치를 클릭하세요', 'warn');
+    return;
+  }
+  let hits = pickHitsFrom(groups.proxy);
+  let source = 'proxy';
+  if (!hits.length) {
+    hits = pickHitsFrom(groups.model);
+    source = 'model';
+  }
+  if (!hits.length) {
+    setStatus('모델 proxy 또는 모델 표면을 클릭하세요', 'warn');
+    return;
+  }
+  state.pairs.push({
+    scan: state.pendingPair.scan,
+    model: roundPoint(hits[0].point),
+    source,
+  });
+  state.pendingPair = null;
+  syncPairsInput();
+  drawPairs();
+  const kind = state.pairs.length >= 4 ? 'good' : 'warn';
+  setStatus(`대응점 ${state.pairs.length}개 저장`, kind);
+}
+
+function handleSceneClick(e) {
+  setMouseFromEvent(e);
+  const hits = raycaster.intersectObjects([...groups.proxy.children, ...groups.model.children, ...groups.path.children], true);
+  if (!hits.length) return;
+  let cur = hits[0].object, guid = null, objRecord = null;
+  while (cur) {
+    if (cur.userData?.guid) { guid = cur.userData.guid; objRecord = cur.userData.object; break; }
+    if (cur.userData?._guid) { guid = cur.userData._guid; break; }
+    cur = cur.parent;
+  }
+  if (guid) {
+    if (!objRecord) objRecord = state.objects.find(o => o.guid === guid) || null;
+    showObject(objRecord, coverageObject(guid));
+    return;
+  }
+  let obj = hits[0].object;
+  while (obj && obj.userData.frameIndex === undefined && obj.parent) obj = obj.parent;
+  if (obj?.userData.frameIndex !== undefined) selectFrame(obj.userData.frameIndex);
+}
+
+renderer.domElement.addEventListener('click', e => {
+  if (state.pickMode) {
+    handleAlignmentPick(e);
+    return;
+  }
+  handleSceneClick(e);
+});
+
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  })[ch]);
+}
+
+function objectForGuid(guid) {
+  return state.objects.find(o => o.guid === guid) || null;
+}
+
+function formatRatio(value) {
+  return Number.isFinite(Number(value)) ? `${Math.round(Number(value) * 100)}%` : '-';
+}
+
+function formatMeters(value) {
+  return Number.isFinite(Number(value)) ? `${Number(value).toFixed(3)} m` : '-';
+}
+
+function formatNumber(value, digits=4) {
+  return Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : '-';
+}
+
+function formatVec(values, digits=3) {
+  if (!Array.isArray(values) || values.length !== 3) return '-';
+  return values.map(v => formatNumber(v, digits)).join(', ');
+}
+
+function formatSpan(bounds) {
+  const span = bounds?.span;
+  if (!Array.isArray(span) || span.length !== 3) return '-';
+  return `${span.map(v => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : '-').join(' x ')} m`;
+}
+
+function coordinateStateLabel(state) {
+  return ({
+    aligned_model_world: '정합됨',
+    raw_scan_local: 'raw scan local',
+  })[state] || state || '-';
+}
+
+function alignmentSummary(alignment) {
+  if (!alignment) return '-';
+  const parts = [
+    alignment.quality || '-',
+    `${alignment.n ?? 0} pts`,
+    `rmse ${formatMeters(alignment.rmse_m)}`,
+  ];
+  if (Number.isFinite(Number(alignment.max_leave_one_out_rmse_m))) {
+    parts.push(`loo ${formatMeters(alignment.max_leave_one_out_rmse_m)}`);
+  }
+  if (alignment.correspondence_spread?.ok === false) parts.push('spread 부족');
+  if (alignment.stable === false) parts.push('unstable');
+  return parts.join(' · ');
+}
+
+function alignmentWarning(alignment) {
+  if (!alignment) return '';
+  const messages = [];
+  const spread = alignment.correspondence_spread;
+  if (spread?.ok === false) {
+    const scan = formatMeters(spread.scan?.extent_m);
+    const model = formatMeters(spread.model?.extent_m);
+    messages.push(`대응점 분포 부족: scan ${scan}, model ${model}. 시작/중간/끝 또는 서로 떨어진 물리 위치를 추가하세요.`);
+  }
+  if (alignment.stable === false && !messages.length) {
+    messages.push('대응점 하나를 제외했을 때 변환이 크게 흔들립니다. residual이 큰 대응점을 확인하고 보강하세요.');
+  }
+  return messages.length ? `<div class="help">${messages.map(esc).join('<br>')}</div>` : '';
+}
+
+function currentAlignment() {
+  return state.coverage?.alignment || null;
+}
+
+function residualThreshold(alignment) {
+  const rmse = Number(alignment?.rmse_m);
+  return Math.max(0.10, Number.isFinite(rmse) ? rmse * 2.0 : 0.10);
+}
+
+function renderAlignmentInfo() {
+  const el = $('alignmentInfo');
+  if (!el) return;
+  const alignment = currentAlignment();
+  if (!alignment) {
+    const count = state.pairs.length;
+    el.innerHTML = count
+      ? `<div class="metric"><span>입력 대응점</span><b>${count} / 4</b></div><div class="help">정합 저장 전입니다. 4개 이상 저장하면 품질과 residual을 계산합니다.</div>`
+      : '대응점을 저장하면 정합 품질과 residual이 표시됩니다.';
+    return;
+  }
+  const q = alignment.quality === 'green' ? 'good' : alignment.quality === 'yellow' ? 'warn' : 'bad';
+  const spread = alignment.correspondence_spread || {};
+  const residuals = Array.isArray(alignment.per_point_residuals) ? alignment.per_point_residuals : [];
+  const threshold = residualThreshold(alignment);
+  const maxIdx = residuals.reduce((best, value, idx) => {
+    if (!Number.isFinite(Number(value))) return best;
+    return best < 0 || Number(value) > Number(residuals[best]) ? idx : best;
+  }, -1);
+  const rows = residuals.length
+    ? `<div class="residual-list">${residuals.map((value, idx) => {
+        const bad = idx === maxIdx || Number(value) > threshold;
+        return `<div class="${bad ? 'bad' : ''}">
+          <span>#${idx + 1}</span>
+          <span>${bad ? '보강 후보' : 'residual'}</span>
+          <b>${formatMeters(value)}</b>
+        </div>`;
+      }).join('')}</div>`
+    : '<div class="help">대응점별 residual 없음</div>';
+  const rotationRows = Array.isArray(alignment.rotation)
+    ? alignment.rotation.map(row => `[${(row || []).map(v => formatNumber(v, 4)).join(', ')}]`).join('<br>')
+    : '-';
+  el.innerHTML = `
+    <div class="metric"><span>quality</span><b class="badge ${q}">${esc(alignment.quality || '-')}</b></div>
+    <div class="metric"><span>대응점</span><b>${alignment.n ?? residuals.length ?? 0}개 · 권장 6개+</b></div>
+    <div class="metric"><span>RMSE</span><b>${formatMeters(alignment.rmse_m)}</b></div>
+    <div class="metric"><span>leave-one-out max</span><b>${formatMeters(alignment.max_leave_one_out_rmse_m)}</b></div>
+    <div class="metric"><span>scale</span><b>${formatNumber(alignment.scale, 5)}</b></div>
+    <div class="metric"><span>stable</span><b>${alignment.stable === false ? 'no' : 'yes'}</b></div>
+    <div class="metric"><span>spread</span><b>${spread.ok === false ? '부족' : '통과'}</b></div>
+    <div class="metric"><span>translation</span><b class="mono">${esc(formatVec(alignment.translation))}</b></div>
+    <div class="help mono">rotation<br>${rotationRows}</div>
+    ${rows}
+    ${alignmentWarning(alignment)}
+  `;
+}
+
+function keyframeUrl(frame) {
+  return state.upload ? `/api/uploads/${state.upload.id}/keyframes/${frame}.jpg` : '#';
+}
+
+function ensureKeyframes(frames) {
+  if (!state.upload) return;
+  const valid = [...new Set((frames || []).map(Number))]
+    .filter(i => Number.isInteger(i) && i >= 0)
+    .slice(0, 8);
+  if (!valid.length) return;
+  fetch(`/api/uploads/${state.upload.id}/keyframes?frames=${valid.join(',')}`).catch(err => {
+    console.warn('keyframe prefetch failed', err);
+  });
+}
+
+function evidenceThumbsHtml(frames, cov) {
+  const thumbs = state.scan?.thumbs || [];
+  const valid = [...new Set((frames || []).map(Number))]
+    .filter(i => Number.isInteger(i) && i >= 0 && i < thumbs.length)
+    .slice(0, 16);
+  if (!valid.length) return '<div class="help">연결된 evidence thumbnail 없음</div>';
+  const keyframes = cov?.evidence_keyframes || [];
+  return `<div class="evidence-strip">${valid.map(i => `
+    <div class="evidence-thumb" data-frame="${i}" title="frame ${frameLabel(i)}">
+      <img src="data:image/jpeg;base64,${thumbs[i]}" alt="">
+      <span>${frameLabel(i)}</span>
+    </div>
+  `).join('')}</div>
+  <div class="keyframe-links">${valid.slice(0, 8).map((i, idx) => {
+    const href = keyframes[idx] || keyframeUrl(i);
+    return `<a href="${esc(href)}" target="_blank" rel="noopener">원본 ${frameLabel(i)}</a>`;
+  }).join('')}</div>`;
+}
+
+function frameCandidateRows(frame) {
+  if (!state.coverage?.objects?.length || frame < 0) return [];
+  const rank = { observed: 0, likely_observed: 1, uncertain: 2, not_observed: 3, out_of_scope: 4 };
+  return state.coverage.objects
+    .map(cov => {
+      const visible = (cov.visibility_frames || []).includes(frame);
+      const supported = (cov.support_frames || []).includes(frame) || (cov.evidence_thumb_ids || []).includes(frame);
+      if (!visible && !supported) return null;
+      return {
+        cov,
+        obj: objectForGuid(cov.guid),
+        visible,
+        supported,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      if (a.supported !== b.supported) return a.supported ? -1 : 1;
+      const ar = rank[a.cov.status] ?? 9;
+      const br = rank[b.cov.status] ?? 9;
+      if (ar !== br) return ar - br;
+      return Number(b.cov.coverage_ratio || 0) - Number(a.cov.coverage_ratio || 0);
+    });
+}
+
+function frameReviewHtml(frame) {
+  if (!Number.isInteger(frame) || frame < 0) return '';
+  const review = frameReview(frame);
+  return `
+    <div class="notice ${review?.accepted === false ? 'bad' : review?.accepted === true ? 'good' : 'warn'}">
+      <b>프레임 위치 검수: ${esc(reviewLabel(review))}</b>
+      <span>선택한 keyframe 위치가 모델 좌표 경로와 맞는지 기록합니다.</span>
+    </div>
+    <div class="row">
+      <button id="frameReviewAcceptBtn" class="primary">위치 확인</button>
+      <button id="frameReviewRejectBtn">위치 불일치</button>
+      <button id="frameReviewClearBtn">검수 삭제</button>
+    </div>
+  `;
+}
+
+function attachFrameReviewHandlers(root) {
+  root.querySelector('#frameReviewAcceptBtn')?.addEventListener('click', () => markSelectedFrameReview(true));
+  root.querySelector('#frameReviewRejectBtn')?.addEventListener('click', () => markSelectedFrameReview(false));
+  root.querySelector('#frameReviewClearBtn')?.addEventListener('click', () => clearSelectedFrameReview());
+}
+
+function updateFrameInfo() {
+  const el = $('frameInfo');
+  if (!el) return;
+  const frame = state.selectedFrame;
+  if (frame < 0) {
+    el.textContent = '프레임을 선택하면 해당 시점의 객체 후보가 표시됩니다.';
+    return;
+  }
+  if (!state.coverage?.objects?.length) {
+    el.textContent = `${frameLabel(frame)} · coverage 분석 결과가 없어 프레임 후보를 표시할 수 없습니다.`;
+    return;
+  }
+  const rows = frameCandidateRows(frame);
+  if (!rows.length) {
+    el.innerHTML = `${frameReviewHtml(frame)}<div class="help">${frameLabel(frame)}에서 연결된 객체 후보 없음</div>`;
+    attachFrameReviewHandlers(el);
+    return;
+  }
+  el.innerHTML = `
+    <div class="metric"><span>${frameLabel(frame)} 후보</span><b>${rows.length}</b></div>
+    ${frameReviewHtml(frame)}
+    <div class="candidate-list">
+      ${rows.slice(0, 24).map(({ cov, obj, supported }) => {
+        const color = STATUS[cov.status]?.color ?? STATUS.default.color;
+        const label = obj?.category || cov.category || 'Object';
+        const system = obj?.system || cov.system || '-';
+        const evidence = supported ? 'support' : 'visible';
+        return `<div class="candidate" data-guid="${esc(cov.guid)}">
+          <b>${esc(label)}</b>
+          <i class="status-dot" style="background:#${color.toString(16).padStart(6,'0')}"></i>
+          <span>${esc(cov.status)} · ${formatRatio(cov.coverage_ratio)} · ${esc(cov.confidence || '-')} · ${evidence}</span>
+          <span>${esc(system)}</span>
+        </div>`;
+      }).join('')}
+    </div>
+  `;
+  el.querySelectorAll('.candidate').forEach(node => {
+    node.onclick = () => {
+      const cov = coverageObject(node.dataset.guid);
+      const obj = objectForGuid(node.dataset.guid) || cov;
+      if (obj && cov) showObject(obj, cov, { selectEvidenceFrame: false });
+    };
+  });
+  attachFrameReviewHandlers(el);
+}
+
+function showObject(obj, cov, opts={}) {
+  const selectEvidenceFrame = opts.selectEvidenceFrame !== false;
+  state.selectedObject = obj;
+  drawSelectionMarker(obj);
+  const frames = cov?.evidence_thumb_ids || cov?.support_frames || [];
+  const visibilityFrames = cov?.visibility_frames || [];
+  const review = objectReview(obj.guid);
+  $('objectInfo').innerHTML = `
+    <div class="metric"><span>GUID</span><b>${esc(obj.guid)}</b></div>
+    <div class="metric"><span>category</span><b>${esc(obj.category)}</b></div>
+    <div class="metric"><span>system</span><b>${esc(obj.system || '-')}</b></div>
+    <div class="metric"><span>zone</span><b>${esc(obj.zone || '-')}</b></div>
+    <div class="metric"><span>status</span><b>${esc(cov?.status || 'base')}</b></div>
+    <div class="metric"><span>confidence</span><b>${esc(cov?.confidence || '-')}</b></div>
+    <div class="metric"><span>evidence score</span><b>${formatRatio(cov?.evidence_score)}</b></div>
+    <div class="metric"><span>coverage</span><b>${formatRatio(cov?.coverage_ratio)}</b></div>
+    <div class="metric"><span>segment</span><b>${formatRatio(cov?.segment_coverage_ratio)}</b></div>
+    <div class="metric"><span>geometry</span><b>${formatRatio(cov?.geometry_consistency)}</b></div>
+    <div class="metric"><span>hit samples</span><b>${cov?.hit_sample_count ?? '-'} / ${cov?.sample_count ?? '-'}</b></div>
+    <div class="metric"><span>segment bins</span><b>${cov?.segment_hit_bins ?? '-'} / ${cov?.segment_total_bins ?? '-'}</b></div>
+    <div class="metric"><span>linear span</span><b>${formatRatio(cov?.linear_hit_span_ratio)}</b></div>
+    <div class="metric"><span>distance median</span><b>${formatMeters(cov?.nearest_distance_median_m)}</b></div>
+    <div class="metric"><span>distance max</span><b>${formatMeters(cov?.nearest_distance_max_m)}</b></div>
+    <div class="metric"><span>support frames</span><b>${frames.length}</b></div>
+    <div class="metric"><span>support source</span><b>${esc(cov?.support_frame_source || '-')}</b></div>
+    <div class="metric"><span>visible frames</span><b>${visibilityFrames.length}</b></div>
+    <div class="notice ${review?.accepted === false ? 'bad' : review?.accepted === true ? 'good' : 'warn'}">
+      <b>객체 evidence 검수: ${esc(reviewLabel(review))}</b>
+      <span>evidence keyframe/crop에서 실제 촬영 흔적이 보이는지 기록합니다.</span>
+    </div>
+    <div class="row">
+      <button id="objectReviewAcceptBtn" class="primary">evidence 확인</button>
+      <button id="objectReviewRejectBtn">불일치</button>
+      <button id="objectReviewClearBtn">검수 삭제</button>
+    </div>
+    <div class="help">evidence thumbnails</div>
+    ${evidenceThumbsHtml(frames, cov)}
+  `;
+  ensureKeyframes(frames);
+  $('objectReviewAcceptBtn')?.addEventListener('click', () => markSelectedObjectReview(true));
+  $('objectReviewRejectBtn')?.addEventListener('click', () => markSelectedObjectReview(false));
+  $('objectReviewClearBtn')?.addEventListener('click', () => clearSelectedObjectReview());
+  $('objectInfo').querySelectorAll('.evidence-thumb').forEach(el => {
+    el.onclick = () => selectFrame(Number(el.dataset.frame));
+  });
+  if (selectEvidenceFrame && frames.length) selectFrame(Math.max(0, Math.min(frames[0], (state.scan?.thumbs?.length || 1) - 1)));
+}
+
+async function init() {
+  buildLegend();
+  syncPairsInput();
+  const [models, uploads] = await Promise.all([
+    fetch('/api/models').then(r => r.json()),
+    fetch('/api/uploads').then(r => r.json()),
+  ]);
+  state.models = models.items || [];
+  state.uploads = uploads.uploads || [];
+  for (const m of state.models) {
+    const opt = document.createElement('option');
+    opt.value = m.model_id;
+    opt.textContent = `${m.name} · ${m.object_count || 0} objs · GUID ${Math.round((m.guid_mapping_ratio || 0) * 100)}%`;
+    $('modelSelect').appendChild(opt);
+  }
+  for (const u of state.uploads) {
+    const opt = document.createElement('option');
+    opt.value = u.id;
+    const when = u.ts_ms ? new Date(u.ts_ms).toLocaleString('ko-KR', {hour12:false}) : u.id;
+    opt.textContent = `${when} · ${u.video || u.id}`;
+    $('uploadSelect').appendChild(opt);
+  }
+  $('modelSelect').value = params.get('model') || (state.models[0]?.model_id || '');
+  $('uploadSelect').value = params.get('upload') || (state.uploads[0]?.id || '');
+  $('loadBtn').onclick = async () => {
+    state.coverage = null;
+    state.alignmentCandidates = null;
+    state.qualityReport = null;
+    state.coverageReview = null;
+    renderAlignmentCandidates();
+    renderQualityReport();
+    renderCoverageReviewControls();
+    resetAlignmentPairs();
+    applyScanOverlayTransform();
+    await loadModel($('modelSelect').value);
+    await loadUpload($('uploadSelect').value);
+    await loadReadiness();
+    const hasCoverage = await loadCoverage();
+    const hasAlignment = hasCoverage || await loadAlignment();
+    await loadAlignmentCandidates();
+    await loadCoverageReview();
+    await loadQualityReport();
+    updateCoverageUi();
+    drawProxyObjects();
+    drawPath();
+    if (!focusFrame()) fitView();
+    if (!hasAlignment) setStatus('정합 필요: 대응점 4개 이상 저장 후 분석', 'warn');
+  };
+  $('analyzeBtn').onclick = analyzeCoverage;
+  $('saveAlignmentBtn').onclick = saveAlignment;
+  $('candidateBtn').onclick = computeAlignmentCandidates;
+  $('autoPlaceBtn').onclick = autoPlaceAlignment;
+  $('saveReviewNotesBtn').onclick = saveReviewNotes;
+  $('resetReviewBtn').onclick = resetCoverageReview;
+  $('reportBtn').onclick = () => {
+    const model = $('modelSelect').value || state.model?.model_id || state.models[0]?.model_id || '';
+    const upload = $('uploadSelect').value || state.upload?.id || '';
+    if (!upload) {
+      setStatus('리포트 열 업로드를 먼저 선택하세요', 'bad');
+      return;
+    }
+    open(`/coverage-report.html?model=${encodeURIComponent(model)}&upload=${encodeURIComponent(upload)}`, '_blank', 'noopener');
+  };
+  $('pickPairBtn').onclick = () => setPickMode(!state.pickMode);
+  $('undoPairBtn').onclick = () => {
+    state.pendingPair = null;
+    state.pairs.pop();
+    syncPairsInput();
+    drawPairs();
+  };
+  $('resetPairsBtn').onclick = resetAlignmentPairs;
+  $('pairsInput').addEventListener('change', () => {
+    try { readPairsInput(); }
+    catch (err) { setStatus(err.message || '대응점 JSON 오류', 'bad'); }
+  });
+  $('fitBtn').onclick = fitView;
+  $('toggleModelBtn').onclick = () => { groups.model.visible = !groups.model.visible; };
+  $('toggleProxyBtn').onclick = () => { groups.proxy.visible = !groups.proxy.visible; };
+  $('togglePathBtn').onclick = () => { groups.path.visible = !groups.path.visible; };
+  $('toggleTimelineBtn').onclick = () => setTimelineVisible(!state.timelineVisible);
+  $('toggleScanBtn').onclick = () => { groups.scan.visible = !groups.scan.visible; };
+  $('togglePointCloudBtn').onclick = async () => {
+    if (!state.pointCloudLoaded) {
+      const ok = await loadPointCloudOverlay();
+      if (!ok) return;
+    }
+    groups.pointCloud.visible = !groups.pointCloud.visible;
+  };
+  $('modelOpacity').oninput = e => applyModelOpacity(e.target.value);
+  setTimelineVisible(true);
+  if ($('modelSelect').value && $('uploadSelect').value) $('loadBtn').click();
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+// 헤드리스/개발 검증용 디버그 훅 (UI 영향 없음)
+window.__cov = { scene, groups, state, camera, controls, THREE, applyModelOpacity, fitView, loadModel };
+
+init().catch(err => {
+  console.error(err);
+  setStatus(`초기화 실패: ${err.message || err}`, 'bad');
+});
+animate();
+</script>
+</body>
+</html>

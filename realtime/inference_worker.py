@@ -50,6 +50,7 @@ def _voxel_downsample(xyz: np.ndarray, rgb: np.ndarray, voxel_size: float = 0.02
 def _voxel_fuse_weighted(
     xyz: np.ndarray, rgb: np.ndarray, conf: np.ndarray,
     voxel_size: float = 0.025, min_obs: int = 1,
+    labels: np.ndarray | None = None,
 ):
     """Confidence-weighted voxel fusion — multi-view observations of the same
     surface collapse into one point at the weighted-mean position, with color
@@ -62,8 +63,12 @@ def _voxel_fuse_weighted(
         voxel_size: cell edge in meters.
         min_obs: minimum number of observations per voxel to keep (1 = keep all).
 
+        labels: optional per-point uint label. If provided, the output label is
+            taken from the highest-confidence observation in each fused voxel.
+
     Returns:
         (M, 3) xyz, (M, 3) rgb, (M,) accumulated weight per voxel.
+        If labels is provided, also returns (M,) fused labels.
     """
     keys = np.floor(xyz / voxel_size).astype(np.int32)
     packed = (keys[:, 0].astype(np.int64) * 65536 + keys[:, 1].astype(np.int64)) * 65536 + keys[:, 2].astype(np.int64)
@@ -85,11 +90,19 @@ def _voxel_fuse_weighted(
     # For each voxel, the last appearance of inv_sorted == voxel gives the highest-w index.
     best_idx_in_order = np.full(n, -1, dtype=np.int64)
     best_idx_in_order[inv_sorted] = np.arange(len(order))  # overwrites earlier with later
-    rgb_out = rgb[order[best_idx_in_order]]
+    best_src_idx = order[best_idx_in_order]
+    rgb_out = rgb[best_src_idx]
+    label_out = None
+    if labels is not None:
+        label_out = labels[best_src_idx].astype(np.uint32)
 
     if min_obs > 1:
         keep = counts >= min_obs
         xyz_out = xyz_out[keep]; rgb_out = rgb_out[keep]; sumw = sumw[keep]
+        if label_out is not None:
+            label_out = label_out[keep]
+    if label_out is not None:
+        return xyz_out.astype(np.float32), rgb_out, sumw.astype(np.float32), label_out
     return xyz_out.astype(np.float32), rgb_out, sumw.astype(np.float32)
 
 
@@ -139,20 +152,91 @@ def _estimate_normals_pca(xyz: np.ndarray, k: int = 20,
     return normals
 
 
-def _radius_outlier_filter(xyz: np.ndarray, rgb: np.ndarray,
-                           radius: float = 0.05, min_neighbors: int = 4):
+def _radius_outlier_keep_mask(
+    xyz: np.ndarray,
+    radius: float = 0.05,
+    min_neighbors: int = 4,
+) -> np.ndarray:
     """Drop points that have fewer than `min_neighbors` other points within
     `radius`. Removes floating noise from multi-view depth disagreements.
     Uses scipy cKDTree for C-speed neighbor counting."""
     if xyz.shape[0] < min_neighbors + 1:
-        return xyz, rgb
+        return np.ones(xyz.shape[0], dtype=bool)
     from scipy.spatial import cKDTree
     tree = cKDTree(xyz)
     # count_neighbors against self → each point counts itself too, so we
     # require min_neighbors + 1 from the query.
     counts = tree.query_ball_point(xyz, r=radius, return_length=True)
-    keep = counts >= (min_neighbors + 1)
+    return counts >= (min_neighbors + 1)
+
+
+def _radius_outlier_filter(xyz: np.ndarray, rgb: np.ndarray,
+                           radius: float = 0.05, min_neighbors: int = 4):
+    keep = _radius_outlier_keep_mask(xyz, radius=radius, min_neighbors=min_neighbors)
     return xyz[keep], rgb[keep]
+
+
+def _connected_component_labels(
+    xyz: np.ndarray,
+    *,
+    voxel_size: float = 0.06,
+    min_points: int = 120,
+) -> tuple[np.ndarray, int]:
+    """Assign coarse connected-component ids to fused points.
+
+    This is not semantic segmentation. It preserves object-like connected
+    components so the viewer can distinguish scans after geometric fusion.
+    """
+    if xyz.shape[0] == 0:
+        return np.zeros(0, dtype=np.uint32), 0
+
+    keys = np.floor(xyz / voxel_size).astype(np.int32)
+    voxels, inv, counts = np.unique(
+        keys, axis=0, return_inverse=True, return_counts=True
+    )
+    if voxels.shape[0] == 0:
+        return np.zeros(xyz.shape[0], dtype=np.uint32), 0
+
+    lookup = {tuple(v.tolist()): i for i, v in enumerate(voxels)}
+    visited = np.zeros(voxels.shape[0], dtype=bool)
+    components: list[tuple[int, list[int]]] = []
+    offsets = [
+        (dx, dy, dz)
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        for dz in (-1, 0, 1)
+        if not (dx == 0 and dy == 0 and dz == 0)
+    ]
+
+    for start in range(voxels.shape[0]):
+        if visited[start]:
+            continue
+        visited[start] = True
+        stack = [start]
+        cells: list[int] = []
+        point_count = 0
+        while stack:
+            cur = stack.pop()
+            cells.append(cur)
+            point_count += int(counts[cur])
+            vx, vy, vz = voxels[cur]
+            for dx, dy, dz in offsets:
+                nb = lookup.get((int(vx + dx), int(vy + dy), int(vz + dz)))
+                if nb is not None and not visited[nb]:
+                    visited[nb] = True
+                    stack.append(nb)
+        components.append((point_count, cells))
+
+    components.sort(key=lambda item: item[0], reverse=True)
+    voxel_labels = np.zeros(voxels.shape[0], dtype=np.uint32)
+    label = 1
+    for point_count, cells in components:
+        if point_count < min_points:
+            continue
+        voxel_labels[np.array(cells, dtype=np.int64)] = label
+        label += 1
+
+    return voxel_labels[inv].astype(np.uint32), label - 1
 
 
 def _preprocess_bgr(bgr: np.ndarray, target_w: int = 518, patch: int = 14) -> torch.Tensor:
@@ -206,9 +290,12 @@ class InferenceWorker:
         max_points_per_frame: int = 270000,  # ≈ 518² (full per-frame point map)
         conf_threshold: float = 1.5,     # demo's absolute conf cutoff (vis_threshold)
         num_scale_frames: int = 16,      # more anchor frames → better global consistency
-        output_mode: str = "points",     # "points" (LBP2) or "mesh" (LBM1, Tier 2 TSDF)
+        output_mode: str = "points",     # "points" (LBP4) or "mesh" (LBM1, Tier 2 TSDF)
         tsdf_voxel: float = 0.012,       # TSDF voxel size (m): 1.2 cm for sharper surfaces
         tsdf_trunc: float = 0.04,        # truncation band (m): ≈ 3×voxel; thin shells, not slabs
+        tsdf_min_weight: float = 2.0,    # require ≥2 depth observations per TSDF surface voxel
+        component_voxel_size: float = 0.06,
+        component_min_points: int = 120,
     ) -> None:
         self.broadcast_fn = broadcast_fn
         self.device = device
@@ -222,6 +309,9 @@ class InferenceWorker:
         self.output_mode = output_mode
         self.tsdf_voxel = tsdf_voxel
         self.tsdf_trunc = tsdf_trunc
+        self.tsdf_min_weight = tsdf_min_weight
+        self.component_voxel_size = component_voxel_size
+        self.component_min_points = component_min_points
 
         # Anchor frames pin the world origin + depth scale across ticks: the first
         # `num_scale_frames` frames are kept forever and re-fed as scale frames on
@@ -429,7 +519,6 @@ class InferenceWorker:
         rot_map = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
         rot_code = rot_map.get(rotation)
         snap = []
-        seq = 0
         for idx in indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ok, bgr = cap.read()
@@ -441,8 +530,7 @@ class InferenceWorker:
                 bgr = cv2.rotate(bgr, rot_code)
             tensor = _preprocess_bgr(bgr, target_w=self.image_size, patch=self.patch_size)
             thumb = (tensor.permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
-            seq += 1
-            snap.append((tensor, thumb, seq))
+            snap.append((tensor, thumb, int(idx) + 1))
         cap.release()
         return snap
 
@@ -485,7 +573,7 @@ class InferenceWorker:
         dc = preds.get("depth_conf")
         wpc = dc.detach().cpu().numpy() if dc is not None else None
 
-        all_xyz, all_rgb, all_conf = [], [], []
+        all_xyz, all_rgb, all_conf, all_source = [], [], [], []
         for i in range(N):
             pts = wp[i].reshape(-1, 3)
             cols = thumbs[i].reshape(-1, 3).astype(np.uint8)
@@ -498,6 +586,7 @@ class InferenceWorker:
                 idx = np.random.default_rng(int(seqs[i])).choice(idx, self.max_points_per_frame, replace=False)
             all_xyz.append(pts[idx]); all_rgb.append(cols[idx])
             all_conf.append(conf[idx] if conf is not None else np.ones(idx.size, dtype=np.float32))
+            all_source.append(np.full(idx.size, int(seqs[i]), dtype=np.uint32))
         if not all_xyz:
             return None
         log.info("window: N_input=%d c2w.shape=%s xyz=%d",
@@ -506,6 +595,8 @@ class InferenceWorker:
             "xyz":  np.concatenate(all_xyz,  axis=0).astype(np.float32),
             "rgb":  np.concatenate(all_rgb,  axis=0).astype(np.uint8),
             "conf": np.concatenate(all_conf, axis=0).astype(np.float32),
+            "source": np.concatenate(all_source, axis=0).astype(np.uint32),
+            "frame_ids": np.asarray(seqs, dtype=np.uint32),
             "c2w":  c2w_np,
             "w2c":  w2c_np,
             "K":    K_np,
@@ -516,14 +607,22 @@ class InferenceWorker:
     def _fuse_merged(self, merged: dict) -> bytes | None:
         """Run Tier 1 + Tier 2 fusion on a merged multi-window result."""
         xyz, rgb, conf = merged["xyz"], merged["rgb"], merged["conf"]
+        source = merged.get("source")
+        if source is None:
+            source = np.zeros(xyz.shape[0], dtype=np.uint32)
+        else:
+            source = source.astype(np.uint32, copy=False)
         c2w_np, w2c_np, K_np = merged["c2w"], merged["w2c"], merged["K"]
         depth_hw = merged["depth"]
         thumbs = merged["thumbs"]
 
         # Tier 1 — voxel fusion
         n_before = xyz.shape[0]
-        xyz, rgb, _ = _voxel_fuse_weighted(xyz, rgb, conf, voxel_size=0.015, min_obs=1)
-        xyz, rgb = _radius_outlier_filter(xyz, rgb, radius=0.04, min_neighbors=3)
+        xyz, rgb, _, source = _voxel_fuse_weighted(
+            xyz, rgb, conf, voxel_size=0.015, min_obs=1, labels=source
+        )
+        keep = _radius_outlier_keep_mask(xyz, radius=0.04, min_neighbors=3)
+        xyz, rgb, source = xyz[keep], rgb[keep], source[keep]
         log.info("Tier1+3 fusion: merged %d → voxel+outlier %d points (windows=%d)",
                  n_before, xyz.shape[0], merged.get("n_windows", 1))
 
@@ -537,8 +636,10 @@ class InferenceWorker:
                     depth_hw, w2c_np, K_np, None,  # no per-pixel conf in merged path; use 1
                     voxel_size=self.tsdf_voxel, trunc=self.tsdf_trunc,
                     conf_floor=0.0,
+                    pad=max(0.2, self.tsdf_trunc * 3.0),
+                    bounds=(xyz.min(axis=0), xyz.max(axis=0)),
                 )
-                verts, faces, normals = extract_mesh(vol, min_weight=1.0)
+                verts, faces, normals = extract_mesh(vol, min_weight=self.tsdf_min_weight)
                 imgs = np.stack(thumbs, axis=0)
                 v_rgb = color_vertices(verts, imgs, w2c_np, K_np)
                 log.info("Tier2+3 TSDF: verts=%d faces=%d in %.2fs",
@@ -553,7 +654,7 @@ class InferenceWorker:
                             + c2w_np.astype(np.float32).tobytes()
                             + K_np[0].astype(np.float32).tobytes())
                     return header + body
-                log.warning("TSDF empty mesh → fall back to LBP2")
+                log.warning("TSDF empty mesh → fall back to LBP4 points")
             except Exception:
                 log.exception("TSDF failed in merged path; falling back to points")
 
@@ -563,10 +664,19 @@ class InferenceWorker:
         normals = _estimate_normals_pca(xyz, k=20, orient_toward=cam_centroid)
         log.info("Phase A(merged): normals %d in %.2fs", normals.shape[0], time.time() - t_n)
 
-        # LBP3 with normals
-        header = struct.pack("<4sIIII", b"LBP3", 1, xyz.shape[0], c2w_np.shape[0], seq)
+        component_ids, component_count = _connected_component_labels(
+            xyz,
+            voxel_size=self.component_voxel_size,
+            min_points=self.component_min_points,
+        )
+        log.info("components(merged): %d", component_count)
+
+        # LBP4: LBP3 plus per-point source-frame id and connected-component id.
+        header = struct.pack("<4sIIII", b"LBP4", 3, xyz.shape[0], c2w_np.shape[0], seq)
         body = (xyz.tobytes() + rgb.tobytes()
                 + normals.astype(np.float32).tobytes()
+                + source.astype(np.uint32).tobytes()
+                + component_ids.astype(np.uint32).tobytes()
                 + c2w_np.astype(np.float32).tobytes()
                 + K_np[0].astype(np.float32).tobytes())
         return header + body
@@ -655,7 +765,7 @@ class InferenceWorker:
     async def _loop(self) -> None:
         """Periodic inference. Skips ticks while one inference is still running
         to prevent GPU pile-up that previously caused the 100% GPU lockup.
-        Streaming path always emits LBP2 points (TSDF mesh is too slow for live)."""
+        Streaming path always emits LBP4 points (TSDF mesh is too slow for live)."""
         log.info("inference loop running (every %.1fs)", self.interval_s)
         loop = asyncio.get_running_loop()
         busy = False
@@ -743,7 +853,7 @@ class InferenceWorker:
 
         # Demo-style filtering: keep points with depth_conf > conf_threshold (1.5).
         # Carry confidence through to fusion as observation weight.
-        all_xyz, all_rgb, all_conf = [], [], []
+        all_xyz, all_rgb, all_conf, all_source = [], [], [], []
         for i in range(N):
             pts = wp[i].reshape(-1, 3)
             cols = thumbs[i].reshape(-1, 3).astype(np.uint8)
@@ -764,24 +874,28 @@ class InferenceWorker:
                 all_conf.append(conf[idx])
             else:
                 all_conf.append(np.ones(idx.size, dtype=np.float32))
+            all_source.append(np.full(idx.size, int(seqs[i]), dtype=np.uint32))
 
         if not all_xyz:
             return None
         xyz  = np.concatenate(all_xyz,  axis=0).astype(np.float32)
         rgb  = np.concatenate(all_rgb,  axis=0).astype(np.uint8)
         conf = np.concatenate(all_conf, axis=0).astype(np.float32)
+        source = np.concatenate(all_source, axis=0).astype(np.uint32)
 
         # Tier 1 — confidence-weighted voxel fusion at 0.8 cm.
         # Multi-view observations of the same surface collapse to one point.
         # Keep all voxels (min_obs=1) so unique observations survive; the
         # radius filter below handles isolated noise instead.
         n_before = xyz.shape[0]
-        xyz, rgb, weights = _voxel_fuse_weighted(xyz, rgb, conf,
-                                                  voxel_size=0.008, min_obs=1)
+        xyz, rgb, weights, source = _voxel_fuse_weighted(
+            xyz, rgb, conf, voxel_size=0.008, min_obs=1, labels=source
+        )
         n_voxel = xyz.shape[0]
         # Radius outlier filter: drop floaters with <5 neighbors in 3 cm.
         # Higher density → stricter neighborhood requirement.
-        xyz, rgb = _radius_outlier_filter(xyz, rgb, radius=0.03, min_neighbors=5)
+        keep = _radius_outlier_keep_mask(xyz, radius=0.03, min_neighbors=5)
+        xyz, rgb, source = xyz[keep], rgb[keep], source[keep]
         log.info("Tier1 fusion: %d → voxel %d → outlier %d points",
                  n_before, n_voxel, xyz.shape[0])
 
@@ -814,8 +928,10 @@ class InferenceWorker:
                     depth_hw, w2c_np, K_np, wpc,
                     voxel_size=self.tsdf_voxel, trunc=self.tsdf_trunc,
                     conf_floor=self.conf_threshold,
+                    pad=max(0.2, self.tsdf_trunc * 3.0),
+                    bounds=(xyz.min(axis=0), xyz.max(axis=0)),
                 )
-                verts, faces, normals = extract_mesh(vol, min_weight=1.0)
+                verts, faces, normals = extract_mesh(vol, min_weight=self.tsdf_min_weight)
                 # Color vertices from images: thumbs is (N, H, W, 3) uint8
                 imgs = np.stack(thumbs, axis=0)
                 v_rgb = color_vertices(verts, imgs, w2c_np, K_np)
@@ -837,9 +953,9 @@ class InferenceWorker:
                         + K_np[0].astype(np.float32).tobytes()
                     )
                     return header + body
-                log.warning("TSDF produced empty mesh — falling back to LBP2 points")
+                log.warning("TSDF produced empty mesh — falling back to LBP4 points")
             except Exception as e:
-                log.exception("TSDF mesh extraction failed, falling back to LBP2: %s", e)
+                log.exception("TSDF mesh extraction failed, falling back to LBP4: %s", e)
 
         # Phase A — compute per-point normals via PCA on k-NN for surfel/splat rendering.
         # Orient normals toward camera centroid (inside-out scan convention).
@@ -848,16 +964,26 @@ class InferenceWorker:
         normals = _estimate_normals_pca(xyz, k=20, orient_toward=cam_centroid)
         log.info("Phase A: normals %d in %.2fs", normals.shape[0], time.time() - t_n)
 
-        # Binary v3 (LBP3) — points + colors + normals for oriented disk splat rendering.
-        #   magic 'LBP3'(4) | flags u32 | num_pts u32 | num_poses u32 | seq u32
+        component_ids, component_count = _connected_component_labels(
+            xyz,
+            voxel_size=self.component_voxel_size,
+            min_points=self.component_min_points,
+        )
+        log.info("components: %d", component_count)
+
+        # Binary v4 (LBP4) — LBP3 plus source-frame and connected-component ids.
+        #   magic 'LBP4'(4) | flags u32 | num_pts u32 | num_poses u32 | seq u32
         #   xyz f32(N*3) | rgb u8(N*3) | normal f32(N*3)
+        #   source_id u32(N) | component_id u32(N)
         #   poses f32(M*12) | K f32(9)
-        flags = 1
-        header = struct.pack("<4sIIII", b"LBP3", flags, xyz.shape[0], c2w_np.shape[0], self._frame_seq)
+        flags = 3
+        header = struct.pack("<4sIIII", b"LBP4", flags, xyz.shape[0], c2w_np.shape[0], self._frame_seq)
         body = (
             xyz.tobytes()
             + rgb.tobytes()
             + normals.astype(np.float32).tobytes()
+            + source.astype(np.uint32).tobytes()
+            + component_ids.astype(np.uint32).tobytes()
             + c2w_np.astype(np.float32).tobytes()
             + K_np[0].astype(np.float32).tobytes()
         )

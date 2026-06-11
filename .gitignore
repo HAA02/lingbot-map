@@ -11,3 +11,12 @@ CLAUDE.md
 .claude/
 .agents/
 skyseg.onnx
+# runtime artifacts (coverage 작업 중 추가)
+realtime/_uploads/
+realtime/_server.log
+realtime/_received_frames/
+realtime/_bim/
+ckpts/
+out/
+video/
+models/old/

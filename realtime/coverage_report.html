@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lingbot-map · coverage report</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; background:#f5f7fa; color:#17202a; font:13px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+  header { position:sticky; top:0; z-index:3; display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:12px 16px; background:#111923; color:#eef4fa; border-bottom:1px solid #26313d; }
+  h1 { margin:0 12px 0 0; font-size:16px; }
+  main { max-width:1180px; margin:0 auto; padding:18px; }
+  select, button { background:#18212b; color:#e7edf4; border:1px solid #3a4a5c; border-radius:5px; padding:6px 9px; font:12px system-ui, sans-serif; }
+  button { cursor:pointer; }
+  button.primary { background:#1f6f45; border-color:#2b8a58; }
+  a { color:#125bb5; }
+  .toolbar-link { color:#e7edf4; text-decoration:none; border:1px solid #3a4a5c; border-radius:5px; padding:6px 9px; font-size:12px; }
+  .grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; }
+  .card { background:white; border:1px solid #d8e0e8; border-radius:8px; padding:14px; margin-bottom:14px; box-shadow:0 1px 2px rgba(15,23,42,.04); }
+  .card h2 { margin:0 0 10px; font-size:15px; }
+  .metric { display:flex; justify-content:space-between; gap:12px; padding:4px 0; border-bottom:1px solid #edf1f5; }
+  .metric:last-child { border-bottom:0; }
+  .metric span:first-child { color:#607080; }
+  .metric b { text-align:right; }
+  .badge { display:inline-block; border-radius:999px; padding:3px 8px; font-size:12px; font-weight:700; background:#e2e8f0; color:#334155; }
+  .pass { background:#d9fbe7; color:#166534; }
+  .warn { background:#fff3c4; color:#854d0e; }
+  .bad { background:#ffe1e1; color:#991b1b; }
+  .pending { background:#e2e8f0; color:#475569; }
+  .checks { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
+  .check { display:grid; grid-template-columns:10px 1fr auto; gap:8px; align-items:center; border:1px solid #d8e0e8; border-radius:6px; padding:8px; background:#fbfdff; }
+  .check i { width:9px; height:9px; border-radius:50%; background:#94a3b8; }
+  .check.pass i { background:#22c55e; }
+  .check.warn i { background:#eab308; }
+  .check.block i, .check.bad i { background:#ef4444; }
+  .check.pending i { background:#94a3b8; }
+  .check span { color:#607080; font-size:12px; text-align:right; }
+  table { width:100%; border-collapse:collapse; background:white; }
+  th, td { border-bottom:1px solid #e6edf3; padding:8px; text-align:left; vertical-align:top; font-size:12px; }
+  th { color:#475569; background:#f8fafc; position:sticky; top:49px; z-index:2; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .thumbs { display:flex; gap:4px; flex-wrap:wrap; }
+  .thumbs a { display:inline-block; padding:2px 5px; border:1px solid #cbd5e1; border-radius:4px; text-decoration:none; font-size:11px; }
+  .note { color:#64748b; margin:6px 0; }
+  .error { color:#991b1b; background:#ffe1e1; border:1px solid #fecaca; border-radius:6px; padding:10px; }
+  @media (max-width: 900px) {
+    .grid, .checks { grid-template-columns:1fr; }
+    th { position:static; }
+  }
+  @media print {
+    header { position:static; background:white; color:#111923; }
+    button, select, .toolbar-link { display:none; }
+    main { max-width:none; padding:0; }
+    .card { box-shadow:none; break-inside:avoid; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Coverage Report</h1>
+  <select id="modelSelect"></select>
+  <select id="uploadSelect"></select>
+  <button id="reloadBtn" class="primary">불러오기</button>
+  <button id="printBtn">인쇄/PDF</button>
+  <a id="viewerLink" class="toolbar-link" target="_blank" rel="noopener">웹뷰 열기</a>
+</header>
+<main>
+  <section class="card">
+    <h2>요약</h2>
+    <div id="summary" class="grid"></div>
+  </section>
+  <section class="card">
+    <h2>준비 상태</h2>
+    <div id="checks" class="checks"></div>
+  </section>
+  <section class="card">
+    <h2>90% 품질 기준</h2>
+    <div id="criteria" class="checks"></div>
+    <div id="blockers" class="note"></div>
+  </section>
+  <section class="card">
+    <h2>수동 검수 기록</h2>
+    <div id="review" class="grid"></div>
+  </section>
+  <section class="card">
+    <h2>객체 Evidence</h2>
+    <div id="objectsNote" class="note"></div>
+    <div style="overflow:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>status</th>
+            <th>category/system</th>
+            <th>GUID</th>
+            <th>coverage</th>
+            <th>support</th>
+            <th>review</th>
+            <th>evidence</th>
+          </tr>
+        </thead>
+        <tbody id="objectsBody"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
+  '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;',
+})[ch]);
+const pct = value => Number.isFinite(Number(value)) ? `${Math.round(Number(value) * 100)}%` : '-';
+const num = value => Number.isFinite(Number(value)) ? Number(value).toLocaleString('ko-KR') : '-';
+
+let state = {
+  models: [],
+  uploads: [],
+  model: null,
+  upload: null,
+  status: null,
+  report: null,
+  review: null,
+  coverage: null,
+};
+
+function badgeClass(status) {
+  if (['pass','ready','ready_for_manual_review'].includes(status)) return 'pass';
+  if (['warn','needs_analysis','needs_evidence_review'].includes(status)) return 'warn';
+  if (['block','blocked','needs_alignment','model_manifest_invalid','needs_scan'].includes(status)) return 'bad';
+  return 'pending';
+}
+
+function metric(label, value) {
+  return `<div class="card" style="margin:0"><div class="metric"><span>${esc(label)}</span><b>${esc(value)}</b></div></div>`;
+}
+
+function metricHtml(label, value) {
+  return `<div class="card" style="margin:0"><div class="metric"><span>${esc(label)}</span><b>${value}</b></div></div>`;
+}
+
+function renderCheckList(el, items) {
+  el.innerHTML = (items || []).map(item => `
+    <div class="check ${badgeClass(item.state)}">
+      <i></i>
+      <b>${esc(item.label || item.id || '-')}</b>
+      <span>${esc(item.detail || item.state || '-')}</span>
+    </div>
+  `).join('') || '<div class="note">항목 없음</div>';
+}
+
+function reviewLabel(review) {
+  if (!review || review.accepted === undefined || review.accepted === null) return '미검수';
+  return review.accepted ? '확인됨' : '불일치';
+}
+
+function keyframeUrl(frame) {
+  return state.upload ? `/api/uploads/${state.upload.id}/keyframes/${frame}.jpg` : '#';
+}
+
+function renderSummary() {
+  const s = state.report?.summary || {};
+  const status = state.report?.status || state.status?.status || '-';
+  $('summary').innerHTML = [
+    metric('업로드', state.upload?.id || '-'),
+    metric('모델', state.model?.name || state.model?.model_id || '-'),
+    metricHtml('리포트 상태', `<span class="badge ${badgeClass(status)}">${esc(status)}</span>`),
+    metric('최종 90%', state.report?.passed_90 ? '통과' : '미통과/검수 필요'),
+    metric('alignment', s.alignment_quality || state.status?.alignment?.quality || state.status?.alignment?.state || '-'),
+    metric('objects', num(s.objects)),
+    metric('observed', `${num(s.observed_count)} · evidence ${pct(s.observed_evidence_ratio)}`),
+    metric('manual review', `object ${pct(s.observed_review_acceptance_ratio)} · frame ${pct(s.frame_review_acceptance_ratio)}`),
+  ].join('');
+}
+
+function renderReview() {
+  const objectReviews = state.review?.object_reviews || {};
+  const frameReviews = state.review?.frame_reviews || {};
+  const objectAccepted = Object.values(objectReviews).filter(x => x && x.accepted === true).length;
+  const objectRejected = Object.values(objectReviews).filter(x => x && x.accepted === false).length;
+  const frameAccepted = Object.values(frameReviews).filter(x => x && x.accepted === true).length;
+  const frameRejected = Object.values(frameReviews).filter(x => x && x.accepted === false).length;
+  $('review').innerHTML = [
+    metric('object 확인', objectAccepted),
+    metric('object 불일치', objectRejected),
+    metric('frame 확인', frameAccepted),
+    metric('frame 불일치', frameRejected),
+    metric('updated', state.review?.updated_at || '-'),
+    metric('notes', state.review?.notes || '-'),
+  ].join('');
+}
+
+function renderObjects() {
+  const body = $('objectsBody');
+  const objects = state.coverage?.objects || [];
+  const objectReviews = state.review?.object_reviews || {};
+  if (!objects.length) {
+    $('objectsNote').innerHTML = state.coverage?.error
+      ? `<div class="error">${esc(state.coverage.error)}</div>`
+      : 'coverage 객체 결과 없음';
+    body.innerHTML = '';
+    return;
+  }
+  const rank = { observed:0, likely_observed:1, uncertain:2, not_observed:3, out_of_scope:4 };
+  const rows = objects.slice().sort((a, b) => {
+    const ar = rank[a.status] ?? 9;
+    const br = rank[b.status] ?? 9;
+    if (ar !== br) return ar - br;
+    return Number(b.coverage_ratio || 0) - Number(a.coverage_ratio || 0);
+  }).slice(0, 200);
+  $('objectsNote').textContent = `${objects.length.toLocaleString('ko-KR')} objects · 상위 200개 표시`;
+  body.innerHTML = rows.map(obj => {
+    const review = objectReviews[obj.guid];
+    const frames = obj.evidence_thumb_ids || obj.support_frames || [];
+    const evidence = frames.slice(0, 8).map(frame => `<a href="${keyframeUrl(frame)}" target="_blank" rel="noopener">#${frame}</a>`).join('');
+    return `<tr>
+      <td><span class="badge ${badgeClass(obj.status)}">${esc(obj.status)}</span></td>
+      <td>${esc(obj.category || '-')}<br><span class="note">${esc(obj.system || '-')}</span></td>
+      <td style="max-width:260px; word-break:break-all">${esc(obj.guid)}</td>
+      <td class="num">${pct(obj.coverage_ratio)}<br><span class="note">seg ${pct(obj.segment_coverage_ratio)}</span></td>
+      <td class="num">${num(obj.support_frame_count ?? frames.length)}<br><span class="note">visible ${num(obj.visibility_frame_count)}</span></td>
+      <td><span class="badge ${review?.accepted === true ? 'pass' : review?.accepted === false ? 'bad' : 'pending'}">${esc(reviewLabel(review))}</span></td>
+      <td><div class="thumbs">${evidence || '-'}</div></td>
+    </tr>`;
+  }).join('');
+}
+
+function renderAll() {
+  $('viewerLink').href = `/coverage.html?model=${encodeURIComponent(state.model?.model_id || state.models?.[0]?.model_id || '')}&upload=${encodeURIComponent(state.upload?.id || '')}`;
+  renderSummary();
+  renderCheckList($('checks'), state.status?.checks || []);
+  renderCheckList($('criteria'), state.report?.criteria || []);
+  const blockers = [...(state.report?.blockers || []), ...(state.report?.warnings || [])];
+  $('blockers').innerHTML = blockers.map(x => `<div>${esc(x.id || 'note')}: ${esc(x.message || '')}</div>`).join('') || 'blocker/warning 없음';
+  renderReview();
+  renderObjects();
+}
+
+async function fetchJson(url, fallback=null) {
+  const r = await fetch(url);
+  const j = await r.json();
+  if (!r.ok) return { ok:false, status:j.status || r.status, error:j.error || String(r.status) };
+  return j;
+}
+
+async function loadReport() {
+  const model = $('modelSelect').value || state.models?.[0]?.model_id || '';
+  const upload = $('uploadSelect').value;
+  if (!upload) return;
+  history.replaceState(null, '', `/coverage-report.html?model=${encodeURIComponent(model)}&upload=${encodeURIComponent(upload)}`);
+  state.model = state.models.find(x => x.model_id === model) || { model_id:model, name:model };
+  state.upload = state.uploads.find(x => x.id === upload) || { id:upload };
+  const q = `model_id=${encodeURIComponent(model)}`;
+  const [status, report, review, coverage] = await Promise.all([
+    fetchJson(`/api/uploads/${upload}/coverage/status?${q}`),
+    fetchJson(`/api/uploads/${upload}/coverage/report?${q}`),
+    fetchJson(`/api/uploads/${upload}/coverage/review?${q}`),
+    fetchJson(`/api/uploads/${upload}/coverage?${q}`),
+  ]);
+  state.status = status;
+  state.report = report;
+  state.review = review?.ok ? review : null;
+  state.coverage = coverage?.ok ? coverage : coverage;
+  renderAll();
+}
+
+async function init() {
+  const [models, uploads] = await Promise.all([
+    fetch('/api/models').then(r => r.json()),
+    fetch('/api/uploads').then(r => r.json()),
+  ]);
+  state.models = models.items || [];
+  state.uploads = uploads.uploads || [];
+  $('modelSelect').innerHTML = state.models.map(m => `<option value="${esc(m.model_id)}">${esc(m.name)} · GUID ${Math.round(Number(m.guid_mapping_ratio || 0) * 100)}%</option>`).join('');
+  $('uploadSelect').innerHTML = state.uploads.map(u => `<option value="${esc(u.id)}">${esc(u.video || u.id)}</option>`).join('');
+  $('modelSelect').value = params.get('model') || (state.models?.[0]?.model_id || '');
+  $('uploadSelect').value = params.get('upload') || state.uploads[0]?.id || '';
+  $('reloadBtn').onclick = loadReport;
+  $('printBtn').onclick = () => print();
+  if ($('uploadSelect').value) await loadReport();
+}
+
+init().catch(err => {
+  document.querySelector('main').innerHTML = `<div class="error">${esc(err.message || err)}</div>`;
+});
+</script>
+</body>
+</html>

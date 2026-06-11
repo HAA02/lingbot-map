@@ -1,0 +1,57 @@
+{
+  "id": "pipe_duct",
+  "model_id": "pipe_duct",
+  "name": "pipe_duct",
+  "glb": "pipe_duct.glb",
+  "metadata": null,
+  "manifest": "pipe_duct.model_manifest.json",
+  "units": "m",
+  "unit_scale_to_m": 1.0,
+  "up_axis": "Z_UP",
+  "metadata_kind": "glb_native",
+  "glb_axis_transform": "gltf_yup_to_zup",
+  "object_count": 372,
+  "counts_by_category": {
+    "Pipe": 85,
+    "PipeFitting": 133,
+    "Duct": 78,
+    "DuctFitting": 76
+  },
+  "glb_url": "/models/pipe_duct.glb",
+  "metadata_url": null,
+  "manifest_url": "/models/pipe_duct.model_manifest.json",
+  "manifest_valid": true,
+  "guid_mapping_ratio": 1.0,
+  "guid_mapping_status": "direct",
+  "guid_mapped_count": 372,
+  "guid_total": 372,
+  "fallback_geometry": "pag_proxy",
+  "fallback_geometry_count": 0,
+  "coverage_geometry_source": "glb_guid_mesh",
+  "glb_role": "coverage_geometry",
+  "proxy_geometry_bounds": {
+    "min": [
+      -12.737853050231934,
+      -19.14891242980957,
+      0.0
+    ],
+    "max": [
+      6.864314079284668,
+      25.706661224365234,
+      27.465002059936523
+    ],
+    "span": [
+      19.6021671295166,
+      44.855573654174805,
+      27.465002059936523
+    ],
+    "center": [
+      -2.936769485473633,
+      3.278874397277832,
+      13.732501029968262
+    ],
+    "diagonal_m": 56.13015038436045
+  },
+  "glb_bytes": 3698816,
+  "metadata_bytes": 0
+}

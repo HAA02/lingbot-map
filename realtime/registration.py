@@ -118,6 +118,8 @@ def chain_windows(windows: list[dict], overlap: int, *, use_icp: bool = True) ->
         xyz:    (M_k, 3)    world-frame points
         rgb:    (M_k, 3)    uint8 colors
         conf:   (M_k,)      per-point confidence
+        source: (M_k,)      per-point source frame id
+        frame_ids: (N_k,)   source frame ids for each pose/depth frame
         depth:  (N_k, H, W) per-frame depth in camera Z (not transformed by alignment)
         thumbs: list of (H, W, 3) RGB images (not transformed)
         K:      (N_k, 3, 3) intrinsics (not transformed)
@@ -150,6 +152,12 @@ def chain_windows(windows: list[dict], overlap: int, *, use_icp: bool = True) ->
         xyz_new = apply_similarity_to_points(new["xyz"], s_k, R_k, t_k)
         c2w_new = apply_similarity_to_c2w(new["c2w"], s_k, R_k, t_k)
         w2c_new = apply_similarity_to_w2c(new["w2c"], s_k, R_k, t_k)
+        # Depth is a metric distance in the same local world scale as the
+        # window poses.  If a Sim(3) scale aligns the window into the reference
+        # frame, TSDF integration must see depth in that reference scale too;
+        # otherwise camera poses and observed surfaces disagree and duplicate
+        # shells survive in the reconstructed mesh.
+        depth_new = new["depth"] * s_k
 
         # 2) ICP refinement on overlap-region surface points (rigid).
         # Take points belonging to overlap frames of each window for surface-level
@@ -159,10 +167,20 @@ def chain_windows(windows: list[dict], overlap: int, *, use_icp: bool = True) ->
             # Subsample to keep ICP fast: up to 8000 points from each overlap region.
             # Heuristic: points from a window with conf in top-50%.
             try:
-                # ref overlap points (last `overlap` cam frames worth)
-                # We use ALL points of the ref window as the target — surface coverage.
-                ref_pts = ref["xyz"]
-                new_pts = xyz_new
+                ref_frame_ids = ref.get("frame_ids")
+                new_frame_ids = new.get("frame_ids")
+                if ref_frame_ids is not None and new_frame_ids is not None:
+                    ref_ids = np.asarray(ref_frame_ids[-overlap:], dtype=np.uint32)
+                    new_ids = np.asarray(new_frame_ids[:overlap], dtype=np.uint32)
+                    ref_mask = np.isin(ref.get("source"), ref_ids)
+                    new_mask = np.isin(new.get("source"), new_ids)
+                    ref_pts = ref["xyz"][ref_mask]
+                    new_pts = xyz_new[new_mask]
+                else:
+                    ref_pts = ref["xyz"]
+                    new_pts = xyz_new
+                if ref_pts.shape[0] < 3 or new_pts.shape[0] < 3:
+                    raise ValueError("not enough overlap points for ICP")
                 if ref_pts.shape[0] > 8000:
                     idx = np.random.default_rng(k * 13).choice(ref_pts.shape[0], 8000, replace=False)
                     ref_pts = ref_pts[idx]
@@ -193,7 +211,9 @@ def chain_windows(windows: list[dict], overlap: int, *, use_icp: bool = True) ->
             "xyz":  xyz_new,
             "rgb":  new["rgb"],
             "conf": new["conf"],
-            "depth":  new["depth"],
+            "source": new.get("source", np.zeros(new["xyz"].shape[0], dtype=np.uint32)),
+            "frame_ids": new.get("frame_ids"),
+            "depth":  depth_new.astype(np.float32, copy=False),
             "thumbs": new["thumbs"],
             "K":      new["K"],
             "scale_to_ref": s_k,
@@ -218,11 +238,16 @@ def chain_windows(windows: list[dict], overlap: int, *, use_icp: bool = True) ->
         "w2c":   cat_drop_overlap("w2c"),
         "depth": cat_drop_overlap("depth"),
         "K":     cat_drop_overlap("K"),
+        "frame_ids": cat_drop_overlap("frame_ids") if "frame_ids" in aligned[0] else None,
         # Per-point fields (xyz, rgb, conf) → keep all (overlap regions produce
         # extra observations of the same surface, which TSDF / Tier1 fusion will average).
         "xyz":  np.concatenate([a["xyz"]  for a in aligned], axis=0),
         "rgb":  np.concatenate([a["rgb"]  for a in aligned], axis=0),
         "conf": np.concatenate([a["conf"] for a in aligned], axis=0),
+        "source": np.concatenate([
+            a.get("source", np.zeros(a["xyz"].shape[0], dtype=np.uint32))
+            for a in aligned
+        ], axis=0).astype(np.uint32),
     }
     # thumbs is a list — same drop-overlap logic
     thumbs = list(aligned[0]["thumbs"])

@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>lingbot-map · LBP4 병합 검증</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #101214; color: #e9eef2; font: 14px/1.5 system-ui, sans-serif; }
+  header { padding: 14px 18px; border-bottom: 1px solid #2a3036; background: #15191d; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  h1 { font-size: 16px; margin: 0; }
+  .badge { padding: 3px 8px; border-radius: 4px; font-size: 12px; font-weight: 650; }
+  .pass { background: #1f6f43; color: white; }
+  .warn { background: #7a5b1e; color: white; }
+  main { display: grid; grid-template-columns: minmax(340px, 460px) 1fr; min-height: calc(100vh - 55px); }
+  aside { border-right: 1px solid #2a3036; padding: 14px; overflow: auto; }
+  .viewer { width: 100%; height: calc(100vh - 55px); border: 0; background: #000; }
+  .card { border: 1px solid #2b333b; border-radius: 6px; padding: 12px; margin-bottom: 12px; background: #161b20; }
+  .card h2 { margin: 0 0 8px; font-size: 14px; display: flex; justify-content: space-between; gap: 10px; }
+  .grid { display: grid; grid-template-columns: 1fr auto; gap: 5px 12px; color: #c8d0d8; font-size: 12px; }
+  .grid b { color: #fff; font-weight: 650; }
+  button, a.button { display: inline-block; margin-top: 10px; padding: 7px 10px; border-radius: 4px; border: 1px solid #496175; background: #263849; color: #fff; cursor: pointer; text-decoration: none; font: inherit; font-size: 12px; }
+  button:hover, a.button:hover { background: #31475c; }
+  .note { color: #aeb8c2; font-size: 12px; margin: 8px 0 14px; }
+  .metric { height: 6px; background: #242b32; border-radius: 999px; overflow: hidden; margin-top: 3px; }
+  .metric > span { display: block; height: 100%; background: #42b883; }
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; }
+    aside { border-right: 0; border-bottom: 1px solid #2a3036; }
+    .viewer { height: 70vh; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>LBP4 병합 검증</h1>
+  <span id="summaryBadge" class="badge warn">loading</span>
+  <a class="button" href="/viewer?audit=1" target="_blank">뷰어 별창</a>
+</header>
+<main>
+  <aside>
+    <div id="summary" class="note"></div>
+    <div id="items"></div>
+  </aside>
+  <iframe id="viewer" class="viewer" src="/viewer?audit=1"></iframe>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => Number.isFinite(n) ? n.toLocaleString('ko-KR') : String(n ?? '—');
+const pct = n => Number.isFinite(n) ? (n * 100).toFixed(1) + '%' : '—';
+
+const variantLabels = {
+  mesh: '메시 보기',
+  texture: '텍스처 병합 보기',
+  visual: '강한 병합 보기',
+  detail: '상세 점군 보기'
+};
+
+async function replay(id, variant='mesh') {
+  const r = await fetch(`/api/audit/replay/${id}?variant=${variant}`, {method: 'POST'}).then(r => r.json());
+  if (!r.ok) throw new Error(r.error || 'replay failed');
+}
+
+function metric(label, value) {
+  const v = Math.max(0, Math.min(1, value || 0));
+  return `<div>${label}</div><b>${pct(value)}</b><div class="metric" style="grid-column:1/3"><span style="width:${v*100}%"></span></div>`;
+}
+
+function renderItem(it) {
+  const mode = it.mode + (it.windows ? ` · ${it.windows} windows` : '');
+  const evidenceUrl = `/coverage.html?upload=${encodeURIComponent(it.id)}`;
+  return `<section class="card">
+    <h2><span>${it.video}</span><span class="badge ${it.pass90 ? 'pass' : 'warn'}">${it.score}%</span></h2>
+    <div class="grid">
+      <div>처리</div><b>${mode}</b>
+      <div>포인트 병합</div><b>${fmt(it.points_before)} → ${fmt(it.points_after)}</b>
+      <div>TSDF 메시</div><b>${fmt(it.mesh_vertices)} verts / ${fmt(it.mesh_faces)} faces (${it.mesh_voxel_m}m, weight≥${it.mesh_min_weight ?? 1})</b>
+      <div>텍스처 병합</div><b>${fmt(it.texture_points)} (${it.texture_voxel_m}m voxel)</b>
+      <div>강한 병합</div><b>${fmt(it.visual_points)} (${it.visual_voxel_m}m voxel)</b>
+      <div>프레임/pose</div><b>${fmt(it.frames_used)} / ${fmt(it.poses)}</b>
+      <div>component</div><b>${fmt(it.components)}개</b>
+      <div>최대 component</div><b>${pct(it.largest_component_ratio)}</b>
+      <div>payload</div><b>${it.payload_mb} MB</b>
+      ${metric('source coverage', it.source_coverage)}
+      ${metric('component label', it.component_nonzero_ratio)}
+      ${metric('normal valid', it.normals_unit_ratio)}
+    </div>
+    <button data-id="${it.id}" data-variant="mesh">메시 보기</button>
+    <button data-id="${it.id}" data-variant="texture">텍스처 병합 보기</button>
+    <button data-id="${it.id}" data-variant="visual">강한 병합 보기</button>
+    <button data-id="${it.id}" data-variant="detail">상세 점군 보기</button>
+    <a class="button" href="${evidenceUrl}" target="_blank">모델 기준 evidence</a>
+    <a class="button" href="/api/audit/glb/${it.id}" download>GLB 다운로드</a>
+  </section>`;
+}
+
+fetch('/api/audit/results')
+  .then(r => r.json())
+  .then(data => {
+    $('summaryBadge').textContent = data.summary.passed ? '90% 기준 통과' : '기준 미달';
+    $('summaryBadge').className = 'badge ' + (data.summary.passed ? 'pass' : 'warn');
+    $('summary').textContent = data.summary.note;
+    $('items').innerHTML = data.items.map(renderItem).join('');
+    document.querySelectorAll('button[data-id]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        btn.textContent = '재생 중...';
+        try {
+          await replay(btn.dataset.id, btn.dataset.variant);
+          btn.textContent = '재생됨';
+        } catch (err) {
+          btn.textContent = '실패';
+          alert(err.message);
+        } finally {
+          const label = variantLabels[btn.dataset.variant] || '보기';
+          setTimeout(() => { btn.disabled = false; btn.textContent = label; }, 1200);
+        }
+      });
+    });
+    const candidates = data.items.filter(x => x.pass90);
+    const first = (candidates.length ? candidates : data.items)
+      .slice()
+      .sort((a, b) => (b.frames_used || 0) - (a.frames_used || 0))[0];
+    if (first) replay(first.id, 'mesh').catch(console.warn);
+  });
+</script>
+</body>
+</html>

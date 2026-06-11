@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import ssl
+import struct
 import subprocess
 import time
 from pathlib import Path
@@ -38,6 +39,8 @@ from inference_worker import InferenceWorker
 
 log = logging.getLogger("realtime")
 ROOT = Path(__file__).resolve().parent
+REPO_ROOT = ROOT.parent
+MODELS_DIR = REPO_ROOT / "models"
 FRAME_DUMP_DIR = ROOT / "_received_frames"
 FRAME_DUMP_DIR.mkdir(exist_ok=True)
 
@@ -126,6 +129,8 @@ class FrameConsumer:
 # ---------------- FastAPI ----------------
 
 app = FastAPI()
+if MODELS_DIR.exists():
+    app.mount("/models", StaticFiles(directory=str(MODELS_DIR)), name="models")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -150,10 +155,703 @@ async def viewer_page():
     return FileResponse(ROOT / "viewer.html", headers={"Cache-Control": "no-store"})
 
 
+@app.get("/audit", response_class=HTMLResponse)
+async def audit_page():
+    return FileResponse(ROOT / "audit.html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/coverage", response_class=HTMLResponse)
+async def coverage_page():
+    return FileResponse(ROOT / "coverage.html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/coverage.html", response_class=HTMLResponse)
+async def coverage_html_page():
+    return FileResponse(ROOT / "coverage.html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/coverage-report", response_class=HTMLResponse)
+async def coverage_report_page():
+    return FileResponse(ROOT / "coverage_report.html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/coverage-report.html", response_class=HTMLResponse)
+async def coverage_report_html_page():
+    return FileResponse(ROOT / "coverage_report.html", headers={"Cache-Control": "no-store"})
+
+
 UPLOAD_DIR = ROOT / "_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 BIM_DIR = ROOT / "_bim"
 BIM_DIR.mkdir(exist_ok=True)
+AUDIT_RESULTS = ROOT / "audit_results.json"
+
+
+MODEL_SPECS = {
+    "gasan-7f": {
+        "name": "gasan-7F",
+        "glb": "gasan-7F.glb",
+        "metadata": "pag_export.json",
+        "manifest": "gasan-7F.model_manifest.json",
+    },
+    "pxx": {
+        "name": "PXX",
+        "glb": "PXX.glb",
+        "metadata": "pxx_pag_export.json",
+        "manifest": "PXX.model_manifest.json",
+    },
+    "sxx": {
+        "name": "SXX",
+        "glb": "SXX.glb",
+        "metadata": "pag_export.json",
+        "manifest": "SXX.model_manifest.json",
+    },
+}
+
+
+LINEAR_PAG_KEYS = [
+    ("pipes", "Pipe"),
+    ("ducts", "Duct"),
+    ("conduits", "Conduit"),
+    ("cableTrays", "CableTray"),
+    ("flexDucts", "FlexDuct"),
+    ("flexPipes", "FlexPipe"),
+    ("wires", "Wire"),
+    ("structuralFraming", "Beam"),
+    ("walls", "Wall"),
+]
+
+
+POINT_PAG_KEYS = [
+    ("elbows", "Elbow"),
+    ("tees", "Tee"),
+    ("valves", "Valve"),
+    ("reducers", "Reducer"),
+    ("ductFittings", "DuctFitting"),
+    ("ductAccessories", "DuctAccessory"),
+    ("mepAccessories", "MepAccessory"),
+    ("cableTrayFittings", "CableTrayFitting"),
+    ("conduitFittings", "ConduitFitting"),
+    ("mechanicalEquipment", "MechanicalEquipment"),
+    ("electricalEquipment", "ElectricalEquipment"),
+    ("plumbingFixtures", "PlumbingFixture"),
+    ("sprinklers", "Sprinkler"),
+    ("genericModels", "GenericModel"),
+    ("specialtyEquipment", "SpecialtyEquipment"),
+    ("columns", "Column"),
+    ("structuralColumns", "Column"),
+    ("doors", "Door"),
+    ("windows", "Window"),
+]
+
+
+def _bad_id(value: str, prefix: str) -> bool:
+    return not value.startswith(prefix) or "/" in value or ".." in value
+
+
+def _read_json(path: Path) -> dict | list:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _json_model_id(doc: dict | list) -> str | None:
+    if not isinstance(doc, dict):
+        return None
+    if doc.get("model_id"):
+        return str(doc.get("model_id"))
+    model = doc.get("model")
+    if isinstance(model, dict):
+        value = model.get("model_id") or model.get("id")
+        return str(value) if value else None
+    return None
+
+
+def _load_scoped_upload_json(upload_id: str, suffix: str, model_id: str | None = None) -> dict | None:
+    candidates: list[Path] = []
+    if model_id:
+        candidates.append(UPLOAD_DIR / f"{upload_id}.{model_id}.{suffix}.json")
+    candidates.append(UPLOAD_DIR / f"{upload_id}.{suffix}.json")
+    for path in candidates:
+        if not path.exists():
+            continue
+        doc = _read_json(path)
+        if model_id and _json_model_id(doc) != model_id:
+            continue
+        if isinstance(doc, dict):
+            return doc
+    return None
+
+
+def _coverage_review_path(upload_id: str, model_id: str) -> Path:
+    return UPLOAD_DIR / f"{upload_id}.{model_id}.coverage_review.json"
+
+
+def _empty_coverage_review(upload_id: str, model_id: str) -> dict:
+    return {
+        "ok": True,
+        "upload_id": upload_id,
+        "model_id": model_id,
+        "object_reviews": {},
+        "frame_reviews": {},
+        "notes": "",
+        "updated_at": None,
+    }
+
+
+def _load_coverage_review(upload_id: str, model_id: str) -> dict:
+    path = _coverage_review_path(upload_id, model_id)
+    if not path.exists():
+        return _empty_coverage_review(upload_id, model_id)
+    doc = _read_json(path)
+    if not isinstance(doc, dict):
+        return _empty_coverage_review(upload_id, model_id)
+    base = _empty_coverage_review(upload_id, model_id)
+    base.update(doc)
+    if not isinstance(base.get("object_reviews"), dict):
+        base["object_reviews"] = {}
+    if not isinstance(base.get("frame_reviews"), dict):
+        base["frame_reviews"] = {}
+    return base
+
+
+def _sanitize_review_entry(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    accepted = value.get("accepted")
+    if accepted is not None:
+        accepted = bool(accepted)
+    frame = value.get("frame")
+    try:
+        frame = int(frame) if frame is not None else None
+    except (TypeError, ValueError):
+        frame = None
+    note = str(value.get("note") or "")[:500]
+    reviewed_at = str(value.get("reviewed_at") or time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    out = {"accepted": accepted, "note": note, "reviewed_at": reviewed_at}
+    if frame is not None:
+        out["frame"] = frame
+    return out
+
+
+def _pag_units_scale(units: str | None) -> float:
+    u = (units or "").lower()
+    if u in ("mm", "millimeter", "millimeters"):
+        return 0.001
+    if u in ("cm", "centimeter", "centimeters"):
+        return 0.01
+    return 1.0
+
+
+def _vec_scaled(v, scale: float) -> list[float] | None:
+    if v is None:
+        return None
+    return [float(x) * scale for x in v]
+
+
+def _bbox_from_center(center: list[float], w: float, h: float, l: float, scale: float) -> list[list[float]]:
+    cx, cy, cz = _vec_scaled(center, scale)
+    dx = abs(float(w or 0.0)) * scale / 2 or 0.05
+    dy = abs(float(l or 0.0)) * scale / 2 or 0.05
+    dz = abs(float(h or 0.0)) * scale / 2 or 0.05
+    return [[cx - dx, cy - dy, cz - dz], [cx + dx, cy + dy, cz + dz]]
+
+
+def _extract_glb_names(path: Path, *, max_names: int = 200_000) -> set[str]:
+    """Return node/mesh names from a GLB JSON chunk without a full glTF loader."""
+    if not path.exists() or path.suffix.lower() != ".glb":
+        return set()
+    names: set[str] = set()
+    try:
+        with path.open("rb") as f:
+            header = f.read(12)
+            if len(header) != 12 or header[:4] != b"glTF":
+                return names
+            while True:
+                chunk_header = f.read(8)
+                if len(chunk_header) < 8:
+                    break
+                length, ctype = struct.unpack("<I4s", chunk_header)
+                data = f.read(length)
+                if ctype == b"JSON":
+                    doc = json.loads(data.decode("utf-8"))
+                    for key in ("nodes", "meshes"):
+                        for item in doc.get(key, []) or []:
+                            name = item.get("name")
+                            if name:
+                                names.add(str(name))
+                            extras = item.get("extras")
+                            if isinstance(extras, dict):
+                                for k in ("guid", "GUID", "ifcGuid", "revitId", "RevitId", "UniqueId", "uniqueId", "ElementID", "elementId"):
+                                    if extras.get(k):
+                                        names.add(str(extras[k]))
+                            if len(names) >= max_names:
+                                return names
+                    return names
+    except Exception as e:
+        log.warning("GLB name scan failed for %s: %s", path, e)
+    return names
+
+
+_GLB_NAME_CACHE: dict[str, tuple[float, set[str]]] = {}
+
+
+def _glb_name_set(glb_path: Path) -> set[str]:
+    """Cached GLB identifier set (node/mesh name + extras GUIDs), keyed by path+mtime."""
+    try:
+        mtime = glb_path.stat().st_mtime
+    except OSError:
+        return set()
+    key = str(glb_path)
+    cached = _GLB_NAME_CACHE.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    names = _extract_glb_names(glb_path)
+    _GLB_NAME_CACHE[key] = (mtime, names)
+    return names
+
+
+_GLB_DOC_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _glb_json(glb_path: Path) -> dict | None:
+    """Cached GLB JSON chunk (full glTF document), keyed by path+mtime."""
+    try:
+        mtime = glb_path.stat().st_mtime
+    except OSError:
+        return None
+    key = str(glb_path)
+    cached = _GLB_DOC_CACHE.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        with glb_path.open("rb") as f:
+            header = f.read(12)
+            if len(header) != 12 or header[:4] != b"glTF":
+                return None
+            doc = None
+            while True:
+                chunk_header = f.read(8)
+                if len(chunk_header) < 8:
+                    break
+                length, ctype = struct.unpack("<I4s", chunk_header)
+                data = f.read(length)
+                if ctype == b"JSON":
+                    doc = json.loads(data.decode("utf-8"))
+                    break
+            if doc is None:
+                return None
+            _GLB_DOC_CACHE[key] = (mtime, doc)
+            return doc
+    except Exception as e:
+        log.warning("GLB JSON scan failed for %s: %s", glb_path, e)
+        return None
+
+
+def _model_registry() -> dict:
+    """Static specs whose files exist + auto-discovered models/*.glb (GLB-native)."""
+    specs: dict[str, dict] = {}
+    for mid, spec in MODEL_SPECS.items():
+        if (MODELS_DIR / spec["glb"]).exists():
+            specs[mid] = spec
+    if MODELS_DIR.exists():
+        for pth in sorted(MODELS_DIR.glob("*.glb")):
+            if any(sp.get("glb") == pth.name for sp in specs.values()):
+                continue
+            mid = re.sub(r"[^a-z0-9_-]", "-", pth.stem.lower()) or "model"
+            if mid in specs:
+                continue
+            specs[mid] = {
+                "name": pth.stem,
+                "glb": pth.name,
+                "metadata": None,
+                "manifest": f"{pth.stem}.model_manifest.json",
+                "kind": "glb_native",
+            }
+    return specs
+
+
+def _default_model_id() -> str:
+    """등록된 첫 모델 id (하드코딩 제거용 동적 기본값)."""
+    return next(iter(_model_registry()), "")
+
+
+GLB_NATIVE_CATEGORY = {
+    "Pipes": "Pipe",
+    "Pipe Fittings": "PipeFitting",
+    "Ducts": "Duct",
+    "Duct Fittings": "DuctFitting",
+    "Duct Accessories": "DuctAccessory",
+    "Pipe Accessories": "PipeAccessory",
+    "Cable Trays": "CableTray",
+    "Conduits": "Conduit",
+}
+
+
+def _glb_node_matrix(n: dict) -> np.ndarray:
+    if "matrix" in n:
+        return np.array(n["matrix"], dtype=np.float64).reshape(4, 4).T
+    T = np.eye(4)
+    if "translation" in n:
+        T[:3, 3] = n["translation"]
+    R = np.eye(4)
+    if "rotation" in n:
+        x, y, z, w = n["rotation"]
+        R[:3, :3] = np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ])
+    S = np.eye(4)
+    if "scale" in n:
+        S[0, 0], S[1, 1], S[2, 2] = n["scale"]
+    return T @ R @ S
+
+
+def _load_glb_native_model(model_id: str, spec: dict) -> tuple[dict, list[dict]]:
+    """GLB 자체를 메타데이터 소스로 객체를 추출한다 (PAG JSON 불필요).
+    노드 extras의 IfcGUID/Category와 accessor bbox + 노드 변환으로 객체를 만들고,
+    glTF Y-up(m) -> model_world Z-up(m) 변환((x, -z, y))을 적용한다."""
+    glb_path = MODELS_DIR / spec["glb"]
+    doc = _glb_json(glb_path)
+    if not doc:
+        raise FileNotFoundError(str(glb_path))
+    nodes = doc.get("nodes", [])
+    meshes = doc.get("meshes", [])
+    accs = doc.get("accessors", [])
+    parent: dict[int, int] = {}
+    for i, n in enumerate(nodes):
+        for c in n.get("children", []) or []:
+            parent[c] = i
+
+    def world(i: int) -> np.ndarray:
+        M = _glb_node_matrix(nodes[i])
+        p = parent.get(i)
+        while p is not None:
+            M = _glb_node_matrix(nodes[p]) @ M
+            p = parent.get(p)
+        return M
+
+    def to_model(pts: np.ndarray) -> np.ndarray:
+        # glTF Y-up -> Z-up: (x, y, z) -> (x, -z, y)
+        out = np.empty_like(pts)
+        out[:, 0] = pts[:, 0]
+        out[:, 1] = -pts[:, 2]
+        out[:, 2] = pts[:, 1]
+        return out
+
+    # 같은 IfcGUID가 여러 노드(다중 mesh 분할)로 나올 수 있으므로 guid 기준으로 bbox를 병합한다
+    merged: dict[str, dict] = {}
+    for i, n in enumerate(nodes):
+        ex = n.get("extras") or {}
+        guid = ex.get("IfcGUID") or ex.get("UniqueId")
+        if not guid or "mesh" not in n:
+            continue
+        lo = np.full(3, np.inf)
+        hi = np.full(3, -np.inf)
+        ok = False
+        M = world(i)
+        for prim in meshes[n["mesh"]].get("primitives", []):
+            a = accs[prim["attributes"]["POSITION"]]
+            if "min" not in a or "max" not in a:
+                continue
+            cr = np.array([[x, y, z]
+                           for x in (a["min"][0], a["max"][0])
+                           for y in (a["min"][1], a["max"][1])
+                           for z in (a["min"][2], a["max"][2])], dtype=np.float64)
+            crw = (np.c_[cr, np.ones(8)] @ M.T)[:, :3]
+            lo = np.minimum(lo, crw.min(0))
+            hi = np.maximum(hi, crw.max(0))
+            ok = True
+        if not ok:
+            continue
+        key = str(guid)
+        ent = merged.get(key)
+        if ent is None:
+            merged[key] = {"lo": lo, "hi": hi, "extras": ex}
+        else:
+            ent["lo"] = np.minimum(ent["lo"], lo)
+            ent["hi"] = np.maximum(ent["hi"], hi)
+
+    objects: list[dict] = []
+    counts: dict[str, int] = {}
+    for guid, ent in merged.items():
+        ex = ent["extras"]
+        box = to_model(np.vstack([ent["lo"], ent["hi"]]))
+        b_lo = box.min(0)
+        b_hi = box.max(0)
+        center = ((b_lo + b_hi) * 0.5).tolist()
+        span = b_hi - b_lo
+        order = np.argsort(span)
+        category = GLB_NATIVE_CATEGORY.get(str(ex.get("Category") or ""), str(ex.get("Category") or "Unknown"))
+        # linear 판정: 진짜 선형 카테고리만. Fitting류는 GUID 병합 시 L자형 bbox가 되어
+        # 장축 start/end가 실제 형상과 무관한 대각선이 되므로 point(bbox) 객체로 둔다.
+        start = end = None
+        linear_ok = category in ("Pipe", "Duct", "Conduit", "CableTray", "FlexDuct", "FlexPipe")
+        if linear_ok and span[order[2]] >= 0.5 and span[order[2]] >= 3.0 * max(span[order[1]], 1e-6):
+            axis = np.zeros(3)
+            axis[order[2]] = span[order[2]] * 0.5
+            c = np.asarray(center)
+            start = (c - axis).tolist()
+            end = (c + axis).tolist()
+        rec = {
+            "guid": str(guid),
+            "category": category,
+            "system": ex.get("System Name") or ex.get("System Type"),
+            "zone": ex.get("Level") or ex.get("Reference Level"),
+            "center": center,
+            "start": start,
+            "end": end,
+            "bbox": [b_lo.tolist(), b_hi.tolist()],
+            "is_linear": bool(start is not None),
+            "diameter_m": float(span[order[1]]),
+            "source_key": "glb_native",
+            "has_glb_mesh": True,
+        }
+        objects.append(rec)
+        counts[category] = counts.get(category, 0) + 1
+
+    manifest = {
+        "id": model_id,
+        "model_id": model_id,
+        "name": spec["name"],
+        "glb": spec["glb"],
+        "metadata": None,
+        "manifest": spec["manifest"],
+        "units": "m",
+        "unit_scale_to_m": 1.0,
+        "up_axis": "Z_UP",
+        "metadata_kind": "glb_native",
+        "glb_axis_transform": "gltf_yup_to_zup",
+        "object_count": len(objects),
+        "counts_by_category": counts,
+    }
+    return manifest, objects
+
+
+def _load_model_objects(model_id: str) -> tuple[dict, list[dict]]:
+    spec = _model_registry().get(model_id)
+    if not spec:
+        raise KeyError(f"unknown model_id: {model_id}")
+    if spec.get("kind") == "glb_native":
+        return _load_glb_native_model(model_id, spec)
+    meta_path = MODELS_DIR / spec["metadata"]
+    if not meta_path.exists():
+        raise FileNotFoundError(str(meta_path))
+    pag = _read_json(meta_path)
+    project = pag.get("project", {}) if isinstance(pag, dict) else {}
+    scale = _pag_units_scale(project.get("units"))
+    units = project.get("units", "m")
+    objects: list[dict] = []
+    counts: dict[str, int] = {}
+
+    def add_obj(obj: dict, category: str, *, linear: bool) -> None:
+        guid = obj.get("guid")
+        if not guid:
+            return
+        start = _vec_scaled(obj.get("start"), scale)
+        end = _vec_scaled(obj.get("end"), scale)
+        center = _vec_scaled(obj.get("center"), scale)
+        if center is None and start is not None and end is not None:
+            center = [(a + b) * 0.5 for a, b in zip(start, end)]
+        bbox = None
+        if obj.get("bbox"):
+            raw = obj["bbox"]
+            if isinstance(raw, list) and len(raw) == 2:
+                bbox = [_vec_scaled(raw[0], scale), _vec_scaled(raw[1], scale)]
+        if bbox is None and center is not None and not linear:
+            bbox = _bbox_from_center(
+                obj.get("center"),
+                obj.get("width") or obj.get("overallWidth") or obj.get("diameter") or obj.get("largeDiameter") or 100.0,
+                obj.get("height") or obj.get("overallHeight") or obj.get("diameter") or obj.get("largeDiameter") or 100.0,
+                obj.get("length") or obj.get("faceToFace") or 100.0,
+                scale,
+            )
+        if center is None and start is None and bbox is None:
+            return
+        rec = {
+            "guid": str(guid),
+            "category": category,
+            "system": obj.get("systemName") or obj.get("system") or obj.get("systemType"),
+            "zone": obj.get("level"),
+            "center": center,
+            "start": start,
+            "end": end,
+            "bbox": bbox,
+            "is_linear": bool(start is not None and end is not None),
+            "diameter_m": float(obj.get("diameter") or obj.get("largeDiameter") or obj.get("runDiameter") or 0.0) * scale,
+            "source_key": obj.get("_source_key"),
+        }
+        objects.append(rec)
+        counts[category] = counts.get(category, 0) + 1
+
+    if isinstance(pag, dict):
+        for key, category in LINEAR_PAG_KEYS:
+            for item in pag.get(key, []) or []:
+                item["_source_key"] = key
+                add_obj(item, category, linear=True)
+        for key, category in POINT_PAG_KEYS:
+            for item in pag.get(key, []) or []:
+                item["_source_key"] = key
+                add_obj(item, category, linear=False)
+
+    manifest = {
+        "id": model_id,
+        "model_id": model_id,
+        "name": spec["name"],
+        "glb": spec["glb"],
+        "metadata": spec["metadata"],
+        "manifest": spec["manifest"],
+        "units": units,
+        "unit_scale_to_m": scale,
+        "up_axis": "Z_UP",
+        "pag_to_glb_transform": [
+            [scale, 0, 0, 0],
+            [0, scale, 0, 0],
+            [0, 0, scale, 0],
+            [0, 0, 0, 1],
+        ],
+        "object_count": len(objects),
+        "counts_by_category": counts,
+    }
+    glb_names = _glb_name_set(MODELS_DIR / spec["glb"])
+    for rec in objects:
+        rec["has_glb_mesh"] = rec["guid"] in glb_names
+    return manifest, objects
+
+
+def _model_manifest(model_id: str, *, persist: bool = False) -> dict:
+    spec = _model_registry()[model_id]
+    glb_path = MODELS_DIR / spec["glb"]
+    meta_path = MODELS_DIR / spec["metadata"] if spec.get("metadata") else None
+    manifest, objects = _load_model_objects(model_id)
+    guids = {o["guid"] for o in objects}
+    if spec.get("kind") == "glb_native":
+        # GLB 자체가 메타데이터 소스이므로 모든 객체가 mesh와 직접 연결된다
+        matched = len(guids)
+    else:
+        names = _glb_name_set(glb_path)
+        matched = sum(1 for g in guids if g in names)
+    mapping_ratio = matched / max(len(guids), 1)
+    proxy_bounds = _model_object_bounds(objects)
+    guid_mapping_status = "direct" if mapping_ratio >= 0.60 else "partial" if mapping_ratio >= 0.10 else "proxy_only"
+    manifest.update({
+        "glb_url": f"/models/{spec['glb']}",
+        "metadata_url": f"/models/{spec['metadata']}" if spec.get("metadata") else None,
+        "manifest_url": f"/models/{spec['manifest']}",
+        "manifest_valid": glb_path.exists() and (meta_path is None or meta_path.exists()) and bool(objects),
+        "guid_mapping_ratio": round(mapping_ratio, 4),
+        "guid_mapping_status": guid_mapping_status,
+        "guid_mapped_count": matched,
+        "guid_total": len(guids),
+        "fallback_geometry": "pag_proxy",
+        "fallback_geometry_count": max(0, len(guids) - matched),
+        "coverage_geometry_source": (
+            "glb_guid_mesh" if mapping_ratio >= 0.60
+            else "hybrid_glb_proxy" if mapping_ratio > 0.0
+            else "pag_proxy"
+        ),
+        "glb_role": (
+            "coverage_geometry" if mapping_ratio >= 0.60
+            else "partial_coverage_geometry" if mapping_ratio > 0.0
+            else "visual_context_only"
+        ),
+        "proxy_geometry_bounds": proxy_bounds,
+        "glb_bytes": glb_path.stat().st_size if glb_path.exists() else 0,
+        "metadata_bytes": meta_path.stat().st_size if (meta_path is not None and meta_path.exists()) else 0,
+    })
+    if persist and MODELS_DIR.exists():
+        out = MODELS_DIR / spec["manifest"]
+        out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest
+
+
+def _select_scan_payload(upload_id: str, preferred: str | None = None) -> Path | None:
+    variants = {
+        "mesh": UPLOAD_DIR / f"{upload_id}.lbm1.mesh",
+        "detail": UPLOAD_DIR / f"{upload_id}.lbp4.test",
+        "texture": UPLOAD_DIR / f"{upload_id}.lbp4.texture",
+        "visual": UPLOAD_DIR / f"{upload_id}.lbp4.visual",
+        "lbp2": UPLOAD_DIR / f"{upload_id}.lbp2",
+    }
+    if preferred and preferred in variants and variants[preferred].exists():
+        return variants[preferred]
+    for key in ("mesh", "detail", "texture", "visual", "lbp2"):
+        if variants[key].exists():
+            return variants[key]
+    return None
+
+
+def _parse_scan_payload(path: Path, *, include_points: bool = False, max_points: int = 250_000) -> dict:
+    data = path.read_bytes()
+    if len(data) < 20:
+        raise ValueError("payload too small")
+    magic = data[:4]
+    out: dict = {
+        "payload": path.name,
+        "payload_bytes": len(data),
+        "magic": magic.decode("ascii", errors="replace"),
+        "points": None,
+        "colors": None,
+        "source_ids": None,
+    }
+    if magic in (b"LBP2", b"LBP3", b"LBP4"):
+        _magic, flags, num_pts, num_poses, seq = struct.unpack("<4sIIII", data[:20])
+        off = 20
+        xyz = np.frombuffer(data, dtype="<f4", count=num_pts * 3, offset=off).reshape(-1, 3)
+        off += num_pts * 3 * 4
+        rgb = np.frombuffer(data, dtype=np.uint8, count=num_pts * 3, offset=off).reshape(-1, 3)
+        off += num_pts * 3
+        if magic == b"LBP3":
+            off += num_pts * 3 * 4
+        src_ids = None
+        if magic == b"LBP4":
+            off += num_pts * 3 * 4  # normals
+            src_ids = np.frombuffer(data, dtype="<u4", count=num_pts, offset=off)
+            off += num_pts * 4
+            off += num_pts * 4  # component ids
+        poses = np.frombuffer(data, dtype="<f4", count=num_poses * 12, offset=off).reshape(-1, 12)
+        off += num_poses * 12 * 4
+        K = np.frombuffer(data, dtype="<f4", count=9, offset=off).reshape(3, 3)
+        out.update({"count": int(num_pts), "poses": poses.tolist(), "K": K.tolist(), "flags": int(flags), "seq": int(seq)})
+        pts_for_bounds = xyz
+        if include_points:
+            step = max(1, int(np.ceil(num_pts / max_points)))
+            sample = xyz[::step].astype(np.float32)
+            out["points"] = sample.tolist()
+            out["colors"] = rgb[::step].astype(np.uint8).tolist()
+            if src_ids is not None:
+                out["source_ids"] = src_ids[::step].astype(np.uint32).tolist()
+    elif magic == b"LBM1":
+        _magic, flags, num_v, num_f, num_poses, seq = struct.unpack("<4sIIIII", data[:24])
+        off = 24
+        verts = np.frombuffer(data, dtype="<f4", count=num_v * 3, offset=off).reshape(-1, 3)
+        off += num_v * 3 * 4
+        rgb = np.frombuffer(data, dtype=np.uint8, count=num_v * 3, offset=off).reshape(-1, 3)
+        off += num_v * 3
+        off += num_f * 3 * 4  # faces
+        poses = np.frombuffer(data, dtype="<f4", count=num_poses * 12, offset=off).reshape(-1, 12)
+        off += num_poses * 12 * 4
+        K = np.frombuffer(data, dtype="<f4", count=9, offset=off).reshape(3, 3)
+        out.update({
+            "count": int(num_v),
+            "faces": int(num_f),
+            "poses": poses.tolist(),
+            "K": K.tolist(),
+            "flags": int(flags),
+            "seq": int(seq),
+            "glb_url": f"/api/audit/glb/{path.stem.replace('.lbm1', '')}" if path.name.endswith(".lbm1.mesh") else None,
+        })
+        pts_for_bounds = verts
+        if include_points:
+            step = max(1, int(np.ceil(num_v / max_points)))
+            out["points"] = verts[::step].astype(np.float32).tolist()
+            out["colors"] = rgb[::step].astype(np.uint8).tolist()
+    else:
+        raise ValueError(f"unsupported payload magic: {magic!r}")
+    if pts_for_bounds.shape[0]:
+        mn = pts_for_bounds.min(axis=0)
+        mx = pts_for_bounds.max(axis=0)
+        out["bounds"] = {"min": mn.astype(float).tolist(), "max": mx.astype(float).tolist()}
+    return out
 
 
 @app.post("/api/upload-video")
@@ -189,6 +887,8 @@ async def upload_video(file: UploadFile = File(...), target_frames: int = 48):
         "ok": _payload is not None,
         "id": upload_id,
         "file": dest.name,
+        "coverage_url": f"/coverage.html?model={next(iter(_model_registry()), 'pxx')}&upload={upload_id}",
+        "report_url": f"/coverage-report.html?model={next(iter(_model_registry()), 'pxx')}&upload={upload_id}",
         "bytes": size,
         "elapsed_s": round(dt, 2),
         **info,
@@ -303,11 +1003,19 @@ async def delete_bim(bim_id: str):
 
 @app.get("/api/uploads")
 async def list_uploads():
-    """List past uploads with persisted point-cloud payloads, newest first."""
+    """List past uploads with any persisted scan payload, newest first."""
+    ids: set[str] = set()
+    for pat in ("upload_*.lbp2", "upload_*.lbp4.*", "upload_*.lbm1.mesh", "upload_*.mp4", "upload_*.mov", "upload_*.webm", "upload_*.mkv", "upload_*.avi"):
+        for p in UPLOAD_DIR.glob(pat):
+            name = p.name
+            if ".lbp4." in name:
+                ids.add(name.split(".lbp4.", 1)[0])
+            elif name.endswith(".lbm1.mesh"):
+                ids.add(name.removesuffix(".lbm1.mesh"))
+            else:
+                ids.add(p.stem)
     items = []
-    for p in sorted(UPLOAD_DIR.glob("upload_*.lbp2"),
-                    key=lambda x: x.stat().st_mtime, reverse=True):
-        upload_id = p.stem
+    for upload_id in sorted(ids, key=lambda x: int(x.split("_")[-1]) if x.count("_") >= 1 and x.split("_")[-1].isdigit() else 0, reverse=True):
         # find matching video (any common ext)
         video = None
         for ext in (".mp4", ".mov", ".webm", ".mkv", ".avi"):
@@ -316,13 +1024,2279 @@ async def list_uploads():
                 video = cand.name
                 break
         ts_ms = int(upload_id.split("_")[-1]) if upload_id.count("_") >= 1 else 0
+        payloads = _upload_payloads(upload_id)
         items.append({
             "id": upload_id,
             "video": video,
-            "payload_bytes": p.stat().st_size,
+            "payloads": payloads,
+            "payload_bytes": max((v["bytes"] for v in payloads.values()), default=0),
             "ts_ms": ts_ms,
+            "coverage_url": f"/coverage.html?model=pxx&upload={upload_id}",
+            "report_url": f"/coverage-report.html?model=pxx&upload={upload_id}",
         })
     return {"uploads": items}
+
+
+def _upload_payloads(upload_id: str) -> dict:
+    payloads = {}
+    for key, p in {
+        "lbp2": UPLOAD_DIR / f"{upload_id}.lbp2",
+        "mesh": UPLOAD_DIR / f"{upload_id}.lbm1.mesh",
+        "detail": UPLOAD_DIR / f"{upload_id}.lbp4.test",
+        "texture": UPLOAD_DIR / f"{upload_id}.lbp4.texture",
+        "visual": UPLOAD_DIR / f"{upload_id}.lbp4.visual",
+        "mesh_glb": UPLOAD_DIR / f"{upload_id}.mesh.glb",
+    }.items():
+        if p.exists():
+            payloads[key] = {"file": p.name, "bytes": p.stat().st_size}
+    return payloads
+
+
+def _load_upload_thumbs(upload_id: str, *, prefer_audit: bool = False) -> list[bytes] | None:
+    candidates = []
+    if prefer_audit:
+        candidates.append(UPLOAD_DIR / f"{upload_id}.lbm1.thumbs.json")
+        candidates.append(UPLOAD_DIR / f"{upload_id}.lbp4.thumbs.json")
+    candidates.append(UPLOAD_DIR / f"{upload_id}.thumbs.json")
+    tp = next((p for p in candidates if p.exists()), None)
+    if tp is None:
+        return None
+    try:
+        return [base64.b64decode(s) for s in json.loads(tp.read_text())]
+    except Exception as e:
+        log.warning("thumbs load failed for %s: %s", upload_id, e)
+        return None
+
+
+def _upload_video_path(upload_id: str) -> Path | None:
+    for ext in (".mp4", ".mov", ".webm", ".mkv", ".avi"):
+        p = UPLOAD_DIR / f"{upload_id}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+def _upload_ts_ms(upload_id: str) -> int:
+    try:
+        return int(upload_id.split("_")[-1]) if upload_id.count("_") >= 1 else 0
+    except Exception:
+        return 0
+
+
+def _video_timing_metadata(upload_id: str, sample_count: int = 0) -> dict:
+    video = _upload_video_path(upload_id)
+    if video is None:
+        return {}
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
+        return {"video_file": video.name}
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    finally:
+        cap.release()
+    duration_s = (total / fps) if total > 0 and fps > 0 else None
+    out: dict = {
+        "video_file": video.name,
+        "video_frame_count": total,
+        "video_fps": round(fps, 3) if fps > 0 else None,
+        "video_duration_s": round(duration_s, 3) if duration_s is not None else None,
+        "upload_ts_ms": _upload_ts_ms(upload_id),
+    }
+    if sample_count > 0 and total > 0:
+        raw_indices = _uniform_video_indices(total, sample_count)
+        out["raw_frame_indices"] = raw_indices
+        if fps > 0:
+            out["frame_timestamps_s"] = [round(idx / fps, 3) for idx in raw_indices]
+    return out
+
+
+def _scan_frame_count(upload_id: str) -> int:
+    p = _select_scan_payload(upload_id, "mesh")
+    if p is None:
+        p = _select_scan_payload(upload_id)
+    if p is not None:
+        try:
+            scan = _parse_scan_payload(p, include_points=False)
+            return int(len(scan.get("poses") or []))
+        except Exception as e:
+            log.warning("scan frame count failed for %s: %s", upload_id, e)
+    thumbs = _load_upload_thumbs(upload_id, prefer_audit=True)
+    return len(thumbs) if thumbs else 0
+
+
+def _uniform_video_indices(total_frames: int, sample_count: int) -> list[int]:
+    if total_frames <= 0 or sample_count <= 0:
+        return []
+    n = min(sample_count, total_frames)
+    if n == 1:
+        return [total_frames // 2]
+    return [int(round(i * (total_frames - 1) / (n - 1))) for i in range(n)]
+
+
+def _extract_keyframes(
+    upload_id: str,
+    frame_ids: list[int],
+    *,
+    max_width: int = 1280,
+    quality: int = 90,
+) -> list[dict]:
+    video = _upload_video_path(upload_id)
+    if video is None:
+        raise FileNotFoundError(f"video not found for {upload_id}")
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
+        raise RuntimeError(f"cannot open video: {video.name}")
+    rotation = int(cap.get(cv2.CAP_PROP_ORIENTATION_META) or 0)
+    try:
+        cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1.0)
+    except Exception:
+        pass
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    sample_count = _scan_frame_count(upload_id) or max(frame_ids, default=-1) + 1
+    raw_indices = _uniform_video_indices(total, sample_count)
+    rot_map = {
+        90: cv2.ROTATE_90_CLOCKWISE,
+        180: cv2.ROTATE_180,
+        270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+    }
+    rot_code = rot_map.get(rotation)
+    out_dir = UPLOAD_DIR / f"{upload_id}.keyframes"
+    out_dir.mkdir(exist_ok=True)
+    out: list[dict] = []
+    try:
+        for frame_id in sorted({int(x) for x in frame_ids if int(x) >= 0}):
+            if frame_id >= len(raw_indices):
+                continue
+            raw_idx = int(raw_indices[frame_id])
+            dest = out_dir / f"frame_{frame_id:06d}.jpg"
+            if not dest.exists():
+                cap.set(cv2.CAP_PROP_POS_FRAMES, raw_idx)
+                ok, bgr = cap.read()
+                if not ok or bgr is None:
+                    continue
+                if rot_code is not None and rotation in (90, 270) and bgr.shape[1] > bgr.shape[0]:
+                    bgr = cv2.rotate(bgr, rot_code)
+                elif rot_code == cv2.ROTATE_180:
+                    bgr = cv2.rotate(bgr, rot_code)
+                h, w = bgr.shape[:2]
+                if max_width > 0 and w > max_width:
+                    scale = max_width / float(w)
+                    bgr = cv2.resize(bgr, (max_width, max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
+                ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+                if not ok:
+                    continue
+                dest.write_bytes(buf.tobytes())
+            try:
+                img = cv2.imread(str(dest))
+                height, width = img.shape[:2] if img is not None else (None, None)
+            except Exception:
+                height, width = None, None
+            out.append({
+                "frame": frame_id,
+                "raw_frame": raw_idx,
+                "timestamp_s": round(raw_idx / fps, 3) if fps > 0 else None,
+                "file": dest.name,
+                "url": f"/api/uploads/{upload_id}/keyframes/{frame_id}.jpg",
+                "width": width,
+                "height": height,
+                "bytes": dest.stat().st_size if dest.exists() else 0,
+            })
+    finally:
+        cap.release()
+    return out
+
+
+@app.get("/api/models")
+async def list_models():
+    """List built-in reference models under /models with manifest validation."""
+    items = []
+    registry = _model_registry()
+    for model_id in registry:
+        try:
+            items.append(_model_manifest(model_id, persist=True))
+        except Exception as e:
+            spec = registry[model_id]
+            items.append({
+                "model_id": model_id,
+                "name": spec["name"],
+                "glb": spec["glb"],
+                "metadata": spec["metadata"],
+                "manifest_valid": False,
+                "error": str(e),
+            })
+    return {"items": items}
+
+
+@app.get("/api/models/{model_id}/objects")
+async def model_objects(model_id: str, limit: int = 5000):
+    """Return PAG-derived proxy objects for a built-in model."""
+    if model_id not in _model_registry():
+        return JSONResponse({"ok": False, "error": "unknown model_id"}, status_code=404)
+    try:
+        manifest, objects = _load_model_objects(model_id)
+        return {"ok": True, "manifest": _model_manifest(model_id), "objects": objects[:max(0, limit)]}
+    except Exception as e:
+        log.exception("model objects failed: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/uploads/{upload_id}/scan")
+async def upload_scan(
+    upload_id: str,
+    variant: str | None = None,
+    include_points: bool = False,
+    include_thumbs: bool = True,
+    max_points: int = 120_000,
+):
+    """Return persisted scan metadata: poses, intrinsics, counts, thumbnails."""
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    p = _select_scan_payload(upload_id, variant)
+    if p is None:
+        return JSONResponse({"ok": False, "error": "no scan payload found"}, status_code=404)
+    try:
+        scan = _parse_scan_payload(p, include_points=include_points, max_points=max(1_000, min(int(max_points), 500_000)))
+    except Exception as e:
+        log.exception("scan parse failed: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    thumbs = _load_upload_thumbs(upload_id, prefer_audit=True) if include_thumbs else None
+    sample_count = max(
+        len(scan.get("poses") or []),
+        len(thumbs) if thumbs else 0,
+    )
+    scan.update(_video_timing_metadata(upload_id, sample_count=sample_count))
+    scan.update({
+        "ok": True,
+        "id": upload_id,
+        "mesh_glb_url": f"/api/uploads/{upload_id}/mesh.glb" if (UPLOAD_DIR / f"{upload_id}.mesh.glb").exists() else None,
+        "thumbs": [base64.b64encode(t).decode("ascii") for t in thumbs] if thumbs else [],
+        "thumb_count": len(thumbs) if thumbs else 0,
+    })
+    return scan
+
+
+@app.get("/api/uploads/{upload_id}/mesh.glb")
+async def upload_scan_glb(upload_id: str):
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    p = UPLOAD_DIR / f"{upload_id}.mesh.glb"
+    if not p.exists():
+        return JSONResponse({"ok": False, "error": "GLB mesh not found"}, status_code=404)
+    return FileResponse(p, media_type="model/gltf-binary", filename=p.name, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/uploads/{upload_id}/keyframes")
+async def upload_keyframes(upload_id: str, frames: str = "", max_width: int = 1280):
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    try:
+        if frames.strip():
+            frame_ids = [int(x) for x in re.split(r"[, ]+", frames.strip()) if x != ""]
+        else:
+            frame_ids = list(range(min(_scan_frame_count(upload_id), 12)))
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "frames must be comma-separated integers"}, status_code=400)
+    try:
+        items = _extract_keyframes(upload_id, frame_ids, max_width=max(0, min(int(max_width), 4096)))
+        return {
+            "ok": True,
+            "id": upload_id,
+            "count": len(items),
+            "items": items,
+            "dir": f"{upload_id}.keyframes",
+        }
+    except FileNotFoundError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=404)
+    except Exception as e:
+        log.exception("keyframe extraction failed: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/uploads/{upload_id}/keyframes/{frame_idx}.jpg")
+async def upload_keyframe_image(upload_id: str, frame_idx: int):
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    if frame_idx < 0:
+        return JSONResponse({"ok": False, "error": "bad frame"}, status_code=400)
+    p = UPLOAD_DIR / f"{upload_id}.keyframes" / f"frame_{frame_idx:06d}.jpg"
+    if not p.exists():
+        try:
+            items = _extract_keyframes(upload_id, [frame_idx])
+        except FileNotFoundError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=404)
+        except Exception as e:
+            log.exception("keyframe extraction failed: %s", e)
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        if not items or not p.exists():
+            return JSONResponse({"ok": False, "error": "keyframe not found"}, status_code=404)
+    return FileResponse(p, media_type="image/jpeg", filename=p.name, headers={"Cache-Control": "no-store"})
+
+
+def _viewer_points(points: np.ndarray) -> np.ndarray:
+    out = points.astype(np.float64, copy=True)
+    out[:, 1] *= -1.0
+    out[:, 2] *= -1.0
+    return out
+
+
+def _apply_sim3(points: np.ndarray, transform: dict) -> np.ndarray:
+    s = float(transform.get("scale", 1.0))
+    R = np.asarray(transform.get("rotation", np.eye(3)), dtype=np.float64)
+    t = np.asarray(transform.get("translation", [0, 0, 0]), dtype=np.float64)
+    return s * (R @ points.T).T + t
+
+
+def _bounds_summary_from_points(points: np.ndarray | list) -> dict | None:
+    arr = np.asarray(points, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 3 or arr.size == 0:
+        return None
+    arr = arr[np.isfinite(arr).all(axis=1)]
+    if arr.size == 0:
+        return None
+    mn = arr.min(axis=0)
+    mx = arr.max(axis=0)
+    span = mx - mn
+    center = (mn + mx) * 0.5
+    return {
+        "min": mn.astype(float).tolist(),
+        "max": mx.astype(float).tolist(),
+        "span": span.astype(float).tolist(),
+        "center": center.astype(float).tolist(),
+        "diagonal_m": float(np.linalg.norm(span)),
+    }
+
+
+def _scan_viewer_bounds(scan: dict) -> dict | None:
+    bounds = scan.get("bounds") if isinstance(scan, dict) else None
+    if not isinstance(bounds, dict) or "min" not in bounds or "max" not in bounds:
+        return None
+    mn = np.asarray(bounds.get("min"), dtype=np.float64)
+    mx = np.asarray(bounds.get("max"), dtype=np.float64)
+    if mn.shape != (3,) or mx.shape != (3,) or not np.isfinite(mn).all() or not np.isfinite(mx).all():
+        return None
+    # Viewer/picking coordinates mirror the payload Y/Z axes before scan-to-model Sim(3).
+    viewer_min = np.array([mn[0], -mx[1], -mx[2]], dtype=np.float64)
+    viewer_max = np.array([mx[0], -mn[1], -mn[2]], dtype=np.float64)
+    return _bounds_summary_from_points(np.vstack([viewer_min, viewer_max]))
+
+
+def _bounds_corners(bounds: dict | None) -> np.ndarray:
+    if not bounds or "min" not in bounds or "max" not in bounds:
+        return np.empty((0, 3), dtype=np.float64)
+    mn = np.asarray(bounds.get("min"), dtype=np.float64)
+    mx = np.asarray(bounds.get("max"), dtype=np.float64)
+    if mn.shape != (3,) or mx.shape != (3,) or not np.isfinite(mn).all() or not np.isfinite(mx).all():
+        return np.empty((0, 3), dtype=np.float64)
+    return np.asarray([
+        [mn[0], mn[1], mn[2]],
+        [mn[0], mn[1], mx[2]],
+        [mn[0], mx[1], mn[2]],
+        [mn[0], mx[1], mx[2]],
+        [mx[0], mn[1], mn[2]],
+        [mx[0], mn[1], mx[2]],
+        [mx[0], mx[1], mn[2]],
+        [mx[0], mx[1], mx[2]],
+    ], dtype=np.float64)
+
+
+def _model_object_bounds(objects: list[dict]) -> dict | None:
+    pts: list[list[float]] = []
+    for obj in objects:
+        for key in ("center", "start", "end"):
+            value = obj.get(key)
+            if isinstance(value, list) and len(value) == 3:
+                pts.append(value)
+        bbox = obj.get("bbox")
+        if isinstance(bbox, list) and len(bbox) == 2:
+            for value in bbox:
+                if isinstance(value, list) and len(value) == 3:
+                    pts.append(value)
+    return _bounds_summary_from_points(pts)
+
+
+def _viewer_pose(pose12) -> tuple[np.ndarray, np.ndarray]:
+    c2w = np.asarray(pose12, dtype=np.float64)
+    if c2w.shape[0] != 12:
+        raise ValueError("pose must have 12 floats")
+    R = np.array([
+        [c2w[0], -c2w[1], -c2w[2]],
+        [-c2w[4], c2w[5], c2w[6]],
+        [-c2w[8], c2w[9], c2w[10]],
+    ], dtype=np.float64)
+    t = np.array([c2w[3], -c2w[7], -c2w[11]], dtype=np.float64)
+    return R, t
+
+
+def _aligned_camera_states(poses, alignment: dict) -> list[tuple[np.ndarray, np.ndarray]]:
+    A = np.asarray(alignment.get("rotation", np.eye(3)), dtype=np.float64)
+    s = float(alignment.get("scale", 1.0))
+    at = np.asarray(alignment.get("translation", [0, 0, 0]), dtype=np.float64)
+    states = []
+    for pose in poses or []:
+        R, t = _viewer_pose(pose)
+        states.append((A @ R, s * (A @ t) + at))
+    return states
+
+
+def _pose_descriptor(poses) -> dict:
+    positions = []
+    for pose in poses or []:
+        try:
+            _R, t = _viewer_pose(pose)
+            positions.append(t)
+        except Exception:
+            continue
+    if not positions:
+        return {
+            "pose_count": 0,
+            "path_length_m": 0.0,
+            "displacement_m": 0.0,
+            "bounds": None,
+        }
+    pts = np.vstack(positions)
+    steps = np.linalg.norm(np.diff(pts, axis=0), axis=1) if pts.shape[0] > 1 else np.zeros(0)
+    return {
+        "pose_count": int(pts.shape[0]),
+        "path_length_m": float(steps.sum()),
+        "displacement_m": float(np.linalg.norm(pts[-1] - pts[0])) if pts.shape[0] > 1 else 0.0,
+        "bounds": _bounds_summary_from_points(pts),
+    }
+
+
+def _model_repetition_risk(objects: list[dict]) -> dict:
+    counts: dict[str, int] = {}
+    system_counts: dict[str, int] = {}
+    for obj in objects:
+        category = str(obj.get("category") or "Unknown")
+        counts[category] = counts.get(category, 0) + 1
+        system = obj.get("system")
+        if system:
+            key = f"{category}:{system}"
+            system_counts[key] = system_counts.get(key, 0) + 1
+    repeated_categories = sorted(
+        ({"category": k, "count": v} for k, v in counts.items() if v >= 8),
+        key=lambda item: item["count"],
+        reverse=True,
+    )[:8]
+    repeated_systems = sorted(
+        ({"group": k, "count": v} for k, v in system_counts.items() if v >= 8),
+        key=lambda item: item["count"],
+        reverse=True,
+    )[:8]
+    max_count = max(counts.values(), default=0)
+    level = "high" if max_count >= 40 or len(repeated_categories) >= 3 else "medium" if max_count >= 12 else "low"
+    return {
+        "level": level,
+        "object_count": len(objects),
+        "max_category_count": max_count,
+        "repeated_categories": repeated_categories,
+        "repeated_systems": repeated_systems,
+        "note": (
+            "repeated model geometry can produce multiple plausible global positions"
+            if level in ("high", "medium")
+            else "repetition risk is low for this model subset"
+        ),
+    }
+
+
+def _bounds_alignment_score(aligned_bounds: dict | None, model_bounds: dict | None) -> dict:
+    if not aligned_bounds or not model_bounds:
+        return {"score": 0.0, "center_distance_m": None, "span_ratio": None}
+    ac = np.asarray(aligned_bounds.get("center"), dtype=np.float64)
+    mc = np.asarray(model_bounds.get("center"), dtype=np.float64)
+    if ac.shape != (3,) or mc.shape != (3,):
+        return {"score": 0.0, "center_distance_m": None, "span_ratio": None}
+    center_distance = float(np.linalg.norm(ac - mc))
+    model_diag = max(float(model_bounds.get("diagonal_m") or 0.0), 1e-6)
+    aligned_diag = max(float(aligned_bounds.get("diagonal_m") or 0.0), 1e-6)
+    center_score = float(np.exp(-center_distance / model_diag))
+    span_ratio = aligned_diag / model_diag
+    span_score = float(np.exp(-abs(np.log(max(span_ratio, 1e-6)))))
+    score = float(0.65 * center_score + 0.35 * span_score)
+    return {
+        "score": round(score, 4),
+        "center_distance_m": center_distance,
+        "span_ratio": span_ratio,
+    }
+
+
+def _candidate_from_alignment(
+    *,
+    candidate_id: str,
+    source: str,
+    alignment: dict,
+    scan_bounds: dict | None,
+    model_bounds: dict | None,
+    reason: str,
+    upload_id: str | None = None,
+    generated_at: str | None = None,
+    can_save: bool = False,
+) -> dict:
+    aligned_bounds = None
+    if scan_bounds:
+        corners = _bounds_corners(scan_bounds)
+        if corners.size:
+            aligned_bounds = _bounds_summary_from_points(_apply_sim3(corners, alignment))
+    score_info = _bounds_alignment_score(aligned_bounds, model_bounds)
+    quality = alignment.get("quality")
+    base_score = float(score_info.get("score") or 0.0)
+    if quality == "green":
+        base_score = max(base_score, 0.78)
+    elif quality == "yellow":
+        base_score = max(base_score, 0.62)
+    confidence = "high" if base_score >= 0.78 and quality == "green" else "medium" if base_score >= 0.55 else "low"
+    return {
+        "id": candidate_id,
+        "source": source,
+        "upload_id": upload_id,
+        "generated_at": generated_at,
+        "quality": quality,
+        "score": round(base_score, 4),
+        "confidence": confidence,
+        "can_save": can_save,
+        "requires_user_approval": source != "manual_pairs_preview",
+        "reason": reason,
+        "alignment": {
+            k: alignment.get(k)
+            for k in (
+                "quality",
+                "stable",
+                "rmse_m",
+                "max_leave_one_out_rmse_m",
+                "correspondence_spread",
+                "scale",
+                "rotation",
+                "translation",
+                "n",
+                "per_point_residuals",
+                "pairs",
+            )
+            if k in alignment
+        },
+        "aligned_scan_bounds": aligned_bounds,
+        "center_distance_m": score_info.get("center_distance_m"),
+        "span_ratio": score_info.get("span_ratio"),
+    }
+
+
+def _previous_alignment_candidates(
+    model_id: str,
+    current_upload_id: str,
+    scan_bounds: dict | None,
+    model_bounds: dict | None,
+    *,
+    limit: int = 5,
+) -> list[dict]:
+    paths = set(UPLOAD_DIR.glob(f"upload_*.{model_id}.alignment.json"))
+    paths.update(UPLOAD_DIR.glob("upload_*.alignment.json"))
+    items = []
+    for path in sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            doc = _read_json(path)
+        except Exception:
+            continue
+        if not isinstance(doc, dict) or _json_model_id(doc) != model_id:
+            continue
+        upload_id = str(doc.get("upload_id") or path.name.split(".", 1)[0])
+        if upload_id == current_upload_id:
+            continue
+        alignment = doc.get("alignment") if isinstance(doc.get("alignment"), dict) else None
+        if not alignment or alignment.get("quality") not in ("green", "yellow"):
+            continue
+        candidate = _candidate_from_alignment(
+            candidate_id=f"previous:{upload_id}",
+            source="previous_upload_alignment",
+            upload_id=upload_id,
+            generated_at=doc.get("generated_at"),
+            alignment=alignment,
+            scan_bounds=scan_bounds,
+            model_bounds=model_bounds,
+            reason="validated alignment from another upload on the same model; use only as a prior and confirm with anchors",
+            can_save=False,
+        )
+        items.append(candidate)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _model_surface_samples(objects: list[dict]) -> np.ndarray:
+    pts = []
+    for obj in objects:
+        samples, _ts = _object_samples(obj)
+        if samples.size:
+            pts.append(samples)
+    if not pts:
+        return np.empty((0, 3), dtype=np.float64)
+    return np.vstack(pts)
+
+
+def _corroborate_alignment(
+    scan_points: np.ndarray,
+    model_tree,
+    alignment: dict,
+    *,
+    inlier_m: float = 0.30,
+    max_points: int = 40_000,
+) -> dict:
+    """Score a candidate transform by NN distance of aligned scan points to model samples.
+    Verification only: never mutates the transform."""
+    if scan_points.size == 0 or model_tree is None:
+        return {"ok": False, "reason": "no scan points or model samples"}
+    pts = scan_points
+    if len(pts) > max_points:
+        idx = np.linspace(0, len(pts) - 1, max_points).astype(int)
+        pts = pts[idx]
+    aligned = _apply_sim3(pts, alignment)
+    d, _ = model_tree.query(aligned, k=1, workers=-1)
+    return {
+        "ok": True,
+        "n_points": int(len(pts)),
+        "median_nn_m": round(float(np.median(d)), 4),
+        "inlier_ratio": round(float((d <= inlier_m).mean()), 4),
+        "inlier_threshold_m": inlier_m,
+    }
+
+
+def _icp_refine_alignment(
+    scan_points: np.ndarray,
+    model_samples: np.ndarray,
+    model_tree,
+    alignment: dict,
+    *,
+    trim_m: float = 0.5,
+    max_points: int = 20_000,
+) -> dict | None:
+    """Refine a prior Sim(3) with rigid ICP against model surface samples (scale frozen).
+    Clutter is trimmed by keeping only seeded points within trim_m of the model."""
+    from registration import icp_refine_rigid
+    if scan_points.size == 0 or model_samples.size == 0 or model_tree is None:
+        return None
+    pts = scan_points
+    if len(pts) > max_points:
+        idx = np.linspace(0, len(pts) - 1, max_points).astype(int)
+        pts = pts[idx]
+    seeded = _apply_sim3(pts, alignment)
+    d, _ = model_tree.query(seeded, k=1, workers=-1)
+    near = seeded[d <= trim_m]
+    if len(near) < 300:
+        return None
+    R_i, t_i, _icp_rmse = icp_refine_rigid(near.astype(np.float64), model_samples.astype(np.float64))
+    R_i = np.asarray(R_i, dtype=np.float64)
+    t_i = np.asarray(t_i, dtype=np.float64)
+    R0 = np.asarray(alignment.get("rotation", np.eye(3)), dtype=np.float64)
+    t0 = np.asarray(alignment.get("translation", [0, 0, 0]), dtype=np.float64)
+    refined = dict(alignment)
+    refined["rotation"] = (R_i @ R0).tolist()
+    refined["translation"] = (R_i @ t0 + t_i).tolist()
+    refined["note"] = "icp_refined_from_prior"
+    return refined
+
+
+def _auto_place_candidates(
+    upload_id: str,
+    model_objects: list[dict],
+    *,
+    scale: float = 1.0,
+    start_hint: list | None = None,
+    max_candidates: int = 3,
+) -> tuple[list[dict], list[str]]:
+    """중력 정렬(+metric scale) 기하 탐색으로 scan->model 배치 가설을 만든다.
+    자동이 원칙이며, start_hint(모델 좌표 1점)는 탐색 범위를 좁히는 보조 수단이다.
+    결과는 가설 후보(quality yellow/red)로, 명시적 저장 전에는 정합이 아니다."""
+    warnings: list[str] = []
+    scan_path = _select_scan_payload(upload_id, "detail")
+    if scan_path is None:
+        return [], ["scan payload not found"]
+    scan = _parse_scan_payload(scan_path, include_points=True, max_points=120_000)
+    pts_raw = np.asarray(scan.get("points") or [], dtype=np.float64)
+    poses = scan.get("poses") or []
+    if pts_raw.size == 0 or len(poses) < 5:
+        return [], ["auto placement needs scan points and >=5 camera poses"]
+    pts = _viewer_points(pts_raw)
+    sub = pts[np.linspace(0, len(pts) - 1, min(6000, len(pts))).astype(int)]
+
+    ups = []
+    for p in poses:
+        R, _t = _viewer_pose(p)
+        ups.append(R @ np.array([0.0, 1.0, 0.0]))
+    g = np.mean(ups, axis=0)
+    gn = float(np.linalg.norm(g))
+    if gn < 1e-6:
+        return [], ["camera up axis unstable; cannot gravity-align"]
+    g /= gn
+    z = np.array([0.0, 0.0, 1.0])
+    v = np.cross(g, z)
+    c = float(g @ z)
+    if np.linalg.norm(v) < 1e-8:
+        R0 = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+    else:
+        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+        R0 = np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
+
+    samples = _model_surface_samples(model_objects)
+    if samples.size == 0:
+        return [], ["model has no geometry samples"]
+    from scipy.spatial import cKDTree
+    tree = cKDTree(samples)
+    scan_c = sub.mean(0)
+
+    def rz(deg: float) -> np.ndarray:
+        r = np.deg2rad(deg)
+        cs, sn = np.cos(r), np.sin(r)
+        return np.array([[cs, -sn, 0], [sn, cs, 0], [0, 0, 1]])
+
+    centers: list[np.ndarray] = []
+    if start_hint is not None and len(start_hint) == 3:
+        hx, hy, hz = (float(x) for x in start_hint)
+        for dx in (-1.5, 0.0, 1.5):
+            for dy in (-1.5, 0.0, 1.5):
+                centers.append(np.array([hx + dx, hy + dy, hz]))
+    else:
+        centers_z = np.asarray([o["center"][2] for o in model_objects if o.get("center")], dtype=np.float64)
+        if centers_z.size:
+            hist, edges = np.histogram(centers_z, bins=24)
+            zmode = float((edges[hist.argmax()] + edges[hist.argmax() + 1]) * 0.5)
+        else:
+            zs_all = samples[:, 2]
+            hist, edges = np.histogram(zs_all, bins=24)
+            zmode = float((edges[hist.argmax()] + edges[hist.argmax() + 1]) * 0.5)
+        band = samples[np.abs(samples[:, 2] - zmode) < 2.5]
+        if band.size == 0:
+            band = samples
+        xq = [float(np.quantile(band[:, 0], q)) for q in (0.15, 0.35, 0.5, 0.65, 0.85)]
+        yq = [float(np.quantile(band[:, 1], q)) for q in (0.1, 0.3, 0.5, 0.7, 0.9)]
+        for zc in (zmode - 1.0, zmode, zmode + 1.0):
+            for cx in xq:
+                for cy in yq:
+                    centers.append(np.array([cx, cy, zc]))
+
+    scored: list[tuple[dict, dict, int]] = []
+    for cgrid in centers:
+        for a in range(0, 360, 20):
+            R = rz(a) @ R0
+            t = cgrid - scale * (R @ scan_c)
+            al = {"scale": scale, "rotation": R.tolist(), "translation": t.tolist()}
+            sc = _corroborate_alignment(sub, tree, al, max_points=3000)
+            if sc.get("ok"):
+                scored.append((sc, al, a))
+    if not scored:
+        return [], ["auto placement search produced no candidates"]
+    scored.sort(key=lambda x: x[0]["median_nn_m"])
+
+    picked: list[tuple[dict, dict, int]] = []
+    for sc, al, a in scored:
+        distinct = True
+        for _sc2, al2, a2 in picked:
+            dt = float(np.linalg.norm(np.asarray(al["translation"]) - np.asarray(al2["translation"])))
+            da = min(abs(a - a2), 360 - abs(a - a2))
+            if dt < 2.0 and da < 30:
+                distinct = False
+                break
+        if distinct:
+            picked.append((sc, al, a))
+        if len(picked) >= max_candidates:
+            break
+
+    out: list[dict] = []
+    for rank, (sc, al, _a) in enumerate(picked):
+        cur = sc
+        for _ in range(3):
+            improved = False
+            for d in ([0.4, 0, 0], [-0.4, 0, 0], [0, 0.4, 0], [0, -0.4, 0], [0, 0, 0.25], [0, 0, -0.25]):
+                a2 = dict(al)
+                a2["translation"] = (np.asarray(al["translation"]) + d).tolist()
+                s2 = _corroborate_alignment(sub, tree, a2, max_points=3000)
+                if s2["median_nn_m"] < cur["median_nn_m"]:
+                    al, cur, improved = a2, s2, True
+            if not improved:
+                break
+        final = _corroborate_alignment(sub, tree, al, max_points=20_000)
+        quality = "yellow" if (final.get("median_nn_m", 9e9) <= 0.50 and final.get("inlier_ratio", 0.0) >= 0.20) else "red"
+        alignment = {
+            "quality": quality,
+            "stable": False,
+            "rmse_m": None,
+            "scale": scale,
+            "rotation": al["rotation"],
+            "translation": al["translation"],
+            "n": 0,
+            "note": "auto_geometric_gravity_aligned",
+            "pairs": [],
+        }
+        cand = _candidate_from_alignment(
+            candidate_id=f"auto:{rank}",
+            source="auto_geometric",
+            alignment=alignment,
+            scan_bounds=None,
+            model_bounds=None,
+            reason="gravity-aligned geometric hypothesis; preview and save explicitly",
+            can_save=quality != "red",
+        )
+        cand["corroboration"] = final
+        cand["corroborated"] = quality != "red"
+        cand["score"] = round(max(0.0, 1.0 - float(final.get("median_nn_m", 1.0))), 4)
+        out.append(cand)
+    if len(out) >= 2:
+        m0 = out[0]["corroboration"]["median_nn_m"]
+        m1 = out[1]["corroboration"]["median_nn_m"]
+        if abs(m0 - m1) < 0.05:
+            warnings.append("auto placement ambiguous: multiple locations score similarly; add a start hint or a correspondence pair")
+    return out, warnings
+
+
+def _infer_image_size(K: np.ndarray) -> tuple[float, float]:
+    cx = float(K[0, 2]) if K.shape == (3, 3) else 0.0
+    cy = float(K[1, 2]) if K.shape == (3, 3) else 0.0
+    return max(1.0, cx * 2.0), max(1.0, cy * 2.0)
+
+
+def _visible_frames_for_samples(
+    samples: np.ndarray,
+    camera_states: list[tuple[np.ndarray, np.ndarray]],
+    K: np.ndarray | None,
+    *,
+    max_depth_m: float = 15.0,
+    margin_px: float = 32.0,
+) -> list[int]:
+    if samples.size == 0 or not camera_states or K is None or K.shape != (3, 3):
+        return []
+    fx = float(K[0, 0])
+    fy = float(K[1, 1])
+    cx = float(K[0, 2])
+    cy = float(K[1, 2])
+    if fx <= 0 or fy <= 0:
+        return []
+    width, height = _infer_image_size(K)
+    frames: list[int] = []
+    for frame_idx, (R, t) in enumerate(camera_states):
+        # R is camera-local to model-world. For row vectors, local = world_delta @ R.
+        local = (samples - t[None, :]) @ R
+        depth = -local[:, 2]
+        in_depth = (depth > 0.05) & (depth <= max_depth_m)
+        if not np.any(in_depth):
+            continue
+        u = fx * (local[:, 0] / np.maximum(depth, 1e-9)) + cx
+        v = fy * (local[:, 1] / np.maximum(depth, 1e-9)) + cy
+        in_frame = (
+            in_depth
+            & (u >= -margin_px)
+            & (u <= width + margin_px)
+            & (v >= -margin_px)
+            & (v <= height + margin_px)
+        )
+        if np.any(in_frame):
+            frames.append(frame_idx)
+    return frames
+
+
+def _nearest_camera_frames_for_points(
+    points: np.ndarray,
+    camera_states: list[tuple[np.ndarray, np.ndarray]],
+    *,
+    max_frames: int = 12,
+) -> list[int]:
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.size == 0 or not camera_states:
+        return []
+    pts = np.atleast_2d(pts)
+    centers = np.asarray([t for _R, t in camera_states], dtype=np.float64)
+    if centers.size == 0:
+        return []
+    dists = np.linalg.norm(pts[:, None, :] - centers[None, :, :], axis=2)
+    nearest = dists.argmin(axis=1)
+    unique, counts = np.unique(nearest, return_counts=True)
+    order = np.argsort(-counts)
+    selected = unique[order][:max(1, int(max_frames))]
+    return sorted(int(x) for x in selected.tolist())
+
+
+def _object_samples(obj: dict, n_linear: int = 24) -> tuple[np.ndarray, np.ndarray]:
+    """Return sample points and [0..1] linear parameters for segment coverage."""
+    if obj.get("start") is not None and obj.get("end") is not None:
+        start = np.asarray(obj["start"], dtype=np.float64)
+        end = np.asarray(obj["end"], dtype=np.float64)
+        ts = np.linspace(0.0, 1.0, n_linear)
+        pts = (1 - ts[:, None]) * start[None, :] + ts[:, None] * end[None, :]
+        return pts, ts
+    pts = []
+    if obj.get("center") is not None:
+        pts.append(obj["center"])
+    if obj.get("bbox") is not None:
+        mn = np.asarray(obj["bbox"][0], dtype=np.float64)
+        mx = np.asarray(obj["bbox"][1], dtype=np.float64)
+        pts.extend([
+            mn, mx,
+            [mn[0], mn[1], mx[2]], [mn[0], mx[1], mn[2]], [mx[0], mn[1], mn[2]],
+            [mn[0], mx[1], mx[2]], [mx[0], mn[1], mx[2]], [mx[0], mx[1], mn[2]],
+            ((mn + mx) * 0.5).tolist(),
+        ])
+    if not pts:
+        pts.append([0, 0, 0])
+    arr = np.asarray(pts, dtype=np.float64)
+    return arr, np.zeros(arr.shape[0], dtype=np.float64)
+
+
+def _linear_hit_metrics(ts: np.ndarray, hit: np.ndarray, *, bins: int = 8) -> dict:
+    params = np.asarray(ts, dtype=np.float64)
+    hits = np.asarray(hit, dtype=bool)
+    if params.size == 0 or hits.size == 0:
+        return {
+            "sample_count": 0,
+            "hit_sample_count": 0,
+            "coverage_ratio": 0.0,
+            "segment_coverage_ratio": 0.0,
+            "geometry_consistency": 0.0,
+            "segment_hit_bins": 0,
+            "segment_total_bins": int(bins),
+            "linear_hit_span_ratio": 0.0,
+            "linear_longest_gap_ratio": 1.0,
+        }
+    bins = max(1, int(bins))
+    sample_count = int(hits.size)
+    hit_count = int(hits.sum())
+    coverage = float(hit_count / max(sample_count, 1))
+    if hit_count == 0:
+        return {
+            "sample_count": sample_count,
+            "hit_sample_count": 0,
+            "coverage_ratio": coverage,
+            "segment_coverage_ratio": 0.0,
+            "geometry_consistency": 0.0,
+            "segment_hit_bins": 0,
+            "segment_total_bins": bins,
+            "linear_hit_span_ratio": 0.0,
+            "linear_longest_gap_ratio": 1.0,
+        }
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    bin_ids = np.clip(np.digitize(params, edges[1:-1], right=False), 0, bins - 1)
+    hit_bins = np.unique(bin_ids[hits])
+    segment_coverage = float(hit_bins.size / bins)
+    hit_params = np.sort(np.clip(params[hits], 0.0, 1.0))
+    hit_span = float(hit_params[-1] - hit_params[0]) if hit_params.size >= 2 else 0.0
+    gaps = np.diff(np.concatenate(([0.0], hit_params, [1.0])))
+    longest_gap = float(gaps.max()) if gaps.size else 1.0
+    # A long linear object should have evidence distributed along its length;
+    # a dense cluster on one end should not look geometrically complete.
+    geometry_consistency = float(min(coverage, segment_coverage))
+    return {
+        "sample_count": sample_count,
+        "hit_sample_count": hit_count,
+        "coverage_ratio": coverage,
+        "segment_coverage_ratio": segment_coverage,
+        "geometry_consistency": geometry_consistency,
+        "segment_hit_bins": int(hit_bins.size),
+        "segment_total_bins": bins,
+        "linear_hit_span_ratio": hit_span,
+        "linear_longest_gap_ratio": longest_gap,
+    }
+
+
+def _correspondence_spread(points: np.ndarray) -> dict:
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.size == 0:
+        return {"extent_m": 0.0, "rms_radius_m": 0.0, "rank": 0, "singular_values": []}
+    centered = pts - pts.mean(axis=0)
+    extent = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+    rms = float(np.sqrt((centered ** 2).sum(axis=1).mean())) if pts.shape[0] else 0.0
+    if pts.shape[0] >= 2:
+        singular = np.linalg.svd(centered, compute_uv=False)
+        rel = singular / max(float(singular[0]), 1e-9)
+        rank = int((rel > 0.08).sum())
+    else:
+        singular = np.zeros(0, dtype=np.float64)
+        rank = 0
+    return {
+        "extent_m": extent,
+        "rms_radius_m": rms,
+        "rank": rank,
+        "singular_values": singular.astype(float).tolist(),
+    }
+
+
+def _solve_scan_to_model_alignment(pairs: list[dict]) -> dict:
+    if len(pairs) < 4:
+        return {
+            "quality": "red",
+            "stable": False,
+            "rmse_m": None,
+            "scale": 1.0,
+            "rotation": np.eye(3).tolist(),
+            "translation": [0, 0, 0],
+            "n": len(pairs),
+            "note": "need >=4 correspondences; using identity for preview",
+        }
+    from lingbot_map.bim.alignment import solve_sim3_umeyama
+    src = np.asarray([p["scan"] for p in pairs], dtype=np.float64)
+    dst = np.asarray([p["model"] for p in pairs], dtype=np.float64)
+    src_spread = _correspondence_spread(src)
+    dst_spread = _correspondence_spread(dst)
+    spread_ok = (
+        src_spread["extent_m"] >= 0.15
+        and dst_spread["extent_m"] >= 0.50
+        and src_spread["rank"] >= 2
+        and dst_spread["rank"] >= 2
+    )
+    result = solve_sim3_umeyama(src, dst, rmse_green=0.10, rmse_yellow=0.25)
+    loo_errors = []
+    if len(pairs) >= 5:
+        for i in range(len(pairs)):
+            keep = [j for j in range(len(pairs)) if j != i]
+            r = solve_sim3_umeyama(src[keep], dst[keep], rmse_green=0.10, rmse_yellow=0.25)
+            pred = r.transform.apply(src[i])
+            loo_errors.append(float(np.linalg.norm(pred - dst[i])))
+    max_loo = max(loo_errors) if loo_errors else float(result.rmse)
+    quality = "red" if result.quality == "review" else result.quality
+    stable = bool(max_loo <= max(0.25, float(result.rmse) * 2.5))
+    if not stable and quality == "green":
+        quality = "yellow"
+    if not stable and quality == "yellow":
+        quality = "red"
+    spread_note = None
+    if not spread_ok:
+        quality = "red"
+        stable = False
+        spread_note = "correspondence points are too clustered or near-collinear; distribute points across the scan/model area"
+    return {
+        "quality": quality,
+        "stable": stable,
+        "rmse_m": float(result.rmse),
+        "max_leave_one_out_rmse_m": max_loo,
+        "correspondence_spread": {
+            "ok": spread_ok,
+            "scan": src_spread,
+            "model": dst_spread,
+            "note": spread_note,
+        },
+        "scale": float(result.transform.scale),
+        "rotation": result.transform.rotation.tolist(),
+        "translation": result.transform.translation.tolist(),
+        "n": int(result.n_correspondences),
+        "per_point_residuals": result.per_point_residuals.tolist(),
+    }
+
+
+def _normalize_alignment_pairs(raw_pairs) -> list[dict]:
+    if raw_pairs is None:
+        return []
+    if not isinstance(raw_pairs, list):
+        raise ValueError("alignment.pairs must be a list")
+    pairs = []
+    for i, pair in enumerate(raw_pairs):
+        if not isinstance(pair, dict):
+            raise ValueError(f"alignment pair #{i + 1} must be an object")
+        scan = pair.get("scan")
+        model = pair.get("model")
+        if not isinstance(scan, list) or not isinstance(model, list) or len(scan) != 3 or len(model) != 3:
+            raise ValueError(f"alignment pair #{i + 1} needs scan/model 3D coordinates")
+        try:
+            scan_v = [float(x) for x in scan]
+            model_v = [float(x) for x in model]
+        except Exception as e:
+            raise ValueError(f"alignment pair #{i + 1} contains non-numeric coordinates") from e
+        if not np.isfinite(scan_v).all() or not np.isfinite(model_v).all():
+            raise ValueError(f"alignment pair #{i + 1} contains non-finite coordinates")
+        pairs.append({"scan": scan_v, "model": model_v})
+    return pairs
+
+
+@app.get("/api/uploads/{upload_id}/coverage")
+async def get_coverage(upload_id: str, model_id: str | None = None):
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    doc = _load_scoped_upload_json(upload_id, "coverage", model_id)
+    if doc is None:
+        return JSONResponse({"ok": False, "status": "needs_analysis", "error": "coverage not found"}, status_code=404)
+    alignment = doc.get("alignment") if isinstance(doc, dict) else None
+    if isinstance(alignment, dict) and alignment.get("quality") == "red":
+        return JSONResponse(
+            {
+                "ok": False,
+                "status": "needs_alignment",
+                "error": "coverage was generated with red alignment and must be regenerated after valid correspondence alignment",
+                "alignment": alignment,
+            },
+            status_code=409,
+        )
+    return JSONResponse(doc, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/uploads/{upload_id}/alignment")
+async def get_alignment(upload_id: str, model_id: str | None = None):
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    doc = _load_scoped_upload_json(upload_id, "alignment", model_id)
+    if doc is None:
+        return JSONResponse({"ok": False, "status": "needs_alignment", "error": "alignment not found"}, status_code=404)
+    return JSONResponse(doc, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/uploads/{upload_id}/alignment/candidates")
+async def get_alignment_candidates(upload_id: str, model_id: str | None = None):
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    doc = _load_scoped_upload_json(upload_id, "alignment_candidates", model_id or _default_model_id())
+    if doc is None:
+        return JSONResponse(
+            {"ok": False, "status": "missing", "error": "alignment candidates not found"},
+            status_code=404,
+        )
+    return JSONResponse(doc, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/uploads/{upload_id}/alignment/candidates")
+async def alignment_candidates(upload_id: str, payload: dict):
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    model_id = payload.get("model_id") or _default_model_id()
+    if model_id not in _model_registry():
+        return JSONResponse({"ok": False, "error": "unknown model_id"}, status_code=404)
+    dry_run = bool(payload.get("dry_run"))
+    try:
+        input_pairs = _normalize_alignment_pairs((payload.get("alignment") or {}).get("pairs", []))
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+    try:
+        manifest = _model_manifest(model_id)
+        if not manifest.get("manifest_valid"):
+            return JSONResponse(
+                {"ok": False, "status": "model_manifest_invalid", "error": "model manifest invalid", "model": manifest},
+                status_code=409,
+            )
+        _manifest, model_objects = _load_model_objects(model_id)
+        model_bounds = _model_object_bounds(model_objects)
+        repetition = _model_repetition_risk(model_objects)
+        scan_path = _select_scan_payload(upload_id, payload.get("variant") or "detail")
+        if scan_path is None:
+            return JSONResponse({"ok": False, "status": "needs_scan", "error": "scan payload not found"}, status_code=404)
+        scan = _parse_scan_payload(scan_path, include_points=False)
+        scan_bounds = _scan_viewer_bounds(scan)
+        descriptor = _pose_descriptor(scan.get("poses") or [])
+        candidates: list[dict] = []
+        warnings: list[str] = []
+
+        if len(input_pairs) >= 4:
+            alignment = _solve_scan_to_model_alignment(input_pairs)
+            alignment["pairs"] = input_pairs
+            candidates.append(_candidate_from_alignment(
+                candidate_id="manual:pairs",
+                source="manual_pairs_preview",
+                alignment=alignment,
+                scan_bounds=scan_bounds,
+                model_bounds=model_bounds,
+                reason="current correspondence pairs solve scan-to-model Sim(3); save alignment before coverage analysis",
+                can_save=alignment.get("quality") in ("green", "yellow"),
+            ))
+            status = "auto_alignment_candidate" if alignment.get("quality") in ("green", "yellow") else "needs_alignment"
+            next_action = "save_alignment" if alignment.get("quality") in ("green", "yellow") else "add_better_alignment_pairs"
+        else:
+            if len(input_pairs) == 0:
+                warnings.append("no anchor pairs provided; video-only global localization is intentionally not auto-accepted")
+            else:
+                warnings.append("1-3 anchor pairs are useful priors but not enough to solve a stable Sim(3) alignment")
+            if payload.get("auto_place"):
+                auto_cands, auto_warnings = _auto_place_candidates(
+                    upload_id,
+                    model_objects,
+                    scale=float(payload.get("scale") or 1.0),
+                    start_hint=payload.get("start_hint"),
+                    max_candidates=int(payload.get("max_candidates") or 3),
+                )
+                candidates.extend(auto_cands)
+                warnings.extend(auto_warnings)
+            candidates.extend(_previous_alignment_candidates(
+                model_id,
+                upload_id,
+                scan_bounds,
+                model_bounds,
+                limit=int(payload.get("max_candidates") or 5),
+            ))
+            # Option B (FR-A4/A3): corroborate prior candidates against scan geometry,
+            # ICP-refine when it improves, and promote can_save under strict gates.
+            if candidates:
+                scan_pts = None
+                try:
+                    scan_full = _parse_scan_payload(scan_path, include_points=True, max_points=150_000)
+                    raw_pts = np.asarray(scan_full.get("points") or [], dtype=np.float64)
+                    if raw_pts.size:
+                        scan_pts = _viewer_points(raw_pts)
+                except Exception as e:
+                    log.warning("candidate corroboration scan load failed: %s", e)
+                model_tree = None
+                model_samples = np.empty((0, 3))
+                if scan_pts is not None and scan_pts.size:
+                    model_samples = _model_surface_samples(model_objects)
+                    try:
+                        from scipy.spatial import cKDTree
+                        model_tree = cKDTree(model_samples) if model_samples.size else None
+                    except Exception:
+                        model_tree = None
+                anchor_src = np.asarray([p["scan"] for p in input_pairs], dtype=np.float64) if input_pairs else None
+                anchor_dst = np.asarray([p["model"] for p in input_pairs], dtype=np.float64) if input_pairs else None
+                for cand in candidates:
+                    if cand.get("source") == "auto_geometric":
+                        continue  # 자동 배치 후보는 _auto_place_candidates에서 이미 검증됨
+                    cal = cand.get("alignment") or {}
+                    if model_tree is None:
+                        continue
+                    score = _corroborate_alignment(scan_pts, model_tree, cal)
+                    if score.get("ok"):
+                        refined = _icp_refine_alignment(scan_pts, model_samples, model_tree, cal)
+                        if refined is not None:
+                            r_score = _corroborate_alignment(scan_pts, model_tree, refined)
+                            if r_score.get("ok") and r_score["median_nn_m"] < score["median_nn_m"]:
+                                cal = {**cal, "rotation": refined["rotation"], "translation": refined["translation"], "note": refined["note"]}
+                                cand["alignment"] = cal
+                                cand["icp_refined"] = True
+                                score = r_score
+                    cand["corroboration"] = score
+                    corroborated = (
+                        bool(score.get("ok"))
+                        and score.get("median_nn_m", 1e9) <= 0.20
+                        and score.get("inlier_ratio", 0.0) >= 0.35
+                    )
+                    cand["corroborated"] = corroborated
+                    anchor_ok = False
+                    if anchor_src is not None and len(anchor_src):
+                        pred = _apply_sim3(anchor_src, cal)
+                        res = np.linalg.norm(pred - anchor_dst, axis=1)
+                        cand["anchor_residuals_m"] = [round(float(x), 4) for x in res]
+                        anchor_ok = bool(np.all(res <= 0.30))
+                    # repeated-geometry models (high risk) still require at least one anchor
+                    if corroborated and (anchor_ok or repetition["level"] != "high"):
+                        cand["can_save"] = True
+                        cand["reason"] = "prior alignment corroborated by scan geometry" + (" + anchors" if anchor_ok else "")
+                saveable = [c for c in candidates if c.get("can_save")]
+                if saveable:
+                    status = "auto_alignment_candidate"
+                    next_action = "save_candidate_alignment"
+                    warnings.append("corroborated candidate available; explicit save still required")
+                else:
+                    top_score = candidates[0]["score"]
+                    close = [c for c in candidates if top_score - c["score"] <= 0.15]
+                    status = "ambiguous_alignment" if len(close) > 1 or repetition["level"] == "high" else "auto_alignment_candidate"
+                    next_action = "add_anchor_pair_or_confirm_candidate"
+                    warnings.append("candidate alignments are preview-only until confirmed by user anchors")
+            else:
+                status = "needs_anchor"
+                next_action = "add_anchor_pair"
+        if repetition["level"] in ("high", "medium"):
+            warnings.append("model contains repeated object groups; ambiguous candidates must not be auto-applied")
+
+        doc = {
+            "ok": True,
+            "status": status,
+            "next_action": next_action,
+            "upload_id": upload_id,
+            "model_id": model_id,
+            "model": {
+                "model_id": manifest.get("model_id"),
+                "name": manifest.get("name"),
+                "manifest_valid": manifest.get("manifest_valid"),
+                "guid_mapping_ratio": manifest.get("guid_mapping_ratio"),
+            },
+            "scan": {
+                "payload": scan_path.name,
+                "magic": scan.get("magic"),
+                "point_count": scan.get("count"),
+                "pose_count": len(scan.get("poses") or []),
+                "bounds": scan_bounds,
+                "trajectory": descriptor,
+            },
+            "repetition_risk": repetition,
+            "anchor_count": len(input_pairs),
+            "candidates": sorted(candidates, key=lambda c: c.get("score", 0.0), reverse=True),
+            "warnings": warnings,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "dry_run": dry_run,
+        }
+        if not dry_run:
+            (UPLOAD_DIR / f"{upload_id}.{model_id}.alignment_candidates.json").write_text(
+                json.dumps(doc, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return doc
+    except Exception as e:
+        log.exception("alignment candidate generation failed: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/uploads/{upload_id}/coverage/status")
+async def coverage_status(upload_id: str, model_id: str | None = None):
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    model_id = model_id or _default_model_id()
+    if model_id not in _model_registry():
+        return JSONResponse({"ok": False, "error": "unknown model_id"}, status_code=404)
+    warnings: list[str] = []
+    try:
+        model = _model_manifest(model_id)
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "status": "model_manifest_invalid", "error": str(e), "model_id": model_id},
+            status_code=409,
+        )
+    if model.get("coverage_geometry_source") == "pag_proxy":
+        warnings.append("GLB GUID mapping is low; coverage coloring uses PAG proxy geometry and GLB is visual context only")
+    try:
+        _manifest, model_objects = _load_model_objects(model_id)
+        model_bounds = _model_object_bounds(model_objects)
+    except Exception as e:
+        model_bounds = None
+        warnings.append(f"model bounds unavailable: {e}")
+
+    payloads = _upload_payloads(upload_id)
+    scan_path = _select_scan_payload(upload_id)
+    scan_status: dict = {"ok": False, "payload": None}
+    scan_bounds = None
+    if scan_path is None:
+        warnings.append("scan payload not found")
+    else:
+        try:
+            scan = _parse_scan_payload(scan_path, include_points=False)
+            scan_bounds = _scan_viewer_bounds(scan)
+            thumbs = _load_upload_thumbs(upload_id, prefer_audit=True) or []
+            scan_status = {
+                "ok": True,
+                "payload": scan_path.name,
+                "magic": scan.get("magic"),
+                "point_count": scan.get("count"),
+                "pose_count": len(scan.get("poses") or []),
+                "thumb_count": len(thumbs),
+                "mesh_glb": (UPLOAD_DIR / f"{upload_id}.mesh.glb").exists(),
+                "has_source_ids": scan.get("magic") == "LBP4",
+            }
+            if not scan_status["mesh_glb"]:
+                warnings.append("scan GLB not found; point cloud can still be used for correspondence picking")
+            if not scan_status["has_source_ids"]:
+                warnings.append("scan source frame ids not available; coverage will use nearest camera pose fallback")
+            if not scan_status["thumb_count"]:
+                warnings.append("thumbnail sidecar not found")
+        except Exception as e:
+            warnings.append(f"scan parse failed: {e}")
+            scan_status = {"ok": False, "payload": scan_path.name, "error": str(e)}
+
+    alignment_doc = _load_scoped_upload_json(upload_id, "alignment", model_id)
+    alignment = alignment_doc.get("alignment") if isinstance(alignment_doc, dict) else None
+    if not alignment:
+        alignment_status = {"state": "missing", "quality": None, "ready": False}
+    else:
+        alignment_status = {
+            "state": "valid" if alignment.get("quality") in ("green", "yellow") else "invalid",
+            "quality": alignment.get("quality"),
+            "ready": alignment.get("quality") in ("green", "yellow"),
+            "n": alignment.get("n"),
+            "stable": alignment.get("stable"),
+            "rmse_m": alignment.get("rmse_m"),
+            "max_leave_one_out_rmse_m": alignment.get("max_leave_one_out_rmse_m"),
+            "spread_ok": (alignment.get("correspondence_spread") or {}).get("ok"),
+        }
+        if not alignment_status["ready"]:
+            warnings.append("valid scan-to-model alignment is required before coverage analysis")
+
+    aligned_scan_bounds = None
+    if alignment and alignment_status["ready"] and scan_bounds:
+        corners = _bounds_corners(scan_bounds)
+        if corners.size:
+            aligned_scan_bounds = _bounds_summary_from_points(_apply_sim3(corners, alignment))
+
+    coordinate_state = "aligned_model_world" if alignment_status["ready"] else "raw_scan_local"
+    coordinate_status = {
+        "state": coordinate_state,
+        "scan_space": "model_world" if alignment_status["ready"] else "lingbot_local_reconstruction",
+        "model_space": "bim_model_world",
+        "model_up_axis": "Z_UP",
+        "scene_up_axis": "Z_UP",
+        "scene_ground_plane": "XY",
+        "viewer_scan_axis": "x,-y,-z",
+        "raw_scan_bounds": scan_bounds,
+        "aligned_scan_bounds": aligned_scan_bounds,
+        "model_bounds": model_bounds,
+        "alignment_required": not alignment_status["ready"],
+        "diagnosis": (
+            "scan has been transformed into model coordinates"
+            if alignment_status["ready"]
+            else "raw scan and BIM model use different origins/axes until correspondence alignment is saved"
+        ),
+    }
+    if scan_status.get("ok") and not alignment_status["ready"]:
+        warnings.append("raw scan coordinates are local reconstruction; model/path overlay requires valid alignment")
+
+    coverage_doc = _load_scoped_upload_json(upload_id, "coverage", model_id)
+    coverage_alignment = coverage_doc.get("alignment") if isinstance(coverage_doc, dict) else None
+    if not coverage_doc:
+        coverage_state = "missing"
+        coverage_ready = False
+    elif isinstance(coverage_alignment, dict) and coverage_alignment.get("quality") == "red":
+        coverage_state = "stale_red_alignment"
+        coverage_ready = False
+        warnings.append("saved coverage was generated with red alignment and must be regenerated")
+    else:
+        coverage_state = "ready"
+        coverage_ready = True
+
+    candidates_doc = _load_scoped_upload_json(upload_id, "alignment_candidates", model_id)
+    if isinstance(candidates_doc, dict):
+        auto_alignment_status = {
+            "state": candidates_doc.get("status"),
+            "candidate_count": len(candidates_doc.get("candidates") or []),
+            "anchor_count": candidates_doc.get("anchor_count"),
+            "repetition_risk": (candidates_doc.get("repetition_risk") or {}).get("level"),
+            "generated_at": candidates_doc.get("generated_at"),
+        }
+    else:
+        auto_alignment_status = {
+            "state": "missing",
+            "candidate_count": 0,
+            "anchor_count": 0,
+            "repetition_risk": None,
+            "generated_at": None,
+        }
+    if auto_alignment_status.get("repetition_risk") == "high":
+        warnings.append("model has many repeated/similar objects; automatic video-to-model mapping requires user anchors")
+
+    if not model.get("manifest_valid"):
+        next_action = "fix_model_manifest"
+        overall = "model_manifest_invalid"
+    elif not scan_status.get("ok"):
+        next_action = "upload_or_process_video"
+        overall = "needs_scan"
+    elif not alignment_status["ready"]:
+        next_action = "add_alignment_pairs"
+        overall = "needs_alignment"
+    elif not coverage_ready:
+        next_action = "run_coverage_analysis"
+        overall = "needs_analysis"
+    else:
+        next_action = "review_coverage"
+        overall = "ready"
+
+    keyframe_dir = UPLOAD_DIR / f"{upload_id}.keyframes"
+    keyframe_count = len(list(keyframe_dir.glob("frame_*.jpg"))) if keyframe_dir.exists() else 0
+    checks = [
+        {
+            "id": "model_manifest",
+            "label": "모델 manifest",
+            "state": "pass" if model.get("manifest_valid") else "block",
+            "detail": "valid" if model.get("manifest_valid") else "invalid",
+        },
+        {
+            "id": "model_guid_mapping",
+            "label": "GUID/기준 형상",
+            "state": "pass" if model.get("coverage_geometry_source") in ("glb_guid_mesh", "hybrid_glb_proxy") else "warn",
+            "detail": (
+                "GLB GUID mesh"
+                if model.get("coverage_geometry_source") == "glb_guid_mesh"
+                else f"하이브리드: {model.get('guid_mapped_count', 0)}/{model.get('guid_total', 0)} GLB mesh + 나머지 proxy"
+                if model.get("coverage_geometry_source") == "hybrid_glb_proxy"
+                else "PAG proxy 기준; GLB는 시각 참고"
+            ),
+        },
+        {
+            "id": "scan_payload",
+            "label": "scan payload",
+            "state": "pass" if scan_status.get("ok") else "block",
+            "detail": (
+                f"{scan_status.get('magic')} · {scan_status.get('point_count', 0):,} pts"
+                if scan_status.get("ok") else "scan 없음"
+            ),
+        },
+        {
+            "id": "pose_thumbnails",
+            "label": "pose/thumb",
+            "state": "pass" if scan_status.get("pose_count") and scan_status.get("thumb_count") else "warn",
+            "detail": f"{scan_status.get('pose_count', 0)} / {scan_status.get('thumb_count', 0)}",
+        },
+        {
+            "id": "scan_overlay",
+            "label": "scan overlay",
+            "state": "pass" if scan_status.get("mesh_glb") else "warn",
+            "detail": "scan GLB 있음" if scan_status.get("mesh_glb") else "scan GLB 없음; RGB 점군으로 대응점 선택",
+        },
+        {
+            "id": "source_frames",
+            "label": "source frame",
+            "state": "pass" if scan_status.get("has_source_ids") else "warn",
+            "detail": "source_ids" if scan_status.get("has_source_ids") else "nearest pose fallback",
+        },
+        {
+            "id": "alignment",
+            "label": "scan-to-model 정합",
+            "state": "pass" if alignment_status["ready"] else "block",
+            "detail": (
+                f"{alignment_status.get('quality')} · rmse {alignment_status.get('rmse_m')}"
+                if alignment_status["ready"]
+                else "green/yellow 정합 필요"
+            ),
+        },
+        {
+            "id": "auto_mapping_risk",
+            "label": "자동 매핑 위험",
+            "state": "warn" if auto_alignment_status.get("repetition_risk") == "high" else "pass",
+            "detail": auto_alignment_status.get("repetition_risk") or "low/unknown",
+        },
+        {
+            "id": "coverage_result",
+            "label": "coverage 결과",
+            "state": (
+                "pass" if coverage_ready else
+                "block" if coverage_state == "stale_red_alignment" else
+                "pending"
+            ),
+            "detail": coverage_state,
+        },
+        {
+            "id": "keyframes",
+            "label": "evidence keyframe",
+            "state": "pass" if keyframe_count else "pending",
+            "detail": f"{keyframe_count} files" if keyframe_count else "필요 시 on-demand 생성",
+        },
+    ]
+
+    return {
+        "ok": True,
+        "status": overall,
+        "next_action": next_action,
+        "model": {
+            "model_id": model.get("model_id"),
+            "name": model.get("name"),
+            "manifest_valid": model.get("manifest_valid"),
+            "guid_mapping_ratio": model.get("guid_mapping_ratio"),
+            "guid_mapping_status": model.get("guid_mapping_status"),
+            "fallback_geometry_count": model.get("fallback_geometry_count"),
+            "coverage_geometry_source": model.get("coverage_geometry_source"),
+            "glb_role": model.get("glb_role"),
+        },
+        "upload": {
+            "id": upload_id,
+            "video": (_upload_video_path(upload_id) or Path("")).name or None,
+            "payloads": payloads,
+        },
+        "scan": scan_status,
+        "alignment": alignment_status,
+        "coordinate": coordinate_status,
+        "auto_alignment": auto_alignment_status,
+        "coverage": {
+            "state": coverage_state,
+            "ready": coverage_ready,
+            "status_counts": coverage_doc.get("status_counts") if isinstance(coverage_doc, dict) else None,
+            "generated_at": coverage_doc.get("generated_at") if isinstance(coverage_doc, dict) else None,
+        },
+        "checks": checks,
+        "warnings": warnings,
+    }
+
+
+@app.get("/api/uploads/{upload_id}/coverage/review")
+async def get_coverage_review(upload_id: str, model_id: str | None = None):
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    model_id = model_id or _default_model_id()
+    if model_id not in _model_registry():
+        return JSONResponse({"ok": False, "error": "unknown model_id"}, status_code=404)
+    return _load_coverage_review(upload_id, model_id)
+
+
+@app.post("/api/uploads/{upload_id}/coverage/review")
+async def save_coverage_review(upload_id: str, payload: dict):
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    model_id = payload.get("model_id") or _default_model_id()
+    if model_id not in _model_registry():
+        return JSONResponse({"ok": False, "error": "unknown model_id"}, status_code=404)
+    replace = bool(payload.get("replace"))
+    review = _empty_coverage_review(upload_id, model_id) if replace else _load_coverage_review(upload_id, model_id)
+
+    object_reviews = payload.get("object_reviews")
+    if isinstance(object_reviews, dict):
+        for guid, value in object_reviews.items():
+            key = str(guid)
+            if value is None:
+                review["object_reviews"].pop(key, None)
+                continue
+            entry = _sanitize_review_entry(value)
+            if entry:
+                review["object_reviews"][key] = entry
+
+    frame_reviews = payload.get("frame_reviews")
+    if isinstance(frame_reviews, dict):
+        for frame, value in frame_reviews.items():
+            try:
+                key = str(int(frame))
+            except (TypeError, ValueError):
+                continue
+            if value is None:
+                review["frame_reviews"].pop(key, None)
+                continue
+            entry = _sanitize_review_entry(value)
+            if entry:
+                review["frame_reviews"][key] = entry
+
+    if "notes" in payload:
+        review["notes"] = str(payload.get("notes") or "")[:2000]
+    review["ok"] = True
+    review["upload_id"] = upload_id
+    review["model_id"] = model_id
+    review["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    _coverage_review_path(upload_id, model_id).write_text(
+        json.dumps(review, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return review
+
+
+@app.get("/api/uploads/{upload_id}/coverage/report")
+async def coverage_quality_report(upload_id: str, model_id: str | None = None):
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    model_id = model_id or _default_model_id()
+    if model_id not in _model_registry():
+        return JSONResponse({"ok": False, "error": "unknown model_id"}, status_code=404)
+
+    blockers: list[dict] = []
+    warnings: list[dict] = []
+    try:
+        model = _model_manifest(model_id)
+        if not model.get("manifest_valid"):
+            blockers.append({"id": "model_manifest", "message": "model manifest is invalid"})
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "status": "model_manifest_invalid", "error": str(e), "model_id": model_id},
+            status_code=409,
+        )
+
+    coverage_doc = _load_scoped_upload_json(upload_id, "coverage", model_id)
+    alignment_doc = _load_scoped_upload_json(upload_id, "alignment", model_id)
+    coverage_alignment = coverage_doc.get("alignment") if isinstance(coverage_doc, dict) else None
+    saved_alignment = alignment_doc.get("alignment") if isinstance(alignment_doc, dict) else None
+    alignment = coverage_alignment if isinstance(coverage_alignment, dict) else saved_alignment
+
+    if not isinstance(coverage_doc, dict):
+        blockers.append({"id": "coverage_missing", "message": "coverage analysis result is missing"})
+        objects: list[dict] = []
+        status_counts: dict = {}
+    elif isinstance(coverage_alignment, dict) and coverage_alignment.get("quality") == "red":
+        blockers.append({"id": "stale_red_alignment", "message": "coverage was generated with red alignment"})
+        objects = coverage_doc.get("objects") or []
+        status_counts = coverage_doc.get("status_counts") or {}
+    else:
+        objects = coverage_doc.get("objects") or []
+        status_counts = coverage_doc.get("status_counts") or {}
+
+    alignment_ready = isinstance(alignment, dict) and alignment.get("quality") in ("green", "yellow")
+    if not alignment_ready:
+        blockers.append({"id": "alignment", "message": "green/yellow scan-to-model alignment is required"})
+
+    scan_path = _select_scan_payload(upload_id)
+    pose_count = 0
+    thumb_count = 0
+    if scan_path is None:
+        blockers.append({"id": "scan_payload", "message": "scan payload is missing"})
+    else:
+        try:
+            scan = _parse_scan_payload(scan_path, include_points=False)
+            pose_count = len(scan.get("poses") or [])
+            thumb_count = len(_load_upload_thumbs(upload_id, prefer_audit=True) or [])
+            if not pose_count or not thumb_count:
+                warnings.append({"id": "pose_thumb", "message": "pose/thumb data is incomplete"})
+        except Exception as e:
+            blockers.append({"id": "scan_payload", "message": f"scan parse failed: {e}"})
+
+    observed = [o for o in objects if o.get("status") == "observed"]
+    likely = [o for o in objects if o.get("status") == "likely_observed"]
+    uncertain = [o for o in objects if o.get("status") == "uncertain"]
+    observed_count = len(observed)
+    observed_with_evidence = sum(1 for o in observed if o.get("evidence_thumb_ids") or o.get("evidence_keyframes"))
+    observed_support_ge3 = sum(1 for o in observed if int(o.get("support_frame_count") or len(o.get("support_frames") or [])) >= 3)
+    observed_evidence_ratio = observed_with_evidence / observed_count if observed_count else 0.0
+    observed_support_ratio = observed_support_ge3 / observed_count if observed_count else 0.0
+    review_doc = _load_coverage_review(upload_id, model_id)
+    object_reviews = review_doc.get("object_reviews") if isinstance(review_doc.get("object_reviews"), dict) else {}
+    frame_reviews = review_doc.get("frame_reviews") if isinstance(review_doc.get("frame_reviews"), dict) else {}
+    observed_reviewed = 0
+    observed_review_accepted = 0
+    observed_review_rejected = 0
+    for obj in observed:
+        rec = object_reviews.get(str(obj.get("guid")))
+        if not isinstance(rec, dict) or rec.get("accepted") is None:
+            continue
+        observed_reviewed += 1
+        if rec.get("accepted") is True:
+            observed_review_accepted += 1
+        else:
+            observed_review_rejected += 1
+    observed_review_ratio = observed_review_accepted / observed_count if observed_count else 0.0
+    frame_reviewed = 0
+    frame_review_accepted = 0
+    frame_review_rejected = 0
+    for rec in frame_reviews.values():
+        if not isinstance(rec, dict) or rec.get("accepted") is None:
+            continue
+        frame_reviewed += 1
+        if rec.get("accepted") is True:
+            frame_review_accepted += 1
+        else:
+            frame_review_rejected += 1
+    frame_review_ratio = frame_review_accepted / frame_reviewed if frame_reviewed else 0.0
+
+    if isinstance(coverage_doc, dict) and not observed_count:
+        warnings.append({"id": "observed_empty", "message": "no observed object exists yet"})
+
+    automated_gate_passed = (
+        not blockers
+        and observed_count > 0
+        and observed_evidence_ratio >= 0.90
+        and observed_support_ratio >= 0.90
+    )
+    manual_gate_passed = (
+        automated_gate_passed
+        and observed_review_ratio >= 0.90
+        and frame_reviewed > 0
+        and frame_review_ratio >= 0.90
+    )
+    if blockers:
+        report_status = "blocked"
+    elif manual_gate_passed:
+        report_status = "ready_for_manual_review"
+    elif automated_gate_passed:
+        report_status = "ready_for_manual_review"
+    else:
+        report_status = "needs_evidence_review"
+
+    criteria = [
+        {
+            "id": "keyframe_location_90",
+            "label": "keyframe 위치 90%",
+            "state": "pass" if alignment_ready and pose_count else "block",
+            "metric": {"pose_count": pose_count, "thumb_count": thumb_count},
+            "detail": "정합된 경로/프레임을 모델 좌표에서 검수 가능" if alignment_ready else "정합 전에는 위치 90% 검수 불가",
+        },
+        {
+            "id": "observed_evidence_90",
+            "label": "observed evidence 90%",
+            "state": (
+                "pass" if observed_count and observed_evidence_ratio >= 0.90 else
+                "pending" if not observed_count else
+                "warn"
+            ),
+            "metric": {
+                "observed_count": observed_count,
+                "observed_with_evidence": observed_with_evidence,
+                "ratio": round(observed_evidence_ratio, 4),
+            },
+            "detail": "observed 객체 대부분이 evidence frame에 연결됨",
+        },
+        {
+            "id": "support_frames",
+            "label": "support frame",
+            "state": (
+                "pass" if observed_count and observed_support_ratio >= 0.90 else
+                "pending" if not observed_count else
+                "warn"
+            ),
+            "metric": {
+                "observed_count": observed_count,
+                "support_ge3": observed_support_ge3,
+                "ratio": round(observed_support_ratio, 4),
+            },
+            "detail": "observed 객체는 최소 3개 support frame 기준을 만족해야 함",
+        },
+        {
+            "id": "overclaim_guard",
+            "label": "과대판정 방지",
+            "state": "pass" if alignment_ready else "block",
+            "metric": {
+                "likely_observed": len(likely),
+                "uncertain": len(uncertain),
+                "status_counts": status_counts,
+            },
+            "detail": "uncertain은 observed로 승격하지 않고 별도 검토",
+        },
+        {
+            "id": "manual_review",
+            "label": "수동 evidence 검수",
+            "state": (
+                "pass" if manual_gate_passed else
+                "warn" if observed_review_rejected or frame_review_rejected else
+                "pending"
+            ),
+            "metric": {
+                "required": True,
+                "observed_reviewed": observed_reviewed,
+                "observed_accepted": observed_review_accepted,
+                "observed_rejected": observed_review_rejected,
+                "observed_acceptance_ratio": round(observed_review_ratio, 4),
+                "frame_reviewed": frame_reviewed,
+                "frame_accepted": frame_review_accepted,
+                "frame_rejected": frame_review_rejected,
+                "frame_acceptance_ratio": round(frame_review_ratio, 4),
+            },
+            "detail": "최종 90% 통과는 observed 객체와 keyframe 위치 수동 검수 90% 이상이 필요",
+        },
+    ]
+
+    return {
+        "ok": True,
+        "upload_id": upload_id,
+        "model_id": model_id,
+        "status": report_status,
+        "automated_gate_passed": automated_gate_passed,
+        "manual_gate_passed": manual_gate_passed,
+        "manual_review_required": True,
+        "passed_90": manual_gate_passed,
+        "summary": {
+            "objects": len(objects),
+            "status_counts": status_counts,
+            "observed_count": observed_count,
+            "observed_with_evidence": observed_with_evidence,
+            "observed_evidence_ratio": round(observed_evidence_ratio, 4),
+            "observed_support_ge3": observed_support_ge3,
+            "observed_support_ratio": round(observed_support_ratio, 4),
+            "observed_reviewed": observed_reviewed,
+            "observed_review_accepted": observed_review_accepted,
+            "observed_review_rejected": observed_review_rejected,
+            "observed_review_acceptance_ratio": round(observed_review_ratio, 4),
+            "frame_reviewed": frame_reviewed,
+            "frame_review_accepted": frame_review_accepted,
+            "frame_review_rejected": frame_review_rejected,
+            "frame_review_acceptance_ratio": round(frame_review_ratio, 4),
+            "alignment_quality": alignment.get("quality") if isinstance(alignment, dict) else None,
+            "coverage_generated_at": coverage_doc.get("generated_at") if isinstance(coverage_doc, dict) else None,
+            "review_updated_at": review_doc.get("updated_at"),
+        },
+        "criteria": criteria,
+        "blockers": blockers,
+        "warnings": warnings,
+    }
+
+
+@app.post("/api/uploads/{upload_id}/alignment")
+async def save_alignment(upload_id: str, payload: dict):
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    model_id = payload.get("model_id") or _default_model_id()
+    if model_id not in _model_registry():
+        return JSONResponse({"ok": False, "error": "unknown model_id"}, status_code=404)
+    try:
+        input_pairs = _normalize_alignment_pairs((payload.get("alignment") or {}).get("pairs", []))
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    if len(input_pairs) < 4:
+        candidate_id = payload.get("candidate_id")
+        if candidate_id:
+            # Option B: explicit save of a corroborated prior candidate (can_save=true only)
+            cand_doc = _load_scoped_upload_json(upload_id, "alignment_candidates", model_id)
+            cand = next(
+                (c for c in (cand_doc or {}).get("candidates", []) if c.get("id") == candidate_id),
+                None,
+            )
+            if not cand or not cand.get("can_save") or not isinstance(cand.get("alignment"), dict):
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "status": "candidate_not_saveable",
+                        "error": "candidate not found, or not corroborated for saving",
+                    },
+                    status_code=409,
+                )
+            try:
+                manifest = _model_manifest(model_id)
+                if not manifest.get("manifest_valid"):
+                    return JSONResponse(
+                        {"ok": False, "status": "model_manifest_invalid", "error": "model manifest invalid", "model": manifest},
+                        status_code=409,
+                    )
+                alignment = dict(cand["alignment"])
+                alignment.setdefault("pairs", [])
+                alignment["source"] = cand.get("source")
+                alignment["candidate_id"] = candidate_id
+                if cand.get("corroboration"):
+                    alignment["corroboration"] = cand["corroboration"]
+                alignment_doc = {
+                    "ok": True,
+                    "upload_id": upload_id,
+                    "model_id": model_id,
+                    "model": manifest,
+                    "alignment": alignment,
+                    "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                }
+                (UPLOAD_DIR / f"{upload_id}.{model_id}.alignment.json").write_text(
+                    json.dumps(alignment_doc, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                (UPLOAD_DIR / f"{upload_id}.alignment.json").write_text(
+                    json.dumps(alignment_doc, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                return alignment_doc
+            except Exception as e:
+                log.exception("candidate alignment save failed: %s", e)
+                return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        return JSONResponse(
+            {
+                "ok": False,
+                "status": "needs_alignment",
+                "error": "alignment save requires at least 4 scan/model correspondence pairs",
+            },
+            status_code=409,
+        )
+    try:
+        manifest = _model_manifest(model_id)
+        if not manifest.get("manifest_valid"):
+            return JSONResponse(
+                {"ok": False, "status": "model_manifest_invalid", "error": "model manifest invalid", "model": manifest},
+                status_code=409,
+            )
+        alignment = _solve_scan_to_model_alignment(input_pairs)
+        alignment["pairs"] = input_pairs
+        alignment_doc = {
+            "ok": True,
+            "upload_id": upload_id,
+            "model_id": model_id,
+            "model": manifest,
+            "alignment": alignment,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        (UPLOAD_DIR / f"{upload_id}.{model_id}.alignment.json").write_text(
+            json.dumps(alignment_doc, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (UPLOAD_DIR / f"{upload_id}.alignment.json").write_text(
+            json.dumps(alignment_doc, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return alignment_doc
+    except Exception as e:
+        log.exception("alignment save failed: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/uploads/{upload_id}/coverage/analyze")
+async def analyze_coverage(upload_id: str, payload: dict):
+    """Generate conservative model-object observation evidence from scan proximity."""
+    if _bad_id(upload_id, "upload_"):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    model_id = payload.get("model_id") or _default_model_id()
+    if model_id not in _model_registry():
+        return JSONResponse({"ok": False, "error": "unknown model_id"}, status_code=404)
+    opts = payload.get("coverage_options", {}) or {}
+    dist_thresh = float(opts.get("distance_threshold_m", 0.10))
+    min_support = int(opts.get("min_support_frames", 3))
+    min_consistency = float(opts.get("min_geometry_consistency", 0.6))
+    require_visibility = bool(opts.get("require_visibility", True))
+    visibility_max_depth_m = float(opts.get("visibility_max_depth_m", 15.0))
+    visibility_margin_px = float(opts.get("visibility_margin_px", 32.0))
+    preferred_variant = payload.get("variant") or "detail"
+    try:
+        input_pairs = _normalize_alignment_pairs((payload.get("alignment") or {}).get("pairs", []))
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+    try:
+        manifest, objects = _load_model_objects(model_id)
+        manifest = _model_manifest(model_id)
+        if not manifest.get("manifest_valid"):
+            return JSONResponse(
+                {"ok": False, "status": "model_manifest_invalid", "error": "model manifest invalid", "model": manifest},
+                status_code=409,
+            )
+        scan_path = _select_scan_payload(upload_id, preferred_variant)
+        if scan_path is None:
+            return JSONResponse({"ok": False, "error": "scan payload not found"}, status_code=404)
+        scan = _parse_scan_payload(scan_path, include_points=True, max_points=500_000)
+        scan_points = np.asarray(scan.get("points") or [], dtype=np.float64)
+        if scan_points.size == 0:
+            return JSONResponse({"ok": False, "error": "scan points not available"}, status_code=400)
+        scan_points = _viewer_points(scan_points)
+        alignment_source = "request_pairs"
+        if input_pairs:
+            if len(input_pairs) < 4:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "status": "needs_alignment",
+                        "error": "coverage analysis requires at least 4 correspondence pairs when pairs are provided",
+                    },
+                    status_code=409,
+                )
+            alignment = _solve_scan_to_model_alignment(input_pairs)
+            alignment["pairs"] = input_pairs
+        else:
+            alignment_doc = _load_scoped_upload_json(upload_id, "alignment", model_id)
+            alignment = alignment_doc.get("alignment") if isinstance(alignment_doc, dict) else None
+            if not isinstance(alignment, dict):
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "status": "needs_alignment",
+                        "error": "coverage analysis requires saved alignment or at least 4 correspondence pairs",
+                    },
+                    status_code=409,
+                )
+            alignment_source = "saved_alignment"
+        if alignment.get("quality") == "red":
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "status": "needs_alignment",
+                    "error": "coverage analysis requires non-red scan/model alignment quality",
+                    "alignment": alignment,
+                },
+                status_code=409,
+            )
+        scan_model = _apply_sim3(scan_points, alignment)
+        poses = scan.get("poses") or []
+        K = np.asarray(scan.get("K"), dtype=np.float64) if scan.get("K") is not None else None
+        camera_states = _aligned_camera_states(poses, alignment) if alignment["quality"] != "red" else []
+
+        try:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(scan_model)
+            tree_mode = "scipy.cKDTree"
+        except Exception:
+            tree = None
+            tree_mode = "numpy_fallback"
+
+        source_ids = scan.get("source_ids")
+        source_ids_arr = np.asarray(source_ids, dtype=np.uint32) if source_ids is not None else None
+
+        results = []
+        status_counts: dict[str, int] = {}
+        for obj in objects:
+            samples, ts = _object_samples(obj)
+            if tree is not None:
+                dists, idx = tree.query(samples, k=1, workers=-1)
+            else:
+                # Fallback for small inputs only; still keeps the API functional.
+                diff = samples[:, None, :] - scan_model[None, :, :]
+                all_d = np.linalg.norm(diff, axis=2)
+                idx = all_d.argmin(axis=1)
+                dists = all_d[np.arange(samples.shape[0]), idx]
+            hit = dists <= dist_thresh
+            coverage = float(hit.mean()) if hit.size else 0.0
+            distribution_metrics = {
+                "sample_count": int(hit.size),
+                "hit_sample_count": int(hit.sum()) if hit.size else 0,
+                "segment_hit_bins": None,
+                "segment_total_bins": None,
+                "linear_hit_span_ratio": None,
+                "linear_longest_gap_ratio": None,
+            }
+            if obj.get("is_linear"):
+                linear_metrics = _linear_hit_metrics(ts, hit)
+                coverage = linear_metrics["coverage_ratio"]
+                segment_coverage = linear_metrics["segment_coverage_ratio"]
+                geometry_consistency = linear_metrics["geometry_consistency"]
+                distribution_metrics.update({
+                    "sample_count": linear_metrics["sample_count"],
+                    "hit_sample_count": linear_metrics["hit_sample_count"],
+                    "segment_hit_bins": linear_metrics["segment_hit_bins"],
+                    "segment_total_bins": linear_metrics["segment_total_bins"],
+                    "linear_hit_span_ratio": linear_metrics["linear_hit_span_ratio"],
+                    "linear_longest_gap_ratio": linear_metrics["linear_longest_gap_ratio"],
+                })
+            else:
+                segment_coverage = coverage
+                geometry_consistency = 1.0 if coverage > 0 else 0.0
+            support_frames: list[int] = []
+            support_frame_source = "none"
+            if source_ids_arr is not None and len(idx):
+                support_frames = sorted({int(source_ids_arr[int(i)]) for i, ok in zip(idx, hit) if ok})
+                support_frame_source = "source_ids"
+            elif len(idx) and np.any(hit):
+                hit_indices = np.asarray(idx, dtype=np.int64)[hit]
+                hit_points = scan_model[hit_indices]
+                support_frames = _nearest_camera_frames_for_points(hit_points, camera_states, max_frames=12)
+                support_frame_source = "nearest_camera_pose" if support_frames else "none"
+            visibility_frames = _visible_frames_for_samples(
+                samples,
+                camera_states,
+                K,
+                max_depth_m=visibility_max_depth_m,
+                margin_px=visibility_margin_px,
+            )
+            if require_visibility and alignment["quality"] != "red":
+                visible_set = set(visibility_frames)
+                support_frames = [f for f in support_frames if f in visible_set]
+            support_count = len(support_frames)
+            support_factor = min(1.0, support_count / max(1, min_support))
+            alignment_factor = 1.0 if alignment["quality"] == "green" else 0.8 if alignment["quality"] == "yellow" else 0.0
+            visibility_factor = 1.0 if visibility_frames or not require_visibility else 0.0
+            evidence_score = float(alignment_factor * visibility_factor * (
+                0.40 * coverage + 0.25 * segment_coverage + 0.15 * geometry_consistency + 0.20 * support_factor
+            ))
+            if evidence_score >= 0.75 and support_count >= min_support:
+                confidence = "high"
+            elif evidence_score >= 0.45:
+                confidence = "medium"
+            elif evidence_score > 0:
+                confidence = "low"
+            else:
+                confidence = "none"
+            if alignment["quality"] == "red" and coverage >= 0.30:
+                status = "uncertain"
+            elif alignment["quality"] != "red" and require_visibility and not visibility_frames:
+                status = "out_of_scope"
+            elif (
+                coverage >= 0.70
+                and segment_coverage >= min_consistency
+                and support_count >= min_support
+                and geometry_consistency >= min_consistency
+                and alignment["quality"] in ("green", "yellow")
+            ):
+                status = "observed"
+            elif coverage >= 0.30 or segment_coverage >= 0.30:
+                status = "likely_observed" if alignment["quality"] in ("green", "yellow") else "uncertain"
+            elif support_count == 0:
+                status = "not_observed"
+            else:
+                status = "uncertain"
+            status_counts[status] = status_counts.get(status, 0) + 1
+            results.append({
+                "guid": obj["guid"],
+                "category": obj["category"],
+                "system": obj.get("system"),
+                "zone": obj.get("zone"),
+                "status": status,
+                "coverage_ratio": round(coverage, 4),
+                "segment_coverage_ratio": round(segment_coverage, 4),
+                "nearest_distance_median_m": float(np.median(dists)) if len(dists) else None,
+                "nearest_distance_max_m": float(np.max(dists)) if len(dists) else None,
+                "geometry_consistency": round(float(geometry_consistency), 4),
+                "sample_count": distribution_metrics["sample_count"],
+                "hit_sample_count": distribution_metrics["hit_sample_count"],
+                "segment_hit_bins": distribution_metrics["segment_hit_bins"],
+                "segment_total_bins": distribution_metrics["segment_total_bins"],
+                "linear_hit_span_ratio": (
+                    round(float(distribution_metrics["linear_hit_span_ratio"]), 4)
+                    if distribution_metrics["linear_hit_span_ratio"] is not None else None
+                ),
+                "linear_longest_gap_ratio": (
+                    round(float(distribution_metrics["linear_longest_gap_ratio"]), 4)
+                    if distribution_metrics["linear_longest_gap_ratio"] is not None else None
+                ),
+                "visibility_frames": visibility_frames,
+                "support_frames": support_frames,
+                "support_frame_source": support_frame_source,
+                "support_frame_count": support_count,
+                "visibility_frame_count": len(visibility_frames),
+                "evidence_score": round(evidence_score, 4),
+                "confidence": confidence,
+                "evidence_thumb_ids": support_frames[:8],
+                "evidence_keyframes": [f"/api/uploads/{upload_id}/keyframes/{f}.jpg" for f in support_frames[:8]],
+                "center": obj.get("center"),
+                "start": obj.get("start"),
+                "end": obj.get("end"),
+                "bbox": obj.get("bbox"),
+            })
+        coverage_doc = {
+            "ok": True,
+            "upload_id": upload_id,
+            "model": manifest,
+            "alignment": alignment,
+            "options": {
+                "distance_threshold_m": dist_thresh,
+                "min_support_frames": min_support,
+                "min_geometry_consistency": min_consistency,
+                "require_visibility": require_visibility,
+                "visibility_max_depth_m": visibility_max_depth_m,
+                "visibility_margin_px": visibility_margin_px,
+                "tree": tree_mode,
+                "scan_payload": scan_path.name,
+                "scan_points_sampled": int(scan_points.shape[0]),
+                "alignment_source": alignment_source,
+            },
+            "status_counts": status_counts,
+            "objects": results,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        out = UPLOAD_DIR / f"{upload_id}.{model_id}.coverage.json"
+        out.write_text(json.dumps(coverage_doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        (UPLOAD_DIR / f"{upload_id}.coverage.json").write_text(json.dumps(coverage_doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        if alignment_source == "request_pairs":
+            alignment_doc = {
+                "ok": True,
+                "upload_id": upload_id,
+                "model_id": model_id,
+                "model": manifest,
+                "alignment": alignment,
+                "generated_at": coverage_doc["generated_at"],
+            }
+            (UPLOAD_DIR / f"{upload_id}.{model_id}.alignment.json").write_text(
+                json.dumps(alignment_doc, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            (UPLOAD_DIR / f"{upload_id}.alignment.json").write_text(
+                json.dumps(alignment_doc, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return coverage_doc
+    except Exception as e:
+        log.exception("coverage analysis failed: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+def _load_audit_results() -> dict:
+    if not AUDIT_RESULTS.exists():
+        return {"summary": {"passed": False, "note": "audit_results.json not found"}, "items": []}
+    return json.loads(AUDIT_RESULTS.read_text())
+
+
+@app.get("/api/audit/results")
+async def audit_results():
+    return _load_audit_results()
+
+
+@app.post("/api/audit/replay/{upload_id}")
+async def replay_audit_upload(upload_id: str, variant: str = "mesh"):
+    """Replay a generated audit payload without replacing the original upload."""
+    if not upload_id.startswith("upload_") or "/" in upload_id or ".." in upload_id:
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    audit = _load_audit_results()
+    allowed = {it.get("id") for it in audit.get("items", [])}
+    if upload_id not in allowed:
+        return JSONResponse({"ok": False, "error": "not in audit results"}, status_code=404)
+    variant_suffix = {
+        "mesh": "lbm1.mesh",
+        "texture": "texture",
+        "visual": "visual",
+        "detail": "test",
+    }
+    if variant not in variant_suffix:
+        return JSONResponse({"ok": False, "error": "variant must be mesh, texture, visual, or detail"}, status_code=400)
+    suffix = variant_suffix[variant]
+    p = UPLOAD_DIR / f"{upload_id}.{suffix}" if variant == "mesh" else UPLOAD_DIR / f"{upload_id}.lbp4.{suffix}"
+    if not p.exists():
+        return JSONResponse({"ok": False, "error": f"{variant} payload not found"}, status_code=404)
+    payload = p.read_bytes()
+    thumbs = _load_upload_thumbs(upload_id, prefer_audit=True)
+    await broadcast_point_cloud(payload, thumbs)
+    return {"ok": True, "id": upload_id, "variant": variant, "bytes": len(payload),
+            "thumbs": len(thumbs) if thumbs else 0,
+            "viewers": len(STATE.viewer_sockets)}
+
+
+@app.get("/api/audit/glb/{upload_id}")
+async def audit_glb(upload_id: str):
+    """Download the generated scan mesh as GLB."""
+    if not upload_id.startswith("upload_") or "/" in upload_id or ".." in upload_id:
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    audit = _load_audit_results()
+    allowed = {it.get("id") for it in audit.get("items", [])}
+    if upload_id not in allowed:
+        return JSONResponse({"ok": False, "error": "not in audit results"}, status_code=404)
+    p = UPLOAD_DIR / f"{upload_id}.mesh.glb"
+    if not p.exists():
+        return JSONResponse({"ok": False, "error": "GLB mesh not found"}, status_code=404)
+    return FileResponse(
+        p,
+        media_type="model/gltf-binary",
+        filename=p.name,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/api/uploads/{upload_id}/replay")
@@ -335,13 +3309,7 @@ async def replay_upload(upload_id: str):
     if not p.exists():
         return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
     payload = p.read_bytes()
-    thumbs: list[bytes] | None = None
-    tp = UPLOAD_DIR / f"{upload_id}.thumbs.json"
-    if tp.exists():
-        try:
-            thumbs = [base64.b64decode(s) for s in json.loads(tp.read_text())]
-        except Exception as e:
-            log.warning("thumbs load failed for %s: %s", upload_id, e)
+    thumbs = _load_upload_thumbs(upload_id)
     await broadcast_point_cloud(payload, thumbs)
     return {"ok": True, "id": upload_id, "bytes": len(payload),
             "thumbs": len(thumbs) if thumbs else 0,
@@ -395,14 +3363,14 @@ async def broadcast_point_cloud(payload: bytes, thumbs: list[bytes] | None = Non
     STATE.last_infer_ts = time.time()
     STATE.last_payload = payload
     STATE.last_thumbs = thumbs
-    # LBP2: magic + flags + num_pts + num_poses + seq
-    if len(payload) >= 20 and payload[:4] == b"LBP2":
+    # LBP2/LBP3/LBP4: magic + flags + num_pts + num_poses + seq
+    if len(payload) >= 20 and payload[:4] in (b"LBP2", b"LBP3", b"LBP4"):
         import struct
         _, _flags, num_pts, _np, _seq = struct.unpack("<4sIIII", payload[:20])
         STATE.last_infer_points = num_pts
     # JSON sidecar with per-frame thumbnails (base64-encoded JPEGs). We send
     # this BEFORE the binary so the viewer can cache thumbs and apply them as
-    # the camera frustums are built from the LBP2 payload.
+    # the camera frustums are built from the point-cloud payload.
     thumbs_msg = None
     if thumbs:
         thumbs_msg = json.dumps({
@@ -506,8 +3474,13 @@ async def on_startup():
         return
     out_mode = os.environ.get("LINGBOT_OUTPUT_MODE", "points")  # "points" | "mesh"
     log.info("starting inference worker (model=%s, output_mode=%s)", model_path, out_mode)
-    STATE.worker = InferenceWorker(model_path, broadcast_point_cloud, output_mode=out_mode)
-    STATE.worker.start()
+    try:
+        STATE.worker = InferenceWorker(model_path, broadcast_point_cloud, output_mode=out_mode)
+        STATE.worker.start()
+    except Exception as e:
+        # GPU OOM 등으로 워커가 못 떠도 coverage 웹 기능은 동작해야 한다 (업로드 처리만 비활성)
+        log.error("inference worker init failed (%s); serving without video processing", e)
+        STATE.worker = None
 
 
 @app.on_event("shutdown")

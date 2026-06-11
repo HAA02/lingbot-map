@@ -30,6 +30,7 @@ def build_tsdf_volume(
     trunc: float = 0.08,
     conf_floor: float = 1.0,      # ignore observations below this confidence
     pad: float = 0.3,             # extra world-space padding around camera trajectory
+    bounds: tuple[np.ndarray, np.ndarray] | None = None,
 ):
     """Fuse per-frame depth maps into a TSDF volume.
 
@@ -43,17 +44,24 @@ def build_tsdf_volume(
     assert w2c.shape == (N, 3, 4)
     assert K.shape == (N, 3, 3)
 
-    # ── 1. Decide grid bounds from camera positions + depth fan ─────────────
-    # c2w translation = camera center in world
-    c2w = _invert_w2c_batch(w2c)
-    cam_centers = c2w[:, :, 3]  # (N, 3)
+    # ── 1. Decide grid bounds ──────────────────────────────────────────────
+    # Prefer explicit surface bounds from the already-aligned point cloud.  It
+    # keeps TSDF integration focused on the observed object and avoids runaway
+    # volumes when multi-window Sim(3) scale changes the depth magnitude.
+    if bounds is not None:
+        mn = np.asarray(bounds[0], dtype=np.float32) - pad
+        mx = np.asarray(bounds[1], dtype=np.float32) + pad
+    else:
+        # c2w translation = camera center in world
+        c2w = _invert_w2c_batch(w2c)
+        cam_centers = c2w[:, :, 3]  # (N, 3)
 
-    # Estimate scene span as cam motion + max trunc-bounded depth in each direction.
-    # Cheap: just use cam_span + a fixed depth margin. (TSDF auto-clips beyond grid.)
-    max_depth = np.percentile(depth_maps[depth_maps > 0.05], 95) if (depth_maps > 0.05).any() else 3.0
-    margin = max_depth + pad
-    mn = cam_centers.min(axis=0) - margin
-    mx = cam_centers.max(axis=0) + margin
+        # Estimate scene span as cam motion + max trunc-bounded depth in each direction.
+        # Cheap: just use cam_span + a fixed depth margin. (TSDF auto-clips beyond grid.)
+        max_depth = np.percentile(depth_maps[depth_maps > 0.05], 95) if (depth_maps > 0.05).any() else 3.0
+        margin = max_depth + pad
+        mn = cam_centers.min(axis=0) - margin
+        mx = cam_centers.max(axis=0) + margin
 
     dims = np.ceil((mx - mn) / voxel_size).astype(np.int32)
     # Safety cap: avoid runaway memory. 600 per axis × 0.012m = 7.2m scene OK;

@@ -41,9 +41,15 @@
   <label style="font-size:12px;opacity:.8">점크기
     <input type="range" id="psize" min="0.001" max="0.05" step="0.001" value="0.01" style="vertical-align:middle;width:80px">
   </label>
+  <select id="colorMode" title="점군 색상 기준" style="background:#222;color:#eee;border:1px solid #555;padding:3px 6px;border-radius:4px;font-size:12px">
+    <option value="rgb">원본 RGB</option>
+    <option value="object">객체</option>
+    <option value="source">촬영순서</option>
+  </select>
   <select id="picker" style="background:#222;color:#eee;border:1px solid #555;padding:3px 6px;border-radius:4px;font-size:12px;max-width:280px">
     <option value="">📜 업로드 선택…</option>
   </select>
+  <span id="payload_badge" style="font-size:12px;opacity:.8">payload 대기</span>
   <span id="ws_badge" class="badge idle">WS 대기</span>
 </header>
 <div class="help">drag: 회전 · wheel: 줌 · shift+drag: 이동</div>
@@ -96,6 +102,7 @@
 <div class="stats">
   <span>WS<b id="s_ws">—</b></span>
   <span>점<b id="s_pts">0</b></span>
+  <span>객체<b id="s_objs">—</b></span>
   <span>카메라<b id="s_cams">0</b></span>
   <span>마지막<b id="s_age">—</b></span>
   <span>FPS<b id="s_fps">—</b></span>
@@ -117,6 +124,8 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 
 const $ = id => document.getElementById(id);
+const viewParams = new URLSearchParams(location.search);
+const auditMode = viewParams.get('audit') === '1';
 const canvas = $('canvas');
 const renderer = new THREE.WebGLRenderer({canvas, antialias: false});
 renderer.setPixelRatio(window.devicePixelRatio);
@@ -140,14 +149,23 @@ scene.add(new THREE.GridHelper(20, 20, 0x333333, 0x222222));
 const MAX_POINTS = 2_000_000;
 const positions = new Float32Array(MAX_POINTS * 3);
 const colors = new Float32Array(MAX_POINTS * 3);
+const baseColors = new Float32Array(MAX_POINTS * 3);
 const normals  = new Float32Array(MAX_POINTS * 3);  // Phase A: per-point normals
+const sourceIds = new Uint32Array(MAX_POINTS);
+const objectIds = new Uint32Array(MAX_POINTS);
 const geom = new THREE.BufferGeometry();
 geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
 geom.setAttribute('color',    new THREE.BufferAttribute(colors,    3));
 geom.setAttribute('normal',   new THREE.BufferAttribute(normals,   3));
 geom.setDrawRange(0, 0);
-let pointSize = 0.01;     // world-unit splat radius
-let hasNormals = false;   // toggled true when LBP3 received
+function auditPointSizeFor(n) {
+  if (n >= 250000) return 2.0;
+  if (n >= 100000) return 2.5;
+  if (n >= 40000) return 3.0;
+  return 4.0;
+}
+let pointSize = auditMode ? 3.0 : 0.01;     // audit: screen pixels; normal: world-unit splat radius
+let hasNormals = false;   // toggled true when LBP3/LBP4 received
 
 // Phase A — surfel splat shader: each point becomes a disk that fades by
 // (1 − distance_to_center) and is back-face-culled by the dot product of the
@@ -200,8 +218,23 @@ const splatMat = new THREE.ShaderMaterial({
     }
   `,
 });
-const points = new THREE.Points(geom, splatMat);
+const auditPointMat = new THREE.PointsMaterial({
+  size: pointSize,
+  sizeAttenuation: false,
+  vertexColors: true,
+  transparent: false,
+  depthTest: true,
+  depthWrite: true,
+});
+const points = new THREE.Points(geom, auditMode ? auditPointMat : splatMat);
 scene.add(points);
+
+if (auditMode) {
+  $('psize').min = '1';
+  $('psize').max = '12';
+  $('psize').step = '0.5';
+  $('psize').value = String(pointSize);
+}
 
 window.addEventListener('resize', () => {
   splatMat.uniforms.uViewportH.value = window.innerHeight;
@@ -211,6 +244,7 @@ let bounds = null;  // {min:[x,y,z], max:[x,y,z]}
 
 const camGroup = new THREE.Group();
 scene.add(camGroup);
+camGroup.visible = !auditMode;
 let camCount = 0;
 let meshObj = null;   // LBM1 mesh; replaces the point cloud when present
 
@@ -253,12 +287,13 @@ function installMesh(verts, vrgb, faces) {
 }
 
 let camScale = 0.03;
-let thumbsVisible = true;
+let thumbsVisible = !auditMode;
 const frustumMat = new THREE.LineBasicMaterial({color: 0x44ddff, transparent: true, opacity: 0.18});
 const trajPositions = [];
 const trajGeom = new THREE.BufferGeometry();
 const trajMat = new THREE.LineBasicMaterial({color: 0xffaa33, transparent: true, opacity: 0.7});
 const trajLine = new THREE.Line(trajGeom, trajMat);
+trajLine.visible = !auditMode;
 scene.add(trajLine);
 
 function addCameraFrustum(c2w, K, scale=camScale, thumbTex=null) {
@@ -326,23 +361,98 @@ function fitView() {
   controls.update();
 }
 
-function replacePoints(xyz, rgb, nrm) {
+let colorMode = 'rgb';
+$('colorMode').value = colorMode;
+let objectCount = 0;
+
+function hashedByteColor(label) {
+  let x = label >>> 0;
+  x ^= x >>> 16;
+  x = Math.imul(x, 0x7feb352d);
+  x ^= x >>> 15;
+  x = Math.imul(x, 0x846ca68b);
+  x ^= x >>> 16;
+  return [
+    72 + (x & 0x7f),
+    72 + ((x >>> 8) & 0x7f),
+    72 + ((x >>> 16) & 0x7f),
+  ];
+}
+
+function setLabelColor(dst, i3, label) {
+  if (auditMode) {
+    const palette = [
+      [0.85, 0.85, 0.85],
+      [1.00, 0.18, 0.12],
+      [0.08, 0.72, 1.00],
+      [0.15, 0.95, 0.32],
+      [1.00, 0.82, 0.08],
+      [0.90, 0.25, 1.00],
+      [1.00, 0.48, 0.08],
+      [0.10, 1.00, 0.82],
+    ];
+    const c = palette[label ? ((label - 1) % (palette.length - 1)) + 1 : 0];
+    dst[i3+0] = c[0];
+    dst[i3+1] = c[1];
+    dst[i3+2] = c[2];
+    return;
+  }
+  if (!label) {
+    dst[i3+0] = _srgbLut[96];
+    dst[i3+1] = _srgbLut[96];
+    dst[i3+2] = _srgbLut[96];
+    return;
+  }
+  const c = hashedByteColor(label);
+  dst[i3+0] = _srgbLut[c[0]];
+  dst[i3+1] = _srgbLut[c[1]];
+  dst[i3+2] = _srgbLut[c[2]];
+}
+
+function applyColorMode() {
+  if (usedPoints <= 0) return;
+  if (colorMode === 'rgb') {
+    colors.set(baseColors.subarray(0, usedPoints * 3), 0);
+  } else {
+    const ids = colorMode === 'source' ? sourceIds : objectIds;
+    for (let i = 0; i < usedPoints; i++) setLabelColor(colors, i * 3, ids[i]);
+  }
+  geom.attributes.color.needsUpdate = true;
+}
+
+function replacePoints(xyz, rgb, nrm, srcIds=null, compIds=null) {
   // Replace mode: overwrite the entire point cloud and recompute bounds.
   // OpenCV world → Three.js: M = diag(1,-1,-1): flip Y (down→up) and Z (forward→back).
   // `nrm` (optional Float32Array) is per-point normal in OpenCV world; same flip applied.
   const n = Math.min(xyz.length / 3, MAX_POINTS);
-  if (n === 0) { usedPoints = 0; geom.setDrawRange(0, 0); return 0; }
+  if (n === 0) {
+    usedPoints = 0;
+    objectCount = 0;
+    $('s_objs').textContent = '—';
+    geom.setDrawRange(0, 0);
+    return 0;
+  }
   let mn = [xyz[0], -xyz[1], -xyz[2]];
   let mx = [xyz[0], -xyz[1], -xyz[2]];
   hasNormals = !!nrm;
+  objectCount = 0;
   for (let i = 0; i < n; i++) {
     const x = xyz[i*3], y = -xyz[i*3+1], z = -xyz[i*3+2];
     positions[i*3+0] = x; positions[i*3+1] = y; positions[i*3+2] = z;
     if (x<mn[0]) mn[0]=x; if (y<mn[1]) mn[1]=y; if (z<mn[2]) mn[2]=z;
     if (x>mx[0]) mx[0]=x; if (y>mx[1]) mx[1]=y; if (z>mx[2]) mx[2]=z;
-    colors[i*3+0] = _srgbLut[rgb[i*3+0]];
-    colors[i*3+1] = _srgbLut[rgb[i*3+1]];
-    colors[i*3+2] = _srgbLut[rgb[i*3+2]];
+    if (auditMode) {
+      baseColors[i*3+0] = rgb[i*3+0] / 255;
+      baseColors[i*3+1] = rgb[i*3+1] / 255;
+      baseColors[i*3+2] = rgb[i*3+2] / 255;
+    } else {
+      baseColors[i*3+0] = _srgbLut[rgb[i*3+0]];
+      baseColors[i*3+1] = _srgbLut[rgb[i*3+1]];
+      baseColors[i*3+2] = _srgbLut[rgb[i*3+2]];
+    }
+    sourceIds[i] = srcIds ? srcIds[i] : 0;
+    objectIds[i] = compIds ? compIds[i] : 0;
+    if (objectIds[i] > objectCount) objectCount = objectIds[i];
     if (nrm) {
       normals[i*3+0] =  nrm[i*3+0];
       normals[i*3+1] = -nrm[i*3+1];
@@ -355,12 +465,12 @@ function replacePoints(xyz, rgb, nrm) {
   bounds = {min: mn, max: mx};
   usedPoints = n;
   geom.attributes.position.needsUpdate = true;
-  geom.attributes.color.needsUpdate = true;
   geom.attributes.normal.needsUpdate = true;
+  applyColorMode();
   geom.setDrawRange(0, usedPoints);
   geom.computeBoundingSphere();
-  // Disable back-face cull when normals are unknown (LBP2 path).
-  splatMat.uniforms.uNormalCull.value = hasNormals ? 0.15 : -1.0;
+  // Audit mode prioritizes visibility from any angle over surfel back-face culling.
+  splatMat.uniforms.uNormalCull.value = (hasNormals && !auditMode) ? 0.15 : -1.0;
 
   // auto camera-frustum scale based on scene extent (frustum is in world units).
   // Point size is in screen pixels (sizeAttenuation=false) — no rescale needed.
@@ -372,12 +482,23 @@ function replacePoints(xyz, rgb, nrm) {
   if (Math.abs(newCam - camScale)/camScale > 0.3) camScale = newCam;
   // Adapt world-unit point size to scene scale: ~0.3% of span — bigger points
   // overlap visually so the cloud reads as a surface, not isolated dots.
-  const newPt = Math.max(0.003, span * 0.003);
-  if (!userSetPointSize) { pointSize = newPt; splatMat.uniforms.uSize.value = pointSize;
-    $('psize').value = pointSize.toFixed(3); }
+  const newPt = auditMode ? auditPointSizeFor(n) : Math.max(0.003, span * 0.003);
+  if (!userSetPointSize) {
+    pointSize = newPt;
+    if (auditMode) {
+      auditPointMat.size = pointSize;
+      $('psize').value = pointSize.toFixed(1);
+    } else {
+      splatMat.uniforms.uSize.value = pointSize;
+      $('psize').value = pointSize.toFixed(3);
+    }
+  }
+  $('s_objs').textContent = objectCount ? objectCount.toLocaleString() : '—';
   return n;
 }
 let userSetPointSize = false;
+$('toggleCams').textContent = camGroup.visible ? '카메라 숨기기' : '카메라 보이기';
+$('toggleThumbs').textContent = thumbsVisible ? '썸네일 숨기기' : '썸네일 보이기';
 
 $('reset').onclick = fitView;
 $('toggleCams').onclick = () => {
@@ -392,18 +513,25 @@ $('toggleThumbs').onclick = () => {
 };
 $('psize').oninput = e => {
   pointSize = parseFloat(e.target.value);
-  splatMat.uniforms.uSize.value = pointSize;
+  if (auditMode) auditPointMat.size = pointSize;
+  else splatMat.uniforms.uSize.value = pointSize;
   userSetPointSize = true;
 };
+$('colorMode').addEventListener('change', e => {
+  colorMode = e.target.value;
+  applyColorMode();
+});
 $('clear').onclick = () => {
   usedPoints = 0;
   geom.setDrawRange(0, 0);
+  if (meshObj) { scene.remove(meshObj); meshObj.geometry.dispose(); meshObj = null; }
   while (camGroup.children.length) camGroup.remove(camGroup.children[0]);
   camCount = 0;
   trajPositions.length = 0;
   trajGeom.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
   bounds = null;
   $('s_pts').textContent = '0';
+  $('s_objs').textContent = '—';
   $('s_cams').textContent = '0';
 };
 // auto-fit on first payload
@@ -490,7 +618,7 @@ function connectWs() {
     const buf = new DataView(ev.data);
     const magic = String.fromCharCode(buf.getUint8(0), buf.getUint8(1), buf.getUint8(2), buf.getUint8(3));
     console.log('[viewer] WS payload', ev.data.byteLength, 'bytes magic=', magic);
-    if (magic === 'LBP2' || magic === 'LBP3') {
+    if (magic === 'LBP2' || magic === 'LBP3' || magic === 'LBP4') {
       const flags   = buf.getUint32(4, true);
       const numPts  = buf.getUint32(8, true);
       const numPoses= buf.getUint32(12, true);
@@ -504,6 +632,15 @@ function connectWs() {
         nrm = new Float32Array(ev.data.slice(off, off + numPts*3*4));
         off += numPts*3*4;
       }
+      let srcIds = null, compIds = null;
+      if (magic === 'LBP4') {
+        nrm = new Float32Array(ev.data.slice(off, off + numPts*3*4));
+        off += numPts*3*4;
+        srcIds = new Uint32Array(ev.data.slice(off, off + numPts*4));
+        off += numPts*4;
+        compIds = new Uint32Array(ev.data.slice(off, off + numPts*4));
+        off += numPts*4;
+      }
       const posesBytes = numPoses*12*4;
       const poses = new Float32Array(ev.data.slice(off, off + posesBytes)); off += posesBytes;
       const K = new Float32Array(ev.data.slice(off, off + 9*4)); off += 9*4;
@@ -512,7 +649,8 @@ function connectWs() {
       if (meshObj) { scene.remove(meshObj); meshObj.geometry.dispose(); meshObj = null; }
       camCount = 0;
       trajPositions.length = 0;
-      replacePoints(xyz, rgb, nrm);
+      $('payload_badge').textContent = `${magic} · ${numPts.toLocaleString()} pts · material=${auditMode ? 'points' : 'surfel'}`;
+      replacePoints(xyz, rgb, nrm, srcIds, compIds);
       for (let i = 0; i < numPoses; i++) {
         addCameraFrustum(poses.subarray(i*12, (i+1)*12), K, camScale, latestThumbs[i] || null);
       }
@@ -535,6 +673,8 @@ function connectWs() {
       trajPositions.length = 0;
       // Clear point cloud + add mesh
       usedPoints = 0; geom.setDrawRange(0, 0);
+      objectCount = 0; $('s_objs').textContent = '—';
+      $('payload_badge').textContent = `${magic} · ${numV.toLocaleString()} verts · material=mesh`;
       installMesh(verts, vrgb, faces);
       for (let i = 0; i < numPoses; i++) {
         addCameraFrustum(poses.subarray(i*12, (i+1)*12), K, camScale, latestThumbs[i] || null);
@@ -546,7 +686,9 @@ function connectWs() {
     firstPayload = false;
     lastMsgTs = Date.now();
     msgCount++; fpsN++;
-    $('s_pts').textContent = usedPoints.toLocaleString();
+    $('s_pts').textContent = meshObj
+      ? `${meshObj.geometry.getAttribute('position').count.toLocaleString()} verts`
+      : usedPoints.toLocaleString();
     $('s_cams').textContent = camCount;
   };
 }
