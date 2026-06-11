@@ -809,6 +809,7 @@ async function loadModel(id) {
       const gltf = await new Promise((resolve, reject) => loader.load(state.model.glb_url, resolve, undefined, reject));
       const root = gltf.scene;
       state.glbMeshesByGuid = new Map();
+      const guidCounts = new Map();
       root.traverse(o => {
         if (o.isMesh) {
           const mats = Array.isArray(o.material) ? o.material : [o.material];
@@ -821,11 +822,24 @@ async function loadModel(id) {
           });
           if (o.material.length === 1) o.material = o.material[0];
           o.userData._neutralMat = o.material;
-          const guid = glbNodeGuid(o);
-          if (guid) {
-            o.userData._guid = guid;
-            if (!state.glbMeshesByGuid.has(guid)) state.glbMeshesByGuid.set(guid, []);
-            state.glbMeshesByGuid.get(guid).push(o);
+          // 일부 익스포터의 accessor min/max가 부정확 -> GLTFLoader 프리셋 bbox를 실정점으로 재계산
+          o.geometry.computeBoundingBox();
+          o.geometry.computeBoundingSphere();
+          const base = glbNodeGuid(o);
+          if (base) {
+            // mesh 노드 자신이 GUID를 가지면(타입 공유 익스포터) 발생 순서 접미사로 고유화 —
+            // 서버 glb_native 로더와 동일 규칙. 부모 상속(GUID 1개=요소 1개)이면 그룹 유지.
+            const ud = o.userData || {};
+            const own = Boolean(ud.IfcGUID || ud.ifcGuid || ud.UniqueId || ud.uniqueId || ud.guid || ud.GUID);
+            let key = base;
+            if (own) {
+              const k = guidCounts.get(base) || 0;
+              guidCounts.set(base, k + 1);
+              if (k > 0) key = `${base}@${k}`;
+            }
+            o.userData._guid = key;
+            if (!state.glbMeshesByGuid.has(key)) state.glbMeshesByGuid.set(key, []);
+            state.glbMeshesByGuid.get(key).push(o);
           }
         }
       });

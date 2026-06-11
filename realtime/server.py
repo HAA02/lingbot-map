@@ -409,25 +409,26 @@ def _glb_name_set(glb_path: Path) -> set[str]:
     return names
 
 
-_GLB_DOC_CACHE: dict[str, tuple[float, dict]] = {}
+_GLB_DOC_CACHE: dict[str, tuple[float, dict, bytes | None]] = {}
 
 
-def _glb_json(glb_path: Path) -> dict | None:
-    """Cached GLB JSON chunk (full glTF document), keyed by path+mtime."""
+def _glb_doc_and_bin(glb_path: Path) -> tuple[dict | None, bytes | None]:
+    """Cached GLB JSON chunk + binary chunk, keyed by path+mtime."""
     try:
         mtime = glb_path.stat().st_mtime
     except OSError:
-        return None
+        return None, None
     key = str(glb_path)
     cached = _GLB_DOC_CACHE.get(key)
     if cached and cached[0] == mtime:
-        return cached[1]
+        return cached[1], cached[2]
     try:
         with glb_path.open("rb") as f:
             header = f.read(12)
             if len(header) != 12 or header[:4] != b"glTF":
-                return None
+                return None, None
             doc = None
+            bin_chunk = None
             while True:
                 chunk_header = f.read(8)
                 if len(chunk_header) < 8:
@@ -436,14 +437,19 @@ def _glb_json(glb_path: Path) -> dict | None:
                 data = f.read(length)
                 if ctype == b"JSON":
                     doc = json.loads(data.decode("utf-8"))
-                    break
+                elif ctype == b"BIN\x00":
+                    bin_chunk = data
             if doc is None:
-                return None
-            _GLB_DOC_CACHE[key] = (mtime, doc)
-            return doc
+                return None, None
+            _GLB_DOC_CACHE[key] = (mtime, doc, bin_chunk)
+            return doc, bin_chunk
     except Exception as e:
         log.warning("GLB JSON scan failed for %s: %s", glb_path, e)
-        return None
+        return None, None
+
+
+def _glb_json(glb_path: Path) -> dict | None:
+    return _glb_doc_and_bin(glb_path)[0]
 
 
 def _model_registry() -> dict:
@@ -511,12 +517,28 @@ def _load_glb_native_model(model_id: str, spec: dict) -> tuple[dict, list[dict]]
     노드 extras의 IfcGUID/Category와 accessor bbox + 노드 변환으로 객체를 만들고,
     glTF Y-up(m) -> model_world Z-up(m) 변환((x, -z, y))을 적용한다."""
     glb_path = MODELS_DIR / spec["glb"]
-    doc = _glb_json(glb_path)
+    doc, bin_chunk = _glb_doc_and_bin(glb_path)
     if not doc:
         raise FileNotFoundError(str(glb_path))
     nodes = doc.get("nodes", [])
     meshes = doc.get("meshes", [])
     accs = doc.get("accessors", [])
+    bvs = doc.get("bufferViews", [])
+
+    def read_positions(acc_idx: int) -> np.ndarray | None:
+        """비압축 POSITION 정점 직접 디코드 (일부 익스포터의 accessor min/max 오류 대비)."""
+        a = accs[acc_idx]
+        if bin_chunk is None or "bufferView" not in a or a.get("componentType") != 5126 or a.get("type") != "VEC3":
+            return None
+        bv = bvs[a["bufferView"]]
+        if bv.get("byteStride") not in (None, 12):
+            return None
+        boff = int(bv.get("byteOffset", 0)) + int(a.get("byteOffset", 0))
+        cnt = int(a["count"])
+        raw = bin_chunk[boff:boff + cnt * 12]
+        if len(raw) < cnt * 12:
+            return None
+        return np.frombuffer(raw, dtype="<f4").reshape(cnt, 3).astype(np.float64)
     parent: dict[int, int] = {}
     for i, n in enumerate(nodes):
         for c in n.get("children", []) or []:
@@ -538,19 +560,31 @@ def _load_glb_native_model(model_id: str, spec: dict) -> tuple[dict, list[dict]]
         out[:, 2] = pts[:, 1]
         return out
 
-    # 같은 IfcGUID가 여러 노드(다중 mesh 분할)로 나올 수 있으므로 guid 기준으로 bbox를 병합한다
-    merged: dict[str, dict] = {}
+    # 노드별 객체 생성. 일부 익스포터는 같은 IfcGUID를 타입 인스턴스들에 공유하므로
+    # 병합하지 않고 발생 순서 접미사(base@k)로 고유화한다. bbox는 가능하면 실제 정점에서
+    # 계산한다(이 익스포터의 accessor min/max는 일부 축이 부정확함을 실측으로 확인).
+    per_node: list[dict] = []
+    guid_seen: dict[str, int] = {}
     for i, n in enumerate(nodes):
         ex = n.get("extras") or {}
-        guid = ex.get("IfcGUID") or ex.get("UniqueId")
-        if not guid or "mesh" not in n:
+        base_guid = ex.get("IfcGUID") or ex.get("UniqueId")
+        if not base_guid or "mesh" not in n:
             continue
         lo = np.full(3, np.inf)
         hi = np.full(3, -np.inf)
         ok = False
         M = world(i)
+        identity = bool(np.allclose(M, np.eye(4), atol=1e-12))
         for prim in meshes[n["mesh"]].get("primitives", []):
-            a = accs[prim["attributes"]["POSITION"]]
+            a_idx = prim["attributes"]["POSITION"]
+            verts = read_positions(a_idx)
+            if verts is not None:
+                vw = verts if identity else (np.c_[verts, np.ones(len(verts))] @ M.T)[:, :3]
+                lo = np.minimum(lo, vw.min(0))
+                hi = np.maximum(hi, vw.max(0))
+                ok = True
+                continue
+            a = accs[a_idx]
             if "min" not in a or "max" not in a:
                 continue
             cr = np.array([[x, y, z]
@@ -563,17 +597,15 @@ def _load_glb_native_model(model_id: str, spec: dict) -> tuple[dict, list[dict]]
             ok = True
         if not ok:
             continue
-        key = str(guid)
-        ent = merged.get(key)
-        if ent is None:
-            merged[key] = {"lo": lo, "hi": hi, "extras": ex}
-        else:
-            ent["lo"] = np.minimum(ent["lo"], lo)
-            ent["hi"] = np.maximum(ent["hi"], hi)
+        k = guid_seen.get(str(base_guid), 0)
+        guid_seen[str(base_guid)] = k + 1
+        guid = str(base_guid) if k == 0 else f"{base_guid}@{k}"
+        per_node.append({"guid": guid, "base_guid": str(base_guid), "lo": lo, "hi": hi, "extras": ex})
 
     objects: list[dict] = []
     counts: dict[str, int] = {}
-    for guid, ent in merged.items():
+    for ent in per_node:
+        guid = ent["guid"]
         ex = ent["extras"]
         box = to_model(np.vstack([ent["lo"], ent["hi"]]))
         b_lo = box.min(0)
@@ -594,6 +626,7 @@ def _load_glb_native_model(model_id: str, spec: dict) -> tuple[dict, list[dict]]
             end = (c + axis).tolist()
         rec = {
             "guid": str(guid),
+            "base_guid": ent["base_guid"],
             "category": category,
             "system": ex.get("System Name") or ex.get("System Type"),
             "zone": ex.get("Level") or ex.get("Reference Level"),
@@ -1633,6 +1666,15 @@ def _model_surface_samples(objects: list[dict]) -> np.ndarray:
     return np.vstack(pts)
 
 
+def _object_surface_radius(obj: dict) -> float:
+    """중심선/중심점 샘플 -> 표면 거리 보정용 반경 (placement 채점·coverage 공용)."""
+    r = float(obj.get("diameter_m") or 0.0) * 0.5
+    if obj.get("is_linear"):
+        return max(0.0, min(r, 0.4))
+    # bbox 기반 point 객체는 중심 거리에 외형이 일부 반영되므로 보수적으로
+    return max(0.0, min(r * 0.5, 0.2))
+
+
 def _model_surface_samples_with_radius(objects: list[dict]) -> tuple[np.ndarray, np.ndarray]:
     """Sample points plus per-sample surface radius (centerline->surface correction)."""
     pts = []
@@ -1641,14 +1683,9 @@ def _model_surface_samples_with_radius(objects: list[dict]) -> tuple[np.ndarray,
         samples, _ts = _object_samples(obj)
         if not samples.size:
             continue
-        r = float(obj.get("diameter_m") or 0.0) * 0.5
-        if obj.get("is_linear"):
-            r = min(r, 0.4)
-        else:
-            # bbox 기반 point 객체는 중심 거리에 외형이 일부 반영되므로 보수적으로
-            r = min(r * 0.5, 0.2)
+        r = _object_surface_radius(obj)
         pts.append(samples)
-        rads.append(np.full(len(samples), max(0.0, r), dtype=np.float64))
+        rads.append(np.full(len(samples), r, dtype=np.float64))
     if not pts:
         return np.empty((0, 3), dtype=np.float64), np.empty((0,), dtype=np.float64)
     return np.vstack(pts), np.concatenate(rads)
@@ -1768,7 +1805,20 @@ def _auto_place_candidates(
         return [], ["model has no geometry samples"]
     from scipy.spatial import cKDTree
     tree = cKDTree(samples)
-    scan_c = sub.mean(0)
+    # M2: 중력 정렬 프레임에서 수평 대평면(바닥/천장) 클러터 제거 후 채점
+    pts_g = (R0 @ sub.T).T
+    zbin = np.round(pts_g[:, 2] / 0.05).astype(int)
+    vals, counts = np.unique(zbin, return_counts=True)
+    clutter = np.zeros(len(sub), dtype=bool)
+    for zb_val, n in sorted(zip(vals.tolist(), counts.tolist()), key=lambda x: -x[1])[:3]:
+        if n >= 0.10 * len(sub):
+            clutter |= np.abs(zbin - zb_val) <= 1
+    if clutter.any() and (len(sub) - int(clutter.sum())) >= 1500:
+        sub_score = sub[~clutter]
+        warnings.append(f"clutter planes removed for scoring: {int(clutter.sum())}/{len(sub)} pts")
+    else:
+        sub_score = sub
+    scan_c = sub_score.mean(0)
 
     def rz(deg: float) -> np.ndarray:
         r = np.deg2rad(deg)
@@ -1800,13 +1850,42 @@ def _auto_place_candidates(
                 for cy in yq:
                     centers.append(np.array([cx, cy, zc]))
 
-    scored: list[tuple[dict, dict, int]] = []
+    # M3: yaw 사전후보 — 모델 배관 방위 분포(길이 가중) vs scan 수평 주축
+    yaws: list[float] = [float(a) for a in range(0, 360, 20)]
+    lin_dirs = []
+    for o in model_objects:
+        if o.get("is_linear") and o.get("start") and o.get("end"):
+            dvec = np.asarray(o["end"], dtype=np.float64) - np.asarray(o["start"], dtype=np.float64)
+            L = float(np.linalg.norm(dvec[:2]))
+            if L > 0.3:
+                lin_dirs.append((float(np.degrees(np.arctan2(dvec[1], dvec[0])) % 180.0), L))
+    if lin_dirs and len(sub_score) >= 100:
+        hist36 = np.zeros(36)
+        for az, w in lin_dirs:
+            hist36[int(az // 5) % 36] += w
+        model_modes = [float(b * 5 + 2.5) for b in np.argsort(hist36)[::-1][:2] if hist36[b] > 0]
+        sg_xy = (R0 @ sub_score.T).T[:, :2]
+        sg_xy = sg_xy - sg_xy.mean(0)
+        evals, evecs = np.linalg.eigh(sg_xy.T @ sg_xy)
+        scan_axes = [float(np.degrees(np.arctan2(evecs[1, i], evecs[0, i])) % 180.0) for i in (1, 0)]
+        cand_yaws: set[float] = set()
+        for m in model_modes:
+            for sax in scan_axes:
+                for flip in (0.0, 180.0):
+                    base = (m - sax + flip) % 360.0
+                    for dd in (-10.0, 0.0, 10.0):
+                        cand_yaws.add(round((base + dd) % 360.0, 1))
+        if cand_yaws:
+            yaws = sorted(cand_yaws)
+            warnings.append(f"yaw prior from pipe azimuths: {len(yaws)} candidates")
+
+    scored: list[tuple[dict, dict, float]] = []
     for cgrid in centers:
-        for a in range(0, 360, 20):
+        for a in yaws:
             R = rz(a) @ R0
             t = cgrid - scale * (R @ scan_c)
             al = {"scale": scale, "rotation": R.tolist(), "translation": t.tolist()}
-            sc = _corroborate_alignment(sub, tree, al, max_points=3000, sample_radii=sample_radii)
+            sc = _corroborate_alignment(sub_score, tree, al, max_points=3000, sample_radii=sample_radii)
             if sc.get("ok"):
                 scored.append((sc, al, a))
     if not scored:
@@ -1835,12 +1914,12 @@ def _auto_place_candidates(
             for d in ([0.4, 0, 0], [-0.4, 0, 0], [0, 0.4, 0], [0, -0.4, 0], [0, 0, 0.25], [0, 0, -0.25]):
                 a2 = dict(al)
                 a2["translation"] = (np.asarray(al["translation"]) + d).tolist()
-                s2 = _corroborate_alignment(sub, tree, a2, max_points=3000, sample_radii=sample_radii)
+                s2 = _corroborate_alignment(sub_score, tree, a2, max_points=3000, sample_radii=sample_radii)
                 if s2["median_nn_m"] < cur["median_nn_m"]:
                     al, cur, improved = a2, s2, True
             if not improved:
                 break
-        final = _corroborate_alignment(sub, tree, al, max_points=20_000, sample_radii=sample_radii)
+        final = _corroborate_alignment(sub_score, tree, al, max_points=20_000, sample_radii=sample_radii)
         # 표면 거리 척도 기준 캘리브레이션: +3m 오배치가 yellow를 통과하지 못하는 값
         quality = "yellow" if (final.get("median_nn_m", 9e9) <= 0.25 and final.get("inlier_ratio", 0.0) >= 0.50) else "red"
         alignment = {
@@ -3104,7 +3183,8 @@ async def analyze_coverage(upload_id: str, payload: dict):
                 all_d = np.linalg.norm(diff, axis=2)
                 idx = all_d.argmin(axis=1)
                 dists = all_d[np.arange(samples.shape[0]), idx]
-            hit = dists <= dist_thresh
+            # M1b: 객체 샘플은 중심선/중심점이므로 표면 반경만큼 허용 거리를 가산
+            hit = dists <= (dist_thresh + _object_surface_radius(obj))
             coverage = float(hit.mean()) if hit.size else 0.0
             distribution_metrics = {
                 "sample_count": int(hit.size),
