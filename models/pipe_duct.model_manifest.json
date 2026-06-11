@@ -10,10 +10,10 @@
   "up_axis": "Z_UP",
   "metadata_kind": "glb_native",
   "glb_axis_transform": "gltf_yup_to_zup",
-  "object_count": 372,
+  "object_count": 454,
   "counts_by_category": {
-    "Pipe": 85,
-    "PipeFitting": 133,
+    "Pipe": 166,
+    "PipeFitting": 134,
     "Duct": 78,
     "DuctFitting": 76
   },
@@ -23,8 +23,8 @@
   "manifest_valid": true,
   "guid_mapping_ratio": 1.0,
   "guid_mapping_status": "direct",
-  "guid_mapped_count": 372,
-  "guid_total": 372,
+  "guid_mapped_count": 454,
+  "guid_total": 454,
   "fallback_geometry": "pag_proxy",
   "fallback_geometry_count": 0,
   "coverage_geometry_source": "glb_guid_mesh",
@@ -33,7 +33,7 @@
     "min": [
       -12.737853050231934,
       -19.14891242980957,
-      0.0
+      26.329999923706055
     ],
     "max": [
       6.864314079284668,
@@ -43,14 +43,14 @@
     "span": [
       19.6021671295166,
       44.855573654174805,
-      27.465002059936523
+      1.1350021362304688
     ],
     "center": [
       -2.936769485473633,
       3.278874397277832,
-      13.732501029968262
+      26.89750099182129
     ],
-    "diagonal_m": 56.13015038436045
+    "diagonal_m": 48.96484120129309
   },
   "glb_bytes": 3698816,
   "metadata_bytes": 0
