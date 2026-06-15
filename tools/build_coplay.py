@@ -69,11 +69,17 @@ scene.add(new THREE.HemisphereLight(0xbfd4ff,0x202830,0.5));
 const controls=new OrbitControls(camera,renderer.domElement);
 function b64f32(s){const bin=atob(s);const u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return new Float32Array(u.buffer);}
 const box=new THREE.Box3();
+const MESH_OBJS=[];
 for(const m of MESHES){
-  const pos=b64f32(m.b64);
+  const pos=b64f32(m.b64); const n=pos.length/3;
   const g=new THREE.BufferGeometry(); g.setAttribute('position',new THREE.BufferAttribute(pos,3)); g.computeVertexNormals();
-  const mat=new THREE.MeshStandardMaterial({color:new THREE.Color(m.color[0],m.color[1],m.color[2]),roughness:0.75,metalness:0.05,side:THREE.DoubleSide,transparent:true,opacity:0.92});
+  const base=new Float32Array(pos.length);
+  for(let i=0;i<n;i++){base[i*3]=m.color[0];base[i*3+1]=m.color[1];base[i*3+2]=m.color[2];}
+  const col=base.slice();
+  g.setAttribute('color',new THREE.BufferAttribute(col,3));
+  const mat=new THREE.MeshStandardMaterial({vertexColors:true,roughness:0.75,metalness:0.05,side:THREE.DoubleSide,transparent:true,opacity:0.92});
   const mesh=new THREE.Mesh(g,mat); scene.add(mesh); box.expandByObject(mesh);
+  MESH_OBJS.push({mesh,pos,base,col,n});
 }
 const c0=box.getCenter(new THREE.Vector3()), sz=box.getSize(new THREE.Vector3());
 // camera path + frustum
@@ -88,13 +94,34 @@ const cone=new THREE.Mesh(new THREE.ConeGeometry(0.6,1.4,4),new THREE.MeshBasicM
 cone.rotation.x=Math.PI/2; frustum.add(cone);
 const ball=new THREE.Mesh(new THREE.SphereGeometry(0.35,16,12),new THREE.MeshBasicMaterial({color:0x31d27c})); frustum.add(ball);
 scene.add(frustum);
+// view camera + frustum-based "what does this frame map to" highlight
+const viewCam=new THREE.PerspectiveCamera(70,1.4,0.1,Math.max(2,Math.min(sz.x,sz.z)*0.25));
+const _fr=new THREE.Frustum(), _m4=new THREE.Matrix4(), _v=new THREE.Vector3();
+let lastHi=-1;
+function highlight(i){
+  const p=POSES[i]; if(!p)return;
+  viewCam.position.set(p.c[0],p.c[1],p.c[2]); viewCam.up.set(p.u[0],p.u[1],p.u[2]);
+  viewCam.lookAt(p.c[0]+p.f[0],p.c[1]+p.f[1],p.c[2]+p.f[2]);
+  viewCam.updateMatrixWorld(true); viewCam.updateProjectionMatrix();
+  _fr.setFromProjectionMatrix(_m4.multiplyMatrices(viewCam.projectionMatrix,viewCam.matrixWorldInverse));
+  let hit=0;
+  for(const o of MESH_OBJS){
+    for(let k=0;k<o.n;k++){
+      _v.set(o.pos[k*3],o.pos[k*3+1],o.pos[k*3+2]);
+      if(_fr.containsPoint(_v)){o.col[k*3]=0.2;o.col[k*3+1]=1.0;o.col[k*3+2]=0.55;hit++;}
+      else{o.col[k*3]=o.base[k*3];o.col[k*3+1]=o.base[k*3+1];o.col[k*3+2]=o.base[k*3+2];}
+    }
+    o.mesh.geometry.attributes.color.needsUpdate=true;
+  }
+  document.getElementById('frameinfo').textContent='frame '+i+' / '+(POSES.length-1)+' · 매핑 정점 '+hit;
+}
 function setFrustum(i){
   i=Math.max(0,Math.min(POSES.length-1,i|0)); const p=POSES[i]; if(!p)return;
   frustum.position.set(p.c[0],p.c[1],p.c[2]);
   const fwd=new THREE.Vector3(p.f[0],p.f[1],p.f[2]).normalize();
   const tgt=new THREE.Vector3().addVectors(frustum.position,fwd);
   frustum.up.set(p.u[0],p.u[1],p.u[2]); frustum.lookAt(tgt);
-  document.getElementById('frameinfo').textContent='frame '+i+' / '+(POSES.length-1);
+  if(i!==lastHi){ lastHi=i; highlight(i); }
 }
 setFrustum(0);
 // fit view
