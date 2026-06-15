@@ -1,0 +1,13 @@
+# 우상단 미니맵: 전체 맵 부감(birdeye), 작은 해상도
+scene: {voxel_size: 0.001, octree_level: 16, max_depth: 10.0, downsample: 2, color_update: first, jitter: true}
+preprocess: {mask_sky: false, conf_threshold: 0.0, vis_threshold: 2.5}
+camera:
+  fov: 60.0
+  transition: 1
+  segments:
+    - mode: birdeye
+      frames: [0, -1]
+      reveal_height_mult: 2.5
+render: {combined_video: false, width: 768, height: 540, point_size: 1.0, near: 0.05, far: 100.0, background: '#101418'}
+overlay: {camera_vis: default, trail_tail_len: 80, head_num_frames: 6}
+pipeline: {fps: 30, num_workers: 8}

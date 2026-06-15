@@ -20,3 +20,10 @@ ckpts/
 out/
 video/
 models/old/
+
+# demo_render isolated env (kaolin/cuda12.4)
+.venv-lbdemo/
+video/_demo_ref/
+out_demo_render/
+out_kakao/
+out_kakao_fmt/

@@ -11,7 +11,10 @@ setup(
                 'voxel_morton/voxel_morton_bind.cpp',
                 'voxel_morton/voxel_morton.cu',
             ],
-            extra_compile_args={'nvcc': ['-O3', '--use_fast_math']},
+            extra_compile_args={
+                'cxx': ['-D_GNU_SOURCE'],
+                'nvcc': ['-O3', '--use_fast_math', '-D_GNU_SOURCE', '-Xcompiler', '-D_GNU_SOURCE'],
+            },
         ),
         CUDAExtension(
             'frustum_cull_ext',
@@ -19,7 +22,10 @@ setup(
                 'frustum_cull/frustum_cull_bind.cpp',
                 'frustum_cull/frustum_cull.cu',
             ],
-            extra_compile_args={'nvcc': ['-O2']},
+            extra_compile_args={
+                'cxx': ['-D_GNU_SOURCE'],
+                'nvcc': ['-O2', '-D_GNU_SOURCE', '-Xcompiler', '-D_GNU_SOURCE'],
+            },
         ),
     ],
     cmdclass={'build_ext': BuildExtension},

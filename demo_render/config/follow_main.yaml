@@ -1,0 +1,17 @@
+# 메인 뷰: 촬영자 시점(follow chase-cam) 전체 시퀀스
+scene: {voxel_size: 0.001, octree_level: 16, max_depth: 10.0, downsample: 2, color_update: first, jitter: true}
+preprocess: {mask_sky: false, conf_threshold: 0.0, vis_threshold: 2.5}
+camera:
+  fov: 65.0
+  transition: 30
+  segments:
+    - mode: follow
+      frames: [0, -1]
+      back_offset: 0.25
+      up_offset: 0.08
+      look_offset: 0.6
+      smooth_window: 60
+      scale_frames: 100
+render: {combined_video: false, width: 1920, height: 1080, point_size: 1.0, near: 0.05, far: 100.0, background: '#1e1e1e'}
+overlay: {camera_vis: default, trail_tail_len: 60, head_num_frames: 8}
+pipeline: {fps: 30, num_workers: 8}
