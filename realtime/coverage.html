@@ -134,8 +134,10 @@
     <div class="help">자동 배치가 원칙입니다: 중력 정렬 + metric scale 기하 탐색으로 배치 가설을 만들고, 미리보기 확인 후 명시적으로 저장합니다. 대응점을 1개만 찍어두면 그 모델 좌표를 시작 힌트로 사용해 탐색을 좁힙니다.</div>
     <div class="row">
       <button id="autoPlaceBtn" class="primary">자동 배치</button>
+      <button id="startHintBtn">시작점 지정</button>
       <button id="candidateBtn">후보 계산</button>
     </div>
+    <div class="help">반복 배관 모델에선 <b>시작점 지정</b>을 누르고 ① 촬영 시작 위치 ② 촬영 방향(이동/배관 진행 방향)을 모델에서 2번 클릭하면, 그 영역·방향으로 좁혀 자동 배치합니다. 방향까지 주면 yaw 모호성이 사라져 위치/방향이 맞습니다. (스케일은 monocular라 자동 탐색)</div>
     <div id="candidateInfo" class="help">후보 계산 전</div>
   </div>
 
@@ -252,6 +254,7 @@ const groups = {
   scan: new THREE.Group(),
   pointCloud: new THREE.Group(),
   pairs: new THREE.Group(),
+  startHint: new THREE.Group(),
   selection: new THREE.Group(),
 };
 Object.values(groups).forEach(g => scene.add(g));
@@ -280,6 +283,9 @@ const state = {
   },
   pairs: [],
   pickMode: false,
+  startPickMode: false,
+  startHint: null,
+  startDir: null,
   pendingPair: null,
   pointCloudLoaded: false,
   modelOpacity: 0.26,
@@ -370,6 +376,7 @@ function updateActionAvailability() {
   $('analyzeBtn').disabled = !canAnalyzeCoverage();
   $('saveAlignmentBtn').disabled = !canSaveAlignment();
   $('pickPairBtn').disabled = !ok || !state.upload;
+  $('startHintBtn').disabled = !ok || !state.upload;
   $('candidateBtn').disabled = !ok || !state.upload;
 }
 
@@ -675,6 +682,9 @@ function readPairsInput() {
 function resetAlignmentPairs() {
   state.pairs = [];
   state.pendingPair = null;
+  state.startHint = null;
+  state.startPickMode = false;
+  clearGroup(groups.startHint);
   syncPairsInput();
   drawPairs();
 }
@@ -1452,9 +1462,10 @@ async function autoPlaceAlignment() {
     setStatus('manifest invalid: 자동 배치 불가', 'bad');
     return;
   }
-  let hint;
-  if (state.pairs.length === 1 && Array.isArray(state.pairs[0]?.model)) hint = state.pairs[0].model;
-  setStatus(hint ? '자동 배치 탐색 중... (시작 힌트 사용)' : '자동 배치 탐색 중... (중력 정렬 · metric scale)', 'warn');
+  let hint = Array.isArray(state.startHint) ? state.startHint : undefined;
+  if (!hint && state.pairs.length === 1 && Array.isArray(state.pairs[0]?.model)) hint = state.pairs[0].model;
+  const dirAz = (hint && typeof state.startDir === 'number') ? state.startDir : undefined;
+  setStatus(hint ? `자동 배치 탐색 중... (시작 힌트${dirAz !== undefined ? '·방향' : ''} 사용)` : '자동 배치 탐색 중... (중력 정렬 · 기하 탐색)', 'warn');
   const r = await fetch(`/api/uploads/${state.upload.id}/alignment/candidates`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -1462,6 +1473,7 @@ async function autoPlaceAlignment() {
       model_id: state.model.model_id,
       auto_place: true,
       start_hint: hint,
+      direction_az: dirAz,
       max_candidates: 3,
     }),
   });
@@ -1777,7 +1789,7 @@ async function setPickMode(enabled) {
       setStatus('대응점 입력용 점군 자동 로딩...', 'warn');
       await loadPointCloudOverlay();
     }
-    if (!hasScanPickGeometry() || !groups.proxy.children.length) {
+    if (!hasScanPickGeometry() || (!groups.proxy.children.length && !groups.model.children.length)) {
       state.pickMode = false;
       setStatus('모델과 스캔 GLB/점군을 먼저 불러오세요', 'bad');
     } else {
@@ -1842,6 +1854,80 @@ function handleAlignmentPick(e) {
   setStatus(`대응점 ${state.pairs.length}개 저장`, kind);
 }
 
+function drawStartHintMarker(p0, p1) {
+  clearGroup(groups.startHint);
+  const sph = new THREE.Mesh(
+    new THREE.SphereGeometry(0.25, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0x31d27c }));
+  sph.position.copy(p0);
+  const pin = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([p0.clone(), p0.clone().add(new THREE.Vector3(0, 0, 3))]),
+    new THREE.LineBasicMaterial({ color: 0x31d27c }));
+  groups.startHint.add(sph, pin);
+  if (p1) { // 촬영 방향 화살표
+    const arrow = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([p0.clone(), p1.clone()]),
+      new THREE.LineBasicMaterial({ color: 0xffd166 }));
+    const tip = new THREE.Mesh(
+      new THREE.ConeGeometry(0.18, 0.5, 12),
+      new THREE.MeshBasicMaterial({ color: 0xffd166 }));
+    tip.position.copy(p1);
+    groups.startHint.add(arrow, tip);
+  }
+}
+
+function setStartPickMode(enabled) {
+  state.startPickMode = Boolean(enabled);
+  if (state.startPickMode) {
+    state.pickMode = false; // 대응점 찍기와 상호 배타
+    state.startHint = null;
+    state.startDir = null;
+    clearGroup(groups.startHint);
+    if (!groups.proxy.children.length && !groups.model.children.length) {
+      state.startPickMode = false;
+      setStatus('모델을 먼저 불러오세요', 'bad');
+    } else {
+      groups.model.visible = true;
+      groups.proxy.visible = true;
+      setStatus('① 촬영 시작 위치를 모델(배관)에서 클릭하세요', 'warn');
+    }
+  }
+  $('startHintBtn').textContent = state.startPickMode ? '시작점/방향 클릭...' : '시작점 지정';
+  $('startHintBtn').className = state.startPickMode ? 'primary' : '';
+}
+
+async function handleStartPick(e) {
+  setMouseFromEvent(e);
+  let hits = pickHitsFrom(groups.proxy);
+  if (!hits.length) hits = pickHitsFrom(groups.model);
+  if (!hits.length) {
+    setStatus('모델 표면(배관)을 클릭하세요', 'warn');
+    return;
+  }
+  const p = hits[0].point;
+  if (!Array.isArray(state.startHint)) {
+    // ① 시작 위치
+    state.startHint = roundPoint(p);
+    drawStartHintMarker(p, null);
+    setStatus('② 촬영 방향(이동/배관 진행 방향)으로 한 번 더 클릭하세요', 'warn');
+    return;
+  }
+  // ② 방향
+  const dx = p.x - state.startHint[0], dy = p.y - state.startHint[1];
+  if (Math.hypot(dx, dy) < 0.3) {
+    setStatus('시작점과 더 떨어진 방향 지점을 클릭하세요', 'warn');
+    return;
+  }
+  state.startDir = Number((Math.atan2(dy, dx) * 180 / Math.PI).toFixed(1));
+  drawStartHintMarker(new THREE.Vector3(state.startHint[0], state.startHint[1], state.startHint[2]), p);
+  setStartPickMode(false);
+  setStatus(`시작점·방향(${state.startDir.toFixed(0)}°) 설정 · 자동 배치 실행...`, 'warn');
+  if (!state.pointCloudLoaded) await loadPointCloudOverlay();
+  groups.pointCloud.visible = true;
+  groups.scan.visible = true;
+  await autoPlaceAlignment();
+}
+
 function handleSceneClick(e) {
   setMouseFromEvent(e);
   const hits = raycaster.intersectObjects([...groups.proxy.children, ...groups.model.children, ...groups.path.children], true);
@@ -1863,6 +1949,10 @@ function handleSceneClick(e) {
 }
 
 renderer.domElement.addEventListener('click', e => {
+  if (state.startPickMode) {
+    handleStartPick(e);
+    return;
+  }
   if (state.pickMode) {
     handleAlignmentPick(e);
     return;
@@ -2239,6 +2329,7 @@ async function init() {
     open(`/coverage-report.html?model=${encodeURIComponent(model)}&upload=${encodeURIComponent(upload)}`, '_blank', 'noopener');
   };
   $('pickPairBtn').onclick = () => setPickMode(!state.pickMode);
+  $('startHintBtn').onclick = () => setStartPickMode(!state.startPickMode);
   $('undoPairBtn').onclick = () => {
     state.pendingPair = null;
     state.pairs.pop();

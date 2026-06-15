@@ -1765,6 +1765,7 @@ def _auto_place_candidates(
     *,
     scale: float = 1.0,
     start_hint: list | None = None,
+    direction_az: float | None = None,
     max_candidates: int = 3,
 ) -> tuple[list[dict], list[str]]:
     """중력 정렬(+metric scale) 기하 탐색으로 scan->model 배치 가설을 만든다.
@@ -1859,7 +1860,24 @@ def _auto_place_candidates(
             L = float(np.linalg.norm(dvec[:2]))
             if L > 0.3:
                 lin_dirs.append((float(np.degrees(np.arctan2(dvec[1], dvec[0])) % 180.0), L))
-    if lin_dirs and len(sub_score) >= 100:
+    if direction_az is not None and len(sub_score) >= 30:
+        # 사용자가 지정한 촬영 방향으로 yaw를 고정한다(±refine). scan 수평 주축에 그 방향을
+        # 맞춰 후보를 만들어 전역 yaw 스윕의 모호성을 제거한다(방향 미지정 시 기존 로직 사용).
+        sg_xy = (R0 @ sub_score.T).T[:, :2]
+        sg_xy = sg_xy - sg_xy.mean(0)
+        evals, evecs = np.linalg.eigh(sg_xy.T @ sg_xy)
+        # primary(최대 분산) 수평 주축 1개만 사용한다. 양 직교 축을 모두 쓰면 90도 모호성으로
+        # 사용자 방향이 상쇄돼 무의미해진다. flip(±180)은 PCA 축의 부호 모호성 보정용.
+        sax = float(np.degrees(np.arctan2(evecs[1, 1], evecs[0, 1])) % 180.0)
+        m = float(direction_az) % 180.0
+        cand_yaws = set()
+        for flip in (0.0, 180.0):
+            base = (m - sax + flip) % 360.0
+            for dd in (-8.0, -4.0, 0.0, 4.0, 8.0):
+                cand_yaws.add(round((base + dd) % 360.0, 1))
+        yaws = sorted(cand_yaws)
+        warnings.append(f"yaw from user direction {round(m,1)}deg: {len(yaws)} candidates")
+    elif lin_dirs and len(sub_score) >= 100:
         hist36 = np.zeros(36)
         for az, w in lin_dirs:
             hist36[int(az // 5) % 36] += w
@@ -1879,15 +1897,26 @@ def _auto_place_candidates(
             yaws = sorted(cand_yaws)
             warnings.append(f"yaw prior from pipe azimuths: {len(yaws)} candidates")
 
+    # 단안(up-to-scale) 재구성이라 절대 scale이 미지수다. start_hint(가이드 모드)에서는
+    # scale도 함께 탐색해 배관 겹침(표면 거리)이 최소가 되는 배율을 찾는다. scan center를
+    # 피벗으로 t를 맞춰 scale을 바꿔도 시작점은 힌트에 고정된다. 힌트 없는 경로는 기존대로 고정.
+    if start_hint is not None and len(start_hint) == 3:
+        scale_cands = sorted({round(scale * f, 4) for f in
+                              (0.5, 0.65, 0.8, 0.9, 1.0, 1.15, 1.35, 1.6, 2.0)})
+        warnings.append(f"scale search enabled (guided): {len(scale_cands)} candidates")
+    else:
+        scale_cands = [scale]
+
     scored: list[tuple[dict, dict, float]] = []
     for cgrid in centers:
         for a in yaws:
             R = rz(a) @ R0
-            t = cgrid - scale * (R @ scan_c)
-            al = {"scale": scale, "rotation": R.tolist(), "translation": t.tolist()}
-            sc = _corroborate_alignment(sub_score, tree, al, max_points=3000, sample_radii=sample_radii)
-            if sc.get("ok"):
-                scored.append((sc, al, a))
+            for s in scale_cands:
+                t = cgrid - s * (R @ scan_c)
+                al = {"scale": s, "rotation": R.tolist(), "translation": t.tolist()}
+                sc = _corroborate_alignment(sub_score, tree, al, max_points=3000, sample_radii=sample_radii)
+                if sc.get("ok"):
+                    scored.append((sc, al, a))
     if not scored:
         return [], ["auto placement search produced no candidates"]
     scored.sort(key=lambda x: x[0]["median_nn_m"])
@@ -2310,6 +2339,8 @@ async def alignment_candidates(upload_id: str, payload: dict):
                     model_objects,
                     scale=float(payload.get("scale") or 1.0),
                     start_hint=payload.get("start_hint"),
+                    direction_az=(float(payload["direction_az"])
+                                  if payload.get("direction_az") is not None else None),
                     max_candidates=int(payload.get("max_candidates") or 3),
                 )
                 candidates.extend(auto_cands)

@@ -7,7 +7,14 @@ Assumes realtime/server.py is running and the upload's scan is reconstructed.
 Usage:
     .venv/bin/python tools/align_video_to_model.py \
         --base-url http://127.0.0.1:8767 --model pipe_duct \
-        --upload upload_XXXX --out reports/pipe_duct_align
+        --upload upload_XXXX --out reports/pipe_duct_align \
+        [--start-hint "x,y,z"]
+
+In repeated-geometry models (e.g. pipe racks) video-only global localization is
+ambiguous. Without --start-hint the tool refuses to auto-save the top candidate
+and instead lists the candidate locations; pass the approx model coordinate where
+filming started (or click a start point in the coverage.html web view) to collapse
+the search and place it correctly.
 """
 from __future__ import annotations
 import argparse, json, time, urllib.error, urllib.parse, urllib.request
@@ -43,10 +50,23 @@ def main():
     ap.add_argument("--model", default="pipe_duct")
     ap.add_argument("--upload", required=True)
     ap.add_argument("--out", default="reports/pipe_duct_align")
+    ap.add_argument("--start-hint", default=None,
+                    help="approx model coord 'x,y,z' where filming started; collapses the "
+                         "auto-place search to ±1.5m around it (required to auto-save in "
+                         "repeated/ambiguous models)")
     args = ap.parse_args()
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     base, model, up = args.base_url, args.model, args.upload
     summary = {"upload": up, "model": model}
+
+    hint = None
+    if args.start_hint:
+        try:
+            hint = [float(x) for x in args.start_hint.split(",")]
+            assert len(hint) == 3
+        except Exception:
+            print(f"  ! bad --start-hint {args.start_hint!r}, expected 'x,y,z'"); return
+        summary["start_hint"] = hint
 
     # 1) wait for scan
     print("== 1. scan status ==")
@@ -63,13 +83,16 @@ def main():
         print("  scan never became ready"); return
 
     # 2) auto-place candidates (persisted)
-    print("== 2. auto-place candidates ==")
+    print(f"== 2. auto-place candidates =={' (start hint '+str(hint)+')' if hint else ''}")
+    cand_payload = {"model_id": model, "auto_place": True, "max_candidates": 5, "dry_run": False}
+    if hint is not None:
+        cand_payload["start_hint"] = hint
     _, cand = req(base, f"/api/uploads/{up}/alignment/candidates", method="POST",
-                  payload={"model_id": model, "auto_place": True, "max_candidates": 5, "dry_run": False},
-                  expect={200})
+                  payload=cand_payload, expect={200})
     cands = cand.get("candidates") or []
     rep = cand.get("repetition_risk") or {}
-    print(f"  status={cand.get('status')} repetition_risk={rep.get('level')} n_candidates={len(cands)}")
+    a_status = cand.get("status")
+    print(f"  status={a_status} repetition_risk={rep.get('level')} n_candidates={len(cands)}")
     for c in cands:
         a = c.get("alignment") or {}; co = c.get("corroboration") or {}
         print(f"   - {c.get('id')} src={c.get('source')} q={a.get('quality')} score={c.get('score')} "
@@ -81,6 +104,22 @@ def main():
     if not autos:
         print("  no auto candidates"); summary["result"] = "no_auto_candidate"
         (out / f"{up}_align_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2)); return
+
+    # Guardrail: video-only auto-placement is ambiguous in repeated-geometry models
+    # (multiple plausible global positions). Do NOT blindly save the top candidate —
+    # it can commit a plausible-but-wrong location. Require a start hint to proceed.
+    ambiguous = (a_status == "ambiguous_alignment") or (rep.get("level") == "high")
+    if hint is None and ambiguous:
+        summary["result"] = "needs_start_hint"
+        print("  ! 모호/반복 모델 + 시작 힌트 없음 → 자동 저장 보류 (틀린 위치 방지)")
+        print("    아래 후보 중 올바른 영역을 골라 --start-hint 'x,y,z' (모델 좌표)로 재실행하거나")
+        print("    웹뷰 coverage.html에서 시작점을 클릭해 자동 배치하세요. 후보 위치(translation):")
+        for c in autos:
+            t = (c.get("alignment") or {}).get("translation") or []
+            print(f"      {c.get('id')}: t={[round(x,2) for x in t]} score={c.get('score')}")
+        (out / f"{up}_align_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2))
+        print(f"\nwrote {out}/{up}_align_summary.json (no alignment saved)"); return
+
     best = max(autos, key=lambda c: (c.get("can_save", False), c.get("score") or 0))
     summary["best_candidate_id"] = best.get("id")
     print(f"  best: {best.get('id')} (can_save={best.get('can_save')})")
