@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 import torch
 
-from lingbot_map.models.gct_stream import GCTStream
+from lingbot_map.models.gct_stream_window import GCTStream
 from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
 from lingbot_map.utils.geometry import (
     closed_form_inverse_se3_general,
@@ -382,15 +382,14 @@ class InferenceWorker:
         use_long = total > multi_window_threshold
 
         if use_long:
-            # Multi-window: split into K windows of `target_frames` each
+            # Long video: sample uniformly, let the model window+align internally.
             num_windows = max(2, min(4, total // (target_frames * 2)))
             payload, thumbs_jpeg, info = await self._process_video_multiwindow(
                 str(path), target_frames=target_frames,
                 num_windows=num_windows, overlap=window_overlap,
             )
             info.update(meta_probe)
-            info["mode"] = "multi-window"
-            info["windows"] = num_windows
+            info["mode"] = "windowed (upstream inference_windowed)"
             return payload, thumbs_jpeg, info
 
         snap, meta = await loop.run_in_executor(
@@ -431,64 +430,38 @@ class InferenceWorker:
     async def _process_video_multiwindow(
         self, video_path: str, target_frames: int, num_windows: int, overlap: int,
     ) -> tuple[bytes | None, list[bytes], dict]:
-        """Tier 3: Sample windows from the video, infer each, align via Procrustes,
-        and run the final fusion (Tier1 + TSDF if enabled) on the merged data."""
+        """Long-video path: feed the whole uniformly-sampled sequence to the
+        model's own windowed inference (`GCTStream.inference_windowed`), which
+        aligns windows internally using overlap-as-scale-frames + learned
+        per-window transforms — no hand-rolled Procrustes/ICP stitching. The
+        single merged result then goes through the same Tier1 (+ optional TSDF)
+        fusion as the short-video path."""
         loop = asyncio.get_running_loop()
         info: dict = {}
 
-        # Decide window bounds in raw-frame indices, with overlap
         meta = self._probe_video(video_path)
         total = meta["total_frames"]
-        # frame-range of each window
-        # span = window's source frame range; consecutive windows share `overlap` virtual frames
-        # We define virtual-frame indices [0..target_frames*num_windows - overlap*(num_windows-1)]
-        # mapped uniformly into [0..total-1].
+        # Sample `eff_len` frames uniformly across the whole video (same density
+        # as before) and let the model window them internally.
         eff_len = target_frames * num_windows - overlap * (num_windows - 1)
         virt_indices = np.linspace(0, total - 1, eff_len).astype(int)
-        win_virt_ranges = []
-        for k in range(num_windows):
-            start_v = k * (target_frames - overlap)
-            end_v = start_v + target_frames
-            win_virt_ranges.append((start_v, end_v))
+        snap = await loop.run_in_executor(
+            None, self._sample_video_by_indices, video_path,
+            [int(v) for v in virt_indices], meta["rotation"],
+        )
+        if not snap:
+            return None, [], {"error": "no frames extracted"}
 
-        # Sample per-window: extract `target_frames` real-frame indices for each window
-        windows_data = []
-        thumbs_per_window: list[list[np.ndarray]] = []
-        for k, (s, e) in enumerate(win_virt_ranges):
-            real_idx = [int(virt_indices[i]) for i in range(s, e)]
-            snap = await loop.run_in_executor(
-                None, self._sample_video_by_indices, video_path, real_idx, meta["rotation"]
-            )
-            if not snap:
-                continue
-            win_raw = await loop.run_in_executor(None, self._run_window_raw, snap)
-            if win_raw is None:
-                continue
-            windows_data.append(win_raw)
-            thumbs_per_window.append([t[1] for t in snap])
+        merged = await loop.run_in_executor(None, self._run_windowed, snap, overlap)
+        if merged is None:
+            return None, [], {"error": "windowed inference produced no output"}
+        info["chunk_scales"] = merged.get("chunk_scales")
+        info["frames_used"] = merged["frame_count"]
 
-        if not windows_data:
-            return None, [], {"error": "no windows produced output"}
-        info["windows_succeeded"] = len(windows_data)
-
-        # Align windows via Procrustes on overlap cam centers
-        from registration import chain_windows
-        try:
-            merged = chain_windows(windows_data, overlap=overlap)
-            info["alignment_scales"] = merged.get("scales_to_ref")
-        except Exception as exc:
-            log.exception("multi-window alignment failed: %s", exc)
-            return None, [], {"error": f"alignment failed: {exc}"}
-
-        # Run final fusion (Tier 1 + Tier 2) on merged data
         payload = await loop.run_in_executor(None, self._fuse_merged, merged)
 
-        # Build thumbs JPEG (drop overlap dupes to match merged frame count)
-        thumbs_flat: list[np.ndarray] = list(thumbs_per_window[0])
-        for k in range(1, len(thumbs_per_window)):
-            thumbs_flat.extend(thumbs_per_window[k][overlap:])
         thumbs_jpeg: list[bytes] = []
-        for thumb_rgb in thumbs_flat:
+        for _, thumb_rgb, _ in snap:
             small = cv2.resize(thumb_rgb, (128, 128), interpolation=cv2.INTER_AREA)
             bgr = cv2.cvtColor(small, cv2.COLOR_RGB2BGR)
             ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
@@ -501,7 +474,6 @@ class InferenceWorker:
                 log.warning("broadcast failed: %s", e)
 
         info.update({
-            "frames_used": merged["frame_count"],
             "payload_bytes": len(payload) if payload else 0,
             "thumbs_bytes": sum(len(t) for t in thumbs_jpeg),
         })
@@ -534,24 +506,33 @@ class InferenceWorker:
         cap.release()
         return snap
 
-    def _run_window_raw(self, snap):
-        """Run inference on one window; return per-window raw data (no fusion yet).
-        Used by multi-window pipeline before Procrustes alignment.
-        Returns dict or None if depth missing."""
+    def _run_windowed(self, snap, overlap: int):
+        """Run the model's own windowed inference over the full sampled sequence
+        and return a dict shaped for `_fuse_merged`. Cross-window alignment is
+        done inside `inference_windowed` (overlap-as-scale-frames + learned
+        chunk_transforms), so every frame already shares one world frame + scale
+        — no external Procrustes/ICP. Returns None if depth missing."""
         if not snap:
             return None
         tensors = [t[0] for t in snap]
         thumbs = [t[1] for t in snap]
         seqs = [t[2] for t in snap]
-        images = torch.stack(tensors, dim=0).unsqueeze(0).to(self.device)
-        N, _, H, W = images.shape[1:]
+        images = torch.stack(tensors, dim=0).to(self.device)  # (N, 3, H, W)
+        N, _, H, W = images.shape
+        window_size = min(32, N)
+        ovl = min(overlap, max(1, window_size - 1))
         with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            preds = self.model.inference_streaming(
-                images.squeeze(0),
-                num_scale_frames=self.num_scale_frames,
+            preds = self.model.inference_windowed(
+                images,
+                window_size=window_size,
+                overlap_size=ovl,
+                num_scale_frames=min(self.num_scale_frames, window_size),
                 keyframe_interval=1,
                 output_device=None,
             )
+        chunk_scales = preds.get("chunk_scales")
+        chunk_scales = (chunk_scales.flatten().cpu().tolist()
+                        if chunk_scales is not None else None)
         for k in list(preds.keys()):
             if isinstance(preds[k], torch.Tensor) and preds[k].dim() >= 4 and preds[k].shape[0] == 1:
                 preds[k] = preds[k][0]
@@ -589,8 +570,9 @@ class InferenceWorker:
             all_source.append(np.full(idx.size, int(seqs[i]), dtype=np.uint32))
         if not all_xyz:
             return None
-        log.info("window: N_input=%d c2w.shape=%s xyz=%d",
-                 N, c2w_np.shape, sum(a.shape[0] for a in all_xyz))
+        n_windows = len(chunk_scales) if chunk_scales else 1
+        log.info("windowed: N=%d windows=%d xyz=%d",
+                 N, n_windows, sum(a.shape[0] for a in all_xyz))
         return {
             "xyz":  np.concatenate(all_xyz,  axis=0).astype(np.float32),
             "rgb":  np.concatenate(all_rgb,  axis=0).astype(np.uint8),
@@ -602,6 +584,9 @@ class InferenceWorker:
             "K":    K_np,
             "depth": depth_np.squeeze(-1),
             "thumbs": thumbs,
+            "frame_count": int(c2w_np.shape[0]),
+            "n_windows": n_windows,
+            "chunk_scales": chunk_scales,
         }
 
     def _fuse_merged(self, merged: dict) -> bytes | None:

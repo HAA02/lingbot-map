@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>멀티윈도우 점군 병합 개선 검증 보고서</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+:root {
+  --bg-page: #FCFBF9; --bg-card: #FFFFFF; --bg-muted: #F7F6F4; --bg-sidebar: #FAFAF8;
+  --text-primary: #1E2432; --text-secondary: #6B7280; --text-tertiary: #9CA3AF;
+  --accent: #E85A4F; --accent-light: rgba(232,90,79,0.1);
+  --border: #EFEFEF; --border-sub: #E8E8E8;
+  --radius: 16px; --shadow-sm: 0 1px 3px rgba(0,0,0,0.04);
+  --font-head: 'Outfit', sans-serif;
+  --font-body: 'Pretendard Variable', 'Pretendard', -apple-system, sans-serif;
+  --mono: 'Cascadia Code', 'Fira Code', monospace;
+  --sidebar-w: 260px;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+html { scroll-behavior: smooth; }
+body { font-family: var(--font-body); background: var(--bg-page); color: var(--text-primary); line-height: 1.7; }
+
+.sidebar { position:fixed; top:0; left:0; width:var(--sidebar-w); height:100vh; background:var(--bg-sidebar); border-right:1px solid var(--border); overflow-y:auto; z-index:1000; display:flex; flex-direction:column; }
+.sidebar-header { padding:28px 24px 20px; border-bottom:1px solid var(--border); }
+.sidebar-header h2 { font-family:var(--font-head); font-size:1.1rem; font-weight:700; color:var(--text-primary); }
+.sidebar-header p { font-size:0.75rem; color:var(--text-tertiary); font-weight:500; margin-top:4px; }
+.sidebar-nav { flex:1; padding:16px 0; overflow-y:auto; }
+.sidebar-nav a { display:flex; align-items:center; gap:12px; padding:10px 24px; color:var(--text-secondary); text-decoration:none; font-size:0.85rem; font-weight:500; border-left:3px solid transparent; transition:all 0.2s; }
+.sidebar-nav a:hover { color:var(--text-primary); background:var(--bg-muted); }
+.sidebar-nav a.active { color:var(--accent); background:var(--accent-light); border-left-color:var(--accent); }
+.sidebar-nav .nav-num { width:24px; height:24px; border-radius:6px; background:var(--bg-muted); border:1px solid var(--border); display:flex; align-items:center; justify-content:center; font-family:var(--font-head); font-size:0.7rem; font-weight:600; color:var(--text-tertiary); flex-shrink:0; }
+.sidebar-nav a.active .nav-num { background:var(--accent); border-color:var(--accent); color:#fff; }
+.sidebar-footer { padding:16px 24px; border-top:1px solid var(--border); font-size:0.72rem; color:var(--text-tertiary); }
+
+.main-content { margin-left:var(--sidebar-w); min-height:100vh; }
+.content-wrapper { max-width:980px; margin:0 auto; padding:48px; }
+
+.hero { background:linear-gradient(135deg, #FCFBF9 0%, #F0EEF5 50%, #EDF5F0 100%); padding:56px 48px; margin:-48px -48px 48px; border-bottom:1px solid var(--border); border-radius:0 0 24px 24px; position:relative; }
+.hero::before { content:''; position:absolute; top:0; left:48px; width:40px; height:3px; background:var(--accent); border-radius:2px; }
+.hero-content { padding-top:16px; }
+.hero h1 { font-family:var(--font-head); font-size:2.2rem; font-weight:600; letter-spacing:-0.02em; color:var(--text-primary); line-height:1.2; margin-bottom:12px; }
+.hero .subtitle { font-family:var(--font-head); font-size:1.05rem; color:var(--text-secondary); font-weight:500; margin-bottom:20px; }
+.hero .description { font-size:0.92rem; color:var(--text-tertiary); max-width:660px; line-height:1.7; }
+
+.section { margin-bottom:56px; opacity:0; transform:translateY(20px); transition:opacity 0.6s, transform 0.6s; }
+.section.visible { opacity:1; transform:translateY(0); }
+.section-header { display:flex; align-items:center; gap:12px; margin-bottom:8px; }
+.section-line { width:24px; height:2px; background:var(--accent); border-radius:1px; }
+.section-label { font-family:var(--font-head); font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:2px; color:var(--text-tertiary); }
+.section-title { font-family:var(--font-head); font-size:1.4rem; font-weight:600; color:var(--text-primary); margin-bottom:8px; }
+.section-desc { color:var(--text-secondary); margin-bottom:24px; font-size:0.92rem; }
+.section p { color:var(--text-secondary); font-size:0.92rem; margin:12px 0; }
+.section h3 { font-family:var(--font-head); font-size:1.05rem; font-weight:600; color:var(--text-primary); margin:24px 0 8px; }
+
+.stat-cards { display:grid; grid-template-columns:repeat(4, 1fr); gap:16px; margin:24px 0; }
+.stat-card { background:var(--bg-card); border-radius:var(--radius); padding:24px 20px; box-shadow:var(--shadow-sm); text-align:center; border:1px solid var(--border); }
+.stat-card .stat-value { font-family:var(--font-head); font-size:2rem; font-weight:700; color:var(--text-primary); }
+.stat-card .stat-value.accent { color:var(--accent); }
+.stat-card .stat-label { font-size:0.8rem; color:var(--text-tertiary); font-weight:500; margin-top:6px; }
+
+.mermaid-wrapper { background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:32px; margin:24px 0; overflow-x:auto; }
+.mermaid { display:flex; justify-content:center; }
+
+.chart-grid { display:grid; grid-template-columns:repeat(2, 1fr); gap:20px; margin:24px 0; }
+.chart-container { background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:24px; }
+.chart-container h4 { font-family:var(--font-head); font-size:0.9rem; font-weight:600; margin-bottom:16px; color:var(--text-primary); }
+.chart-container canvas { max-height:300px; }
+.chart-full { grid-column: 1 / -1; }
+
+.data-table-wrapper { background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); overflow-x:auto; margin:24px 0; }
+.data-table { width:100%; border-collapse:collapse; font-size:0.85rem; }
+.data-table th { background:var(--bg-muted); color:var(--text-primary); padding:14px 16px; text-align:left; font-family:var(--font-head); font-weight:600; font-size:0.8rem; border-bottom:1px solid var(--border); }
+.data-table td { padding:12px 16px; border-bottom:1px solid var(--border); color:var(--text-secondary); }
+.data-table tr:last-child td { border-bottom:none; }
+.data-table tr:hover td { background:var(--bg-muted); }
+.data-table code { font-family:var(--mono); font-size:0.78rem; background:var(--bg-muted); padding:2px 6px; border-radius:4px; border:1px solid var(--border); }
+
+.edu-box { border-radius:var(--radius); padding:20px 24px; margin:20px 0; font-size:0.9rem; border:1px solid; border-left-width:4px; }
+.edu-box .edu-title { font-family:var(--font-head); font-weight:600; font-size:0.85rem; margin-bottom:8px; }
+.edu-box p { margin:6px 0; }
+.edu-box.insight { background:var(--accent-light); border-color:rgba(232,90,79,0.2); border-left-color:var(--accent); }
+.edu-box.insight .edu-title { color:var(--accent); }
+.edu-box.note { background:#F0EEF5; border-color:rgba(168,160,192,0.3); border-left-color:#A8A0C0; }
+.edu-box.note .edu-title { color:#5A5570; }
+.edu-box.warning { background:#FEF3C7; border-color:rgba(180,83,9,0.2); border-left-color:#B45309; }
+.edu-box.warning .edu-title { color:#B45309; }
+.edu-box.success { background:#E8F5E9; border-color:rgba(46,125,50,0.2); border-left-color:#2E7D32; }
+.edu-box.success .edu-title { color:#2E7D32; }
+.edu-box.section-summary { background:var(--bg-muted); border-color:var(--border); border-left-color:var(--text-secondary); }
+.edu-box.section-summary .edu-title { color:var(--text-primary); }
+
+.figure { background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:16px; margin:24px 0; box-shadow:var(--shadow-sm); }
+.figure img { width:100%; border-radius:8px; display:block; }
+.figure figcaption { font-size:0.82rem; color:var(--text-tertiary); margin-top:12px; text-align:center; line-height:1.6; }
+.figure .fig-tag { font-family:var(--font-head); font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:1.5px; color:var(--accent); margin-bottom:10px; display:block; }
+
+pre { background:#1E293B; border-radius:8px; padding:18px; overflow-x:auto; margin:14px 0; }
+pre code { color:#E2E8F0; font-family:var(--mono); font-size:0.82rem; line-height:1.6; }
+p code, li code { font-family:var(--mono); font-size:0.82rem; background:var(--bg-muted); padding:2px 6px; border-radius:4px; border:1px solid var(--border); color:var(--text-primary); }
+
+.section ul { margin:12px 0 12px 4px; padding-left:20px; color:var(--text-secondary); font-size:0.92rem; }
+.section ul li { margin:7px 0; }
+
+.scroll-top { position:fixed; bottom:2rem; right:2rem; width:44px; height:44px; background:var(--accent); color:#fff; border:none; border-radius:12px; font-size:1.2rem; cursor:pointer; box-shadow:0 4px 12px rgba(232,90,79,0.3); display:none; z-index:100; }
+.mobile-toggle { display:none; position:fixed; top:16px; left:16px; z-index:1001; width:40px; height:40px; background:var(--bg-card); color:var(--text-primary); border:1px solid var(--border); border-radius:10px; font-size:1.2rem; cursor:pointer; box-shadow:var(--shadow-sm); }
+@media (max-width:768px) {
+  .sidebar { transform:translateX(-100%); transition:transform 0.3s; }
+  .sidebar.open { transform:translateX(0); }
+  .mobile-toggle { display:flex; align-items:center; justify-content:center; }
+  .main-content { margin-left:0; }
+  .content-wrapper { padding:24px 16px; }
+  .hero { padding:40px 20px; margin:-24px -16px 32px; }
+  .stat-cards { grid-template-columns:repeat(2, 1fr); }
+  .chart-grid { grid-template-columns:1fr; }
+}
+@media print {
+  .sidebar, .mobile-toggle, .scroll-top { display:none !important; }
+  .main-content { margin-left:0; }
+  .section { opacity:1 !important; transform:none !important; }
+}
+</style>
+</head>
+<body>
+<button class="mobile-toggle" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+<nav class="sidebar">
+  <div class="sidebar-header">
+    <h2>병합 개선 검증</h2>
+    <p>upstream inference_windowed</p>
+  </div>
+  <div class="sidebar-nav">
+    <a href="#s1"><span class="nav-num">1</span> 개요</a>
+    <a href="#s2"><span class="nav-num">2</span> 원인 분석</a>
+    <a href="#s3"><span class="nav-num">3</span> 변경 사항</a>
+    <a href="#s4"><span class="nav-num">4</span> 테스트 방법</a>
+    <a href="#s5"><span class="nav-num">5</span> 결과 · 캡처</a>
+    <a href="#s6"><span class="nav-num">6</span> 결론</a>
+  </div>
+  <div class="sidebar-footer">2026-06-15 · lingbot-map</div>
+</nav>
+<div class="main-content">
+  <div class="content-wrapper">
+    <div class="hero" id="hero">
+      <div class="hero-content">
+        <h1>멀티윈도우 점군 병합 개선 검증</h1>
+        <p class="subtitle">자작 Procrustes+ICP 봉합 → 상류 모델 내장 윈도우 추론(inference_windowed)</p>
+        <p class="description">긴 영상에서 점군 병합이 깨지던 문제를, 상류 모델의 내장 윈도우 추론
+        <code>GCTStream.inference_windowed</code> 호출로 교체했습니다. 보유 영상 2종으로 기존(OLD)과 변경(NEW)을
+        동일 조건에서 비교 검증하고, 카메라 궤적과 점군을 캡처해 차이를 확인했습니다.</p>
+      </div>
+    </div>
+
+    <!-- ============ 1. 개요 ============ -->
+    <section class="section" id="s1">
+      <div class="section-header"><span class="section-line"></span><span class="section-label">Overview</span></div>
+      <h2 class="section-title">1. 개요</h2>
+      <p class="section-desc">새 브랜치에서 병합 방식을 상류 호출로 바꾸고, 보유 영상으로 검증했습니다.</p>
+      <div class="stat-cards">
+        <div class="stat-card"><div class="stat-value accent">+47/−62</div><div class="stat-label">코드 변경 (inference_worker.py)</div></div>
+        <div class="stat-card"><div class="stat-value">2</div><div class="stat-label">고유 테스트 영상</div></div>
+        <div class="stat-card"><div class="stat-value accent">2.0×</div><div class="stat-label">업로드 영상 점밀도 (NEW/OLD)</div></div>
+        <div class="stat-card"><div class="stat-value">0 / 0</div><div class="stat-label">체크포인트 missing/unexpected</div></div>
+      </div>
+      <div class="edu-box insight">
+        <div class="edu-title">한 줄 요약</div>
+        <p>데모(<code>demo.py</code>)가 깔끔했던 이유는 “좋은 봉합 알고리즘”이 아니라 <strong>봉합을 모델에 맡기기 때문</strong>입니다.
+        AutoPM 브랜치는 그 일을 사람이 만든 16점 Procrustes + ICP로 대체해 깨졌습니다. 이번 변경은 다시 모델에 맡깁니다.</p>
+      </div>
+      <div class="data-table-wrapper">
+        <table class="data-table">
+          <thead><tr><th>항목</th><th>내용</th></tr></thead>
+          <tbody>
+            <tr><td>새 브랜치</td><td><code>AutoPM-260612-upstream-windowed</code></td></tr>
+            <tr><td>변경 파일</td><td><code>realtime/inference_worker.py</code> (+47 / −62)</td></tr>
+            <tr><td>검증 하니스</td><td><code>tools/windowed_recon_test.py</code> (신규)</td></tr>
+            <tr><td>환경</td><td>RTX 5090 32GB · torch 2.10 cu128 · <code>ckpts/lingbot-map-long.pt</code></td></tr>
+            <tr><td>테스트 영상</td><td>업로드 13개는 동일 파일(md5 일치) → 고유 영상 2종으로 검증</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ============ 2. 원인 분석 ============ -->
+    <section class="section" id="s2">
+      <div class="section-header"><span class="section-line"></span><span class="section-label">Root Cause</span></div>
+      <h2 class="section-title">2. 왜 기존(OLD) 병합이 깨졌나</h2>
+      <p class="section-desc">긴 영상(&gt;300프레임)은 한 번에 추론할 수 없어 여러 윈도우로 쪼갭니다. 문제는 그 윈도우를 “어떻게 다시 합치느냐”였습니다.</p>
+      <div class="mermaid-wrapper">
+        <div class="mermaid">
+flowchart LR
+  subgraph OLD["기존 (AutoPM) — 외부 봉합"]
+    direction TB
+    A1[영상 분할<br>윈도우 4개] --> A2[윈도우별<br>inference_streaming<br>각각 독립 좌표계]
+    A2 --> A3[Procrustes<br>카메라 중심 16점만]
+    A3 --> A4[ICP 보정<br>rigid]
+    A4 --> A5[윈도우 체인 누적<br>스케일 복리 오차]
+    A5 --> A6[병합 결과<br>경로 점프 · 이중벽]
+  end
+  subgraph NEW["변경 (상류) — 내부 정렬"]
+    direction TB
+    B1[전체 균일 샘플] --> B2[model.inference_windowed<br>1회 호출]
+    B2 --> B3[overlap = 다음 윈도우<br>scale frame 재사용]
+    B3 --> B4[학습된 chunk_transforms<br>전역 일관 정렬]
+    B4 --> B5[병합 결과<br>연속 경로 · 정합 표면]
+  end
+        </div>
+      </div>
+      <h3>깨짐의 4가지 원인</h3>
+      <ul>
+        <li><strong>독립 좌표계</strong> — 윈도우마다 KV 캐시가 리셋되어 각자 다른 임의의 좌표계·스케일로 나옴</li>
+        <li><strong>빈약한 적합</strong> — Procrustes를 overlap 카메라 중심 <code>16점</code>에만 맞춤. 궤적이 거의 일직선이면 회전·스케일 추정이 불안정(ill-conditioned)</li>
+        <li><strong>복리 오차</strong> — 윈도우별 스케일을 독립 추정해 체인으로 누적 → 뒤 윈도우로 갈수록 오차가 곱해짐</li>
+        <li><strong>약한 수렴</strong> — point-to-point ICP가 살짝 어긋난 local minimum에 고정 → ghost 표면</li>
+      </ul>
+      <div class="edu-box note">
+        <div class="edu-title">상류는 이미 정답을 갖고 있었다</div>
+        <p>상류 저장소에는 검증된 멀티윈도우 정렬(<code>inference_windowed</code>)이 이미 있습니다. overlap 프레임을 다음 윈도우의
+        <em>scale frame</em>으로 재사용하고(bidirectional attention) 학습된 <code>chunk_transforms</code>로 합칩니다.
+        AutoPM 브랜치는 이걸 안 쓰고 고전적 Procrustes+ICP를 자작한 것이 회귀의 본질이었습니다.</p>
+      </div>
+    </section>
+
+    <!-- ============ 3. 변경 사항 ============ -->
+    <section class="section" id="s3">
+      <div class="section-header"><span class="section-line"></span><span class="section-label">The Fix</span></div>
+      <h2 class="section-title">3. 변경 사항</h2>
+      <p class="section-desc">모델 클래스를 윈도우 지원 버전으로 바꾸고, 긴 영상 경로를 상류 1회 호출로 단순화했습니다.</p>
+      <div class="data-table-wrapper">
+        <table class="data-table">
+          <thead><tr><th>구분</th><th>기존 (OLD)</th><th>변경 (NEW)</th></tr></thead>
+          <tbody>
+            <tr><td>모델 클래스</td><td><code>gct_stream.GCTStream</code></td><td><code>gct_stream_window.GCTStream</code></td></tr>
+            <tr><td>긴 영상 추론</td><td>윈도우별 <code>inference_streaming</code> 따로</td><td><code>inference_windowed</code> 1회</td></tr>
+            <tr><td>윈도우 정렬</td><td>외부 <code>chain_windows</code> (Procrustes+ICP)</td><td>모델 내부 (chunk_transforms)</td></tr>
+            <tr><td>라이브 스트리밍 경로</td><td><code>inference_streaming</code></td><td>동일 (시그니처 호환, 유지)</td></tr>
+            <tr><td>제거된 의존</td><td>—</td><td><code>_run_window_raw</code>, <code>registration</code> import</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3>핵심 코드 (긴 영상 경로)</h3>
+      <pre><code>// 기존: 윈도우별 추론 후 외부 봉합
+for k in windows:
+    win = inference_streaming(window_k)      # 각자 독립 좌표계
+merged = chain_windows(wins, overlap=16)     # Procrustes 16점 + ICP  ← 깨짐
+
+// 변경: 상류 내장 윈도우 추론 1회
+preds = model.inference_windowed(
+    images, window_size=32, overlap_size=16,
+    num_scale_frames=16, keyframe_interval=1) # overlap=scale frame 재사용
+                                              # + 학습된 chunk_transforms 내부 정렬</code></pre>
+      <div class="edu-box success">
+        <div class="edu-title">검증: 실제 워커 경로 동작 확인</div>
+        <p>수정된 <code>_run_windowed → _fuse_merged</code> 경로가 유효한 <code>LBP4</code> payload를 생성함을 직접 확인했습니다
+        (npts &gt; 0, nposes = frame_count). 체크포인트는 <code>missing=0 / unexpected=0</code>으로 완전 호환됩니다.</p>
+      </div>
+    </section>
+
+    <!-- ============ 4. 테스트 방법 ============ -->
+    <section class="section" id="s4">
+      <div class="section-header"><span class="section-line"></span><span class="section-label">Methodology</span></div>
+      <h2 class="section-title">4. 테스트 방법</h2>
+      <p class="section-desc">공정한 비교를 위해 <strong>동일한 144 프레임</strong>으로 OLD/NEW를 돌리고, 같은 융합·렌더를 적용했습니다.</p>
+      <ul>
+        <li><strong>입력</strong> — 동일 영상에서 144프레임 균일 샘플 (양쪽 동일)</li>
+        <li><strong>OLD</strong> — 윈도우별 <code>inference_streaming</code> + <code>chain_windows</code> (현 워커 방식)</li>
+        <li><strong>NEW</strong> — 상류 <code>inference_windowed</code> (window 32 · overlap 16 · scale 16)</li>
+        <li><strong>공통 융합</strong> — 깊이 역투영 → voxel 0.015m + radius outlier (양쪽 동일)</li>
+        <li><strong>캡처</strong> — 카메라 자세에서 중력축 추정 → top-down(평면도) · elevation(입면) ortho z-buffer + 카메라 궤적(프레임 순서 색상)</li>
+      </ul>
+      <div class="edu-box warning">
+        <div class="edu-title">읽는 법 — 궤적이 핵심 지표</div>
+        <p>카메라 궤적의 색은 프레임 순서(보라→노랑)입니다. 정상이면 색이 <strong>하나의 연속 경로</strong>로 이어집니다.
+        병합이 깨지면 윈도우 경계에서 색이 <strong>다른 위치로 점프</strong>하고 회색 연결선이 화면을 가로지릅니다.</p>
+      </div>
+    </section>
+
+    <!-- ============ 5. 결과 · 캡처 ============ -->
+    <section class="section" id="s5">
+      <div class="section-header"><span class="section-line"></span><span class="section-label">Results</span></div>
+      <h2 class="section-title">5. 결과 — 영상별 캡처</h2>
+      <p class="section-desc">두 영상 모두 OLD에서 경로가 깨지고, NEW에서 연속·정합 복원됩니다.</p>
+
+      <div class="chart-grid">
+        <div class="chart-container"><h4>점 개수 (OLD vs NEW)</h4><canvas id="ptChart"></canvas></div>
+        <div class="chart-container"><h4>윈도우 스케일 — OLD chain (1.0 기준)</h4><canvas id="scaleChart"></canvas></div>
+      </div>
+
+      <div class="data-table-wrapper">
+        <table class="data-table">
+          <thead><tr><th>영상</th><th>프레임</th><th>OLD 점수</th><th>NEW 점수</th><th>OLD 윈도우 스케일</th></tr></thead>
+          <tbody>
+            <tr><td><code>upload</code> (문제 케이스)</td><td>836</td><td>416,426</td><td><strong>828,197</strong></td><td>1.0 · 1.36 · 0.84 · 1.05</td></tr>
+            <tr><td><code>pxx</code> (야외)</td><td>408</td><td>593,828</td><td>595,937</td><td>1.0 · 0.98 · 1.08 · <strong>0.60</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>① upload 영상 — 실제 문제 케이스 (836프레임)</h3>
+      <div class="figure">
+        <span class="fig-tag">카메라 궤적 · 가장 결정적</span>
+        <img src="img/upload_traj.png" alt="upload 카메라 궤적 OLD vs NEW">
+        <figcaption><strong>OLD</strong>(좌): 윈도우들이 전혀 다른 위치로 튀어 경로가 산산조각 — 회색 연결선이 화면 전체를 가로지름.
+        <strong>NEW</strong>(우): 보라→노랑이 매끄러운 단일 호로 이어짐.</figcaption>
+      </div>
+      <div class="figure">
+        <span class="fig-tag">점군 · top-down / elevation (중력 정렬)</span>
+        <img src="img/upload_compare.png" alt="upload 점군 OLD vs NEW">
+        <figcaption><strong>위 OLD</strong>: 오정렬로 표면이 부서지고 흩어진 점이 outlier 필터에 제거됨(416K).
+        <strong>아래 NEW</strong>: 곡면이 끊김 없이 조밀하게 복원됨(828K, 약 2배).</figcaption>
+      </div>
+
+      <h3>② pxx 영상 — 야외 (408프레임)</h3>
+      <div class="figure">
+        <span class="fig-tag">카메라 궤적</span>
+        <img src="img/pxx_traj.png" alt="pxx 카메라 궤적 OLD vs NEW">
+        <figcaption><strong>OLD</strong>(좌): 윈도우 경계에서 경로가 불연속 점프·접힘(특히 4번째 윈도우 스케일 0.60으로 급축소).
+        <strong>NEW</strong>(우): 단일 연속 경로.</figcaption>
+      </div>
+      <div class="figure">
+        <span class="fig-tag">점군 · top-down / elevation (중력 정렬)</span>
+        <img src="img/pxx_compare.png" alt="pxx 점군 OLD vs NEW">
+        <figcaption>야외 저텍스처 장면이라 점군 자체가 노이즈가 많지만, NEW가 더 일관된 구조를 형성. (이 영상은 궤적 차이가 더 명확)</figcaption>
+      </div>
+
+      <div class="edu-box insight">
+        <div class="edu-title">왜 NEW가 점이 2배 많은가?</div>
+        <p>OLD는 윈도우가 어긋나 같은 표면의 점들이 서로 다른 곳에 흩어집니다. 이렇게 흩어진 점은 이웃이 부족해
+        <code>radius outlier</code> 필터에서 대량 제거됩니다. NEW는 표면이 정확히 겹쳐 점이 살아남으므로 더 조밀합니다 —
+        점 개수 증가가 곧 <strong>정합 품질의 정량 지표</strong>입니다.</p>
+      </div>
+    </section>
+
+    <!-- ============ 6. 결론 ============ -->
+    <section class="section" id="s6">
+      <div class="section-header"><span class="section-line"></span><span class="section-label">Conclusion</span></div>
+      <h2 class="section-title">6. 결론</h2>
+      <p>상류 <code>inference_windowed</code> 호출 방식으로 긴 영상의 병합 깨짐이 해소되었습니다. 두 영상 모두
+      <strong>카메라 궤적의 연속성이 회복</strong>되었고, 문제 케이스(upload)에서는 <strong>표면 정합도·점밀도가 약 2배</strong>로 향상되었습니다.</p>
+      <div class="edu-box section-summary">
+        <div class="edu-title">정리</div>
+        <p>• 깨짐의 원인은 “자작 외부 봉합(Procrustes 16점 + ICP + 스케일 체인 누적)”이었다.<br>
+        • 해법은 봉합을 모델 내부 학습 정렬에 위임하는 것 — 데모가 깔끔했던 것과 동일한 원리.<br>
+        • 라이브 스트리밍 경로는 시그니처 호환으로 영향 없이 유지된다.</p>
+      </div>
+      <h3>남은 과제 / 후속</h3>
+      <ul>
+        <li>전체 서버 스택(FastAPI + three.js 웹뷰)에서의 end-to-end 검수 — 본 보고서는 워커 경로 + 오프스크린 캡처로 검증</li>
+        <li><code>registration.py</code>는 워커에서 미사용이 되었으나 비교 하니스가 참조 중 — 정리 시점 별도 판단</li>
+        <li>변경 커밋 및 smoke 게이트(<code>coverage_web_smoke.py</code>) 회귀 확인</li>
+      </ul>
+    </section>
+
+  </div>
+</div>
+<button class="scroll-top" onclick="window.scrollTo({top:0,behavior:'smooth'})">&#8593;</button>
+<script>
+mermaid.initialize({ startOnLoad: true, theme: 'neutral', flowchart: { useMaxWidth: true } });
+
+window.addEventListener('scroll', function() {
+  document.querySelector('.scroll-top').style.display = window.scrollY > 400 ? 'flex' : 'none';
+});
+
+(function() {
+  var tocLinks = document.querySelectorAll('.sidebar-nav a[href^="#"]');
+  var sectionEls = [];
+  tocLinks.forEach(function(link) {
+    var id = link.getAttribute('href').slice(1);
+    var el = document.getElementById(id);
+    if (el) sectionEls.push({ id: id, el: el, link: link });
+  });
+  function updateActive() {
+    var scrollY = window.scrollY || window.pageYOffset;
+    var triggerLine = scrollY + window.innerHeight * 0.18;
+    var active = null;
+    for (var i = 0; i < sectionEls.length; i++) {
+      var top = sectionEls[i].el.getBoundingClientRect().top + scrollY;
+      if (top <= triggerLine) active = sectionEls[i];
+    }
+    tocLinks.forEach(function(l) { l.classList.remove('active'); });
+    if (active) active.link.classList.add('active');
+  }
+  var ticking = false;
+  window.addEventListener('scroll', function() {
+    if (!ticking) { requestAnimationFrame(function() { updateActive(); ticking = false; }); ticking = true; }
+  });
+  updateActive();
+})();
+
+var fadeObs = new IntersectionObserver(function(entries) {
+  entries.forEach(function(e) { if (e.isIntersecting) e.target.classList.add('visible'); });
+}, { threshold: 0.1 });
+document.querySelectorAll('.section').forEach(function(el) { fadeObs.observe(el); });
+
+document.querySelectorAll('.sidebar-nav a').forEach(function(a) {
+  a.addEventListener('click', function() {
+    if (window.innerWidth <= 768) document.querySelector('.sidebar').classList.remove('open');
+  });
+});
+
+new Chart(document.getElementById('ptChart'), {
+  type: 'bar',
+  data: {
+    labels: ['upload (문제)', 'pxx (야외)'],
+    datasets: [
+      { label: 'OLD (chain)', data: [416426, 593828], backgroundColor: '#C8B0BC', borderColor:'#C8B0BC', borderWidth:1 },
+      { label: 'NEW (windowed)', data: [828197, 595937], backgroundColor: '#A0C8B0', borderColor:'#A0C8B0', borderWidth:1 }
+    ]
+  },
+  options: { responsive:true, plugins:{ legend:{ position:'bottom' } },
+    scales:{ y:{ beginAtZero:true, ticks:{ callback:function(v){ return (v/1000)+'K'; } } } } }
+});
+
+new Chart(document.getElementById('scaleChart'), {
+  type: 'line',
+  data: {
+    labels: ['W1', 'W2', 'W3', 'W4'],
+    datasets: [
+      { label: 'upload', data: [1.0, 1.36, 0.84, 1.05], borderColor:'#A8C4DC', backgroundColor:'#A8C4DC', tension:0.3, fill:false },
+      { label: 'pxx', data: [1.0, 0.98, 1.08, 0.60], borderColor:'#E85A4F', backgroundColor:'#E85A4F', tension:0.3, fill:false }
+    ]
+  },
+  options: { responsive:true, plugins:{ legend:{ position:'bottom' } },
+    scales:{ y:{ suggestedMin:0.4, suggestedMax:1.6, title:{ display:true, text:'윈도우 스케일 배율' } } } }
+});
+</script>
+</body>
+</html>
