@@ -61,7 +61,7 @@ TEMPLATE = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
 <div id="hud"><b>설계모델 ↔ 영상 co-play</b> <span id="pmode" style="font-weight:700;padding:2px 8px;border-radius:6px;background:__PMODECOL__;color:#0a0d13">__PMODE__</span><br><span style="color:#9fb0c8">__MODELNAME__ · 삼각형 __TRIS__ · 포즈 __NPOSES__</span><br><span class="legend">__LEGEND__</span><br><span id="finfo" style="color:#9fb0c8">frame —</span></div>
 <div id="pip"><header><span>정합 렌더 영상 (점군)</span><span class="sp"></span><button id="pmin" title="최소화">▭</button></header><video id="rvid" src="__RVIDEO__" muted playsinline preload="none"></video><div class="rsz n"></div><div class="rsz s"></div><div class="rsz e"></div><div class="rsz w"></div><div class="rsz ne"></div><div class="rsz nw"></div><div class="rsz se"></div><div class="rsz sw"></div></div>
 <div id="place">모델 클릭=첫 위치 · <b>화살표</b>이동 · <b>[</b>/<b>]</b>회전 · <b>,</b>/<b>.</b>스케일 · <b>m</b>좌우반전 · <b>PgUp/Dn</b>높이<br><span id="pp" style="color:#cdd6e6"></span></div>
-<div id="bar"><button id="play">▶ 재생</button><button id="placeBtn">위치 지정</button><button id="fcam">촬영자 추적</button><input id="seek" type="range" min="0" max="1000" value="0"><span class="t" id="t">0.0s</span></div>
+<div id="bar"><button id="play">▶ 재생</button><button id="placeBtn">위치 지정</button><button id="fcam">촬영자 추적</button><button id="peer" style="display:__PEERSHOW__;background:__PEERCOL__;color:#0a0d13;font-weight:700" onclick="location.href='__PEERURL__'">__PEERLABEL__</button><input id="seek" type="range" min="0" max="1000" value="0"><span class="t" id="t">0.0s</span></div>
 <script type="module">
 import * as THREE from 'three';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
@@ -402,7 +402,9 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
         Fxz = Fg[:, [0, 2]] @ R2.T; Uxz = Ug[:, [0, 2]] @ R2.T
 
     eye = float(bbox[0][1]) + 1.5
-    Y = eye + (Cg[:, 1] - np.median(Cg[:, 1])) * s
+    # 눈높이 + 소량 bob. 수직변동을 수평스케일 s로 곱하면(자동 s=5↑) 비현실적으로 출렁 →
+    # ±0.2m로 클램프해 높이를 자동/수동 일관·현실화.
+    Y = eye + np.clip((Cg[:, 1] - np.median(Cg[:, 1])) * s, -0.2, 0.2)
     pose_json = [{"c": [round(float(XZ[i, 0]), 3), round(float(Y[i]), 3), round(float(XZ[i, 1]), 3)],
                   "f": [round(float(Fxz[i, 0]), 4), round(float(Fg[i, 1]), 4), round(float(Fxz[i, 1]), 4)],
                   "u": [round(float(Uxz[i, 0]), 4), round(float(Ug[i, 1]), 4), round(float(Uxz[i, 1]), 4)]}
@@ -481,6 +483,7 @@ def main():
     ap.add_argument("--auto-localize", action="store_true", help="prior 궤적을 프레임별 객체-앵커 PnP로 자동 정제(드리프트 제거)")
     ap.add_argument("--frames-dir", default=None, help="--auto-localize용 추출 프레임 폴더")
     ap.add_argument("--hfov", type=float, default=69.0, help="카메라 수평 FOV(도) — PnP 내부파라미터")
+    ap.add_argument("--peer-url", default=None, help="전환 버튼이 열 상대 뷰어 파일명(예: coplay_autopipe.html)")
     ap.add_argument("--duration", type=float, default=35.3)
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
@@ -540,6 +543,10 @@ def main():
         pmode, pcol = "✋ 수동 · GT경로 입력", "#ffb347"
     else:
         pmode, pcol = "🤖 자동 · 천장정합", "#31d27c"
+    is_manual = bool(args.gt_path) and not (args.auto_pipe or (args.auto_localize and args.frames_dir))
+    peer_label = "🤖 자동 보기" if is_manual else "✋ 수동 보기"
+    peer_col = "#31d27c" if is_manual else "#ffb347"
+    peer_show = "inline-block" if args.peer_url else "none"
 
     legend = []
     for m in sorted(meshes_json, key=lambda x: -len(x["b64"]))[:5]:
@@ -557,6 +564,10 @@ def main():
             .replace("__LEGEND__", " ".join(legend))
             .replace("__PMODE__", pmode)
             .replace("__PMODECOL__", pcol)
+            .replace("__PEERURL__", args.peer_url or "#")
+            .replace("__PEERLABEL__", peer_label)
+            .replace("__PEERCOL__", peer_col)
+            .replace("__PEERSHOW__", peer_show)
             .replace("__RVIDEO__", rel_video))
     out.write_text(html, encoding="utf-8")
     print(f"wrote {out} ({out.stat().st_size/1e6:.1f} MB) tris={tris:,} poses={len(pose_json)} render={rel_video}")
