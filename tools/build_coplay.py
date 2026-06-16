@@ -477,6 +477,7 @@ def main():
     ap.add_argument("--anchor", default=None, help="coarse 첫 위치 'x,z' (모델 좌표) → 그 근처 국소 정합")
     ap.add_argument("--gt-path", default=None, help="실제 촬영경로 waypoints 'x1,z1 x2,z2 ...' (모델 XZ) → 궤적을 이에 직접 피팅")
     ap.add_argument("--gt-mode", default="snap", choices=["snap", "umeyama"], help="snap=GT선에 스냅(직선 walk가 직선), umeyama=강체피팅(재구성 곡선 유지)")
+    ap.add_argument("--auto-pipe", action="store_true", help="메인 소화배관(FXX) 런 자동검출 → 그 아래로 경로 자동(수동 waypoint 불요)")
     ap.add_argument("--auto-localize", action="store_true", help="prior 궤적을 프레임별 객체-앵커 PnP로 자동 정제(드리프트 제거)")
     ap.add_argument("--frames-dir", default=None, help="--auto-localize용 추출 프레임 폴더")
     ap.add_argument("--hfov", type=float, default=69.0, help="카메라 수평 FOV(도) — PnP 내부파라미터")
@@ -513,7 +514,13 @@ def main():
     else:
         poses, scan_pts = fetch_scan(args.base_url, args.upload)
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
-    if args.gt_path:
+    if args.auto_pipe:
+        from scan2bim.pipe_path import main_pipe_run
+        fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
+        wps = main_pipe_run(fxx).tolist()
+        pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps, snap=(args.gt_mode == "snap"))
+        print("  auto-pipe:", reginfo, "run:", [[round(v, 1) for v in w] for w in wps])
+    elif args.gt_path:
         wps = [[float(v) for v in seg.split(",")] for seg in args.gt_path.split()]
         pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps, snap=(args.gt_mode == "snap"))
         print("  gt-path fit:", reginfo, "waypoints:", wps)
