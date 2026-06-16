@@ -109,6 +109,7 @@ function setFrustum(i){ i=Math.max(0,Math.min(POSES.length-1,i|0)); const p=POSE
   if(i!==lastHi){ lastHi=i; highlight(i); } if(followCam) applyFollow(i); }
 rsize(); setFrustum(0);
 const d=Math.max(sz.x,sz.y,sz.z)*0.6; camera.position.set(c0.x+d,c0.y+d*0.6,c0.z+d); controls.target.copy(c0); controls.update();
+controls.enabled=!followCam;  // follow 모드면 OrbitControls 끔 (충돌 방지)
 // shared timeline driven by the render video
 const rvid=document.getElementById('rvid'), seek=document.getElementById('seek'), tlab=document.getElementById('t'), playb=document.getElementById('play');
 let dur=Math.max(META.duration||1,0.1);
@@ -117,7 +118,7 @@ playb.onclick=()=>{ if(rvid.paused){rvid.play();playb.textContent='⏸ 일시정
 seek.oninput=()=>{ rvid.currentTime=(seek.value/1000)*dur; };
 function sync(t){ const f=Math.max(0,Math.min(1,t/dur)); seek.value=Math.round(f*1000); tlab.textContent=t.toFixed(1)+'s'; setFrustum(Math.round(f*(POSES.length-1))); }
 addEventListener('resize', rsize);
-function loop(){ requestAnimationFrame(loop); sync(rvid.currentTime||0); controls.update(); renderer.render(scene,camera); }
+function loop(){ requestAnimationFrame(loop); sync(rvid.currentTime||0); if(!followCam) controls.update(); renderer.render(scene,camera); }
 loop();
 window.__coplay={scene,camera,POSES,MESHES,box,setFrustum,setFollow:(v)=>{followCam=!!v;}};
 </script></body></html>"""
