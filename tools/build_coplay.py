@@ -360,12 +360,16 @@ def _umeyama2d(src, dst):
     return s, R, md - s * (R @ ms)   # dst ≈ s*(src@R.T)+t
 
 
-def place_gtpath(poses, scan_pts, bbox, waypoints):
-    """Fit the camera trajectory to a USER-GIVEN ground-truth path (model XZ
-    waypoints). Ceiling auto-registration is ambiguous on parallel pipe columns
-    (it picked the wrong corridor); the drawn path resolves it. Gravity-align +
-    chirality-flip the trajectory, then arc-length resample both and Umeyama-2D
-    fit (scale+rot+trans). Vertical = eye level. [[alignment-monocular-scale]]"""
+def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
+    """Place the camera trajectory using a USER-GIVEN ground-truth path (model XZ
+    waypoints). Ceiling auto-registration is ambiguous on parallel pipe columns;
+    the drawn path resolves it.
+
+    snap=True (default): WARP each pose onto the GT polyline by arc-length fraction
+    → a straight walk renders straight (monocular drift bends it otherwise). Camera
+    look-direction = GT tangent rotated by the recon's forward-vs-motion offset
+    (keeps look-up/pan). snap=False: rigid Umeyama-2D fit (keeps recon curve).
+    Vertical = eye level. [[alignment-monocular-scale]]"""
     centers, fwd, up = [], [], []
     for p in poses:
         c, f, u = viewer_pose(p); centers.append(c); up.append(u); fwd.append(f)
@@ -375,9 +379,28 @@ def place_gtpath(poses, scan_pts, bbox, waypoints):
     Cg = centers @ Rg.T; Fg = fwd @ Rg.T; Ug = up @ Rg.T
     Cg[:, 0] *= -1; Fg[:, 0] *= -1; Ug[:, 0] *= -1   # chirality (model is X-mirrored)
     gt = np.asarray(waypoints, float)
-    s, R2, t2 = _umeyama2d(_resample(Cg[:, [0, 2]], 120), _resample(gt, 120))
-    XZ = s * (Cg[:, [0, 2]] @ R2.T) + t2
-    Fxz = Fg[:, [0, 2]] @ R2.T; Uxz = Ug[:, [0, 2]] @ R2.T
+    traj = Cg[:, [0, 2]]
+
+    if snap:
+        d = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(traj, axis=0), axis=1))])
+        gd = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(gt, axis=0), axis=1))])
+        gtot = float(gd[-1]); pos_s = (d / max(d[-1], 1e-9)) * gtot         # arc-length fraction → GT length
+        XZ = np.column_stack([np.interp(pos_s, gd, gt[:, 0]), np.interp(pos_s, gd, gt[:, 1])])
+        ah = np.column_stack([np.interp(np.minimum(pos_s + .3, gtot), gd, gt[:, 0]), np.interp(np.minimum(pos_s + .3, gtot), gd, gt[:, 1])])
+        bh = np.column_stack([np.interp(np.maximum(pos_s - .3, 0), gd, gt[:, 0]), np.interp(np.maximum(pos_s - .3, 0), gd, gt[:, 1])])
+        gt_ang = np.arctan2((ah - bh)[:, 1], (ah - bh)[:, 0])
+        vel = np.vstack([traj[1] - traj[0], np.diff(traj, axis=0)])
+        ker = np.ones(9) / 9.0                                              # smooth recon motion dir (drift jitter)
+        mv_ang = np.arctan2(np.convolve(vel[:, 1], ker, "same"), np.convolve(vel[:, 0], ker, "same"))
+        rot = gt_ang - mv_ang; cr, sr = np.cos(rot), np.sin(rot)            # per-pose yaw onto GT tangent
+        Fxz = np.column_stack([cr * Fg[:, 0] - sr * Fg[:, 2], sr * Fg[:, 0] + cr * Fg[:, 2]])
+        Uxz = np.column_stack([cr * Ug[:, 0] - sr * Ug[:, 2], sr * Ug[:, 0] + cr * Ug[:, 2]])
+        s = gtot / max(d[-1], 1e-9)
+    else:
+        s, R2, t2 = _umeyama2d(_resample(traj, 120), _resample(gt, 120))
+        XZ = s * (traj @ R2.T) + t2
+        Fxz = Fg[:, [0, 2]] @ R2.T; Uxz = Ug[:, [0, 2]] @ R2.T
+
     eye = float(bbox[0][1]) + 1.5
     Y = eye + (Cg[:, 1] - np.median(Cg[:, 1])) * s
     pose_json = [{"c": [round(float(XZ[i, 0]), 3), round(float(Y[i]), 3), round(float(XZ[i, 1]), 3)],
@@ -385,8 +408,8 @@ def place_gtpath(poses, scan_pts, bbox, waypoints):
                   "u": [round(float(Uxz[i, 0]), 4), round(float(Ug[i, 1]), 4), round(float(Uxz[i, 1]), 4)]}
                  for i in range(len(XZ))]
     plen = float(np.linalg.norm(np.diff(XZ, axis=0), axis=1).sum())
-    return pose_json, {"mode": "gt-path", "scale": round(s, 3), "path_m": round(plen, 2),
-                       "cam_h": round(eye - float(bbox[0][1]), 2)}
+    return pose_json, {"mode": "gt-snap" if snap else "gt-umeyama", "scale": round(s, 3),
+                       "path_m": round(plen, 2), "cam_h": round(eye - float(bbox[0][1]), 2)}
 
 
 def main():
@@ -399,6 +422,7 @@ def main():
     ap.add_argument("--demo-match", default="161613")
     ap.add_argument("--anchor", default=None, help="coarse 첫 위치 'x,z' (모델 좌표) → 그 근처 국소 정합")
     ap.add_argument("--gt-path", default=None, help="실제 촬영경로 waypoints 'x1,z1 x2,z2 ...' (모델 XZ) → 궤적을 이에 직접 피팅")
+    ap.add_argument("--gt-mode", default="snap", choices=["snap", "umeyama"], help="snap=GT선에 스냅(직선 walk가 직선), umeyama=강체피팅(재구성 곡선 유지)")
     ap.add_argument("--duration", type=float, default=35.3)
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
@@ -434,7 +458,7 @@ def main():
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
     if args.gt_path:
         wps = [[float(v) for v in seg.split(",")] for seg in args.gt_path.split()]
-        pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps)
+        pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps, snap=(args.gt_mode == "snap"))
         print("  gt-path fit:", reginfo, "waypoints:", wps)
     else:
         pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox, anchor=anchor)
