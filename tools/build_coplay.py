@@ -189,7 +189,7 @@ def place_gravity(poses, scan_pts, bbox, scale=1.0):
              "u": [round(float(x), 4) for x in U[i]]} for i in range(len(C))]
 
 
-def place_registered(poses, scan_pts, model_ceiling, bbox):
+def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
     """Real registration: gravity-align scan, then register its CEILING band to
     the model ceiling (grid XY + yaw + scale + Umeyama-ICP). Returns placed
     poses + fit metrics. (Footage looks up → ceiling-to-ceiling locks well.)"""
@@ -221,13 +221,23 @@ def place_registered(poses, scan_pts, model_ceiling, bbox):
     def Ry(a):
         r = np.deg2rad(a); return np.array([[np.cos(r), 0, np.sin(r)], [0, 1, 0], [-np.sin(r), 0, np.cos(r)]])
 
+    # coarse prior (1-click 첫 위치): restrict the search to ±3.5m around it →
+    # 반복배관/노이즈와 무관하게 그 방에서 국소 정합(보장).
+    if anchor is not None:
+        ax, az = float(anchor[0]), float(anchor[1])
+        gx = np.linspace(ax - 3.5, ax + 3.5, 7)
+        gz = np.linspace(az - 3.5, az + 3.5, 7)
+    else:
+        gx = np.linspace(lo[0] + 2, hi[0] - 2, 7)
+        gz = np.linspace(lo[2] + 2, hi[2] - 2, 9)
+
     best = None
     for s in (1.0, 1.15, 1.3, 1.45, 1.6):
         for yaw in range(0, 360, 15):
             R = Ry(yaw)
             align = abs(float(np.cos(np.deg2rad(a_s + yaw - a_p))))  # 1=traj∥pipes
-            for cx in np.linspace(lo[0] + 2, hi[0] - 2, 7):
-                for cz in np.linspace(lo[2] + 2, hi[2] - 2, 9):
+            for cx in gx:
+                for cz in gz:
                     t = np.array([cx, yc, cz]) - s * (R @ scan_c)
                     d, _ = tree.query(s * (sc @ R.T) + t, workers=-1)
                     score = float((d < 0.25).mean()) + 0.25 * align
@@ -250,6 +260,7 @@ def main():
     ap.add_argument("--render-video", required=True, help="GPU point-cloud render mp4 (left panel)")
     ap.add_argument("--demo-html", default=None, help="pointcloud map HTML for poses (build_demo_map)")
     ap.add_argument("--demo-match", default="161613")
+    ap.add_argument("--anchor", default=None, help="coarse 첫 위치 'x,z' (모델 좌표) → 그 근처 국소 정합")
     ap.add_argument("--duration", type=float, default=35.3)
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
@@ -281,8 +292,9 @@ def main():
         poses, scan_pts = load_demo_cloud(args.demo_html, args.demo_match)
     else:
         poses, scan_pts = fetch_scan(args.base_url, args.upload)
-    pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox)
-    print("  registration:", reginfo)
+    anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
+    pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox, anchor=anchor)
+    print("  registration:", reginfo, "anchor:", anchor)
 
     legend = []
     for m in sorted(meshes_json, key=lambda x: -len(x["b64"]))[:5]:
