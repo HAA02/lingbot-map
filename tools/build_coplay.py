@@ -35,10 +35,10 @@ TEMPLATE = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
 #c{position:fixed;inset:0;display:block}
 #hud{position:fixed;left:12px;top:12px;background:rgba(10,13,19,.8);border:1px solid #283042;border-radius:8px;padding:8px 11px;font-size:12px;z-index:5;max-width:360px}
 #hud b{color:#fff} #hud .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px} .hl{color:#31d27c}
-#pip{position:fixed;right:18px;top:18px;width:360px;background:#11151f;border:1px solid #2c3344;border-radius:10px;overflow:hidden;z-index:20;box-shadow:0 8px 30px rgba(0,0,0,.6)}
+#pip{position:fixed;right:18px;top:18px;width:360px;height:235px;background:#11151f;border:1px solid #2c3344;border-radius:10px;overflow:hidden;z-index:20;box-shadow:0 8px 30px rgba(0,0,0,.6);display:flex;flex-direction:column;resize:both;min-width:160px;min-height:110px;max-width:92vw;max-height:88vh}
 #pip header{display:flex;align-items:center;gap:6px;padding:5px 8px;background:#161b26;cursor:move;font-size:12px;color:#cdd6e6;user-select:none}
 #pip header .sp{flex:1} #pip header button{background:#222b3a;color:#cdd6e6;border:1px solid #313c4f;border-radius:5px;padding:0 8px;cursor:pointer;font-size:13px;line-height:18px}
-#pip video{width:100%;display:block;background:#000} #pip.min video{display:none}
+#pip video{width:100%;flex:1;min-height:0;display:block;object-fit:contain;background:#000} #pip.min{height:auto!important;resize:none} #pip.min video{display:none}
 #bar{position:fixed;left:12px;right:12px;bottom:12px;display:flex;gap:10px;align-items:center;background:rgba(14,18,25,.92);border:1px solid #283042;border-radius:10px;padding:8px 14px;z-index:10}
 #bar button{background:#1c2433;color:#e8eaf0;border:1px solid #2c3344;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px}
 #bar button.on{background:#31d27c;color:#06210f;border-color:#31d27c}
@@ -50,9 +50,9 @@ TEMPLATE = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
 </head><body>
 <canvas id="c"></canvas>
 <div id="hud"><b>설계모델 ↔ 영상 co-play</b><br><span style="color:#9fb0c8">__MODELNAME__ · 삼각형 __TRIS__ · 포즈 __NPOSES__</span><br><span class="legend">__LEGEND__</span><br><span id="finfo" style="color:#9fb0c8">frame —</span></div>
-<div id="pip"><header><span>정합 렌더 영상 (점군)</span><span class="sp"></span><button id="psm" title="축소">−</button><button id="pbg" title="확대">＋</button><button id="pmin" title="최소화">▭</button></header><video id="rvid" src="__RVIDEO__" muted playsinline preload="none"></video></div>
-<div id="place">위치 지정: 모델 클릭 → 첫 위치 · <b>화살표</b>=이동 · <b>[</b>/<b>]</b>=회전 · <b>PgUp/Dn</b>=높이</div>
-<div id="bar"><button id="play">▶ 재생</button><button id="placeBtn">위치 지정</button><button id="fcam" class="on">촬영자 추적</button><input id="seek" type="range" min="0" max="1000" value="0"><span class="t" id="t">0.0s</span></div>
+<div id="pip"><header><span>정합 렌더 영상 (점군)</span><span class="sp"></span><button id="pmin" title="최소화">▭</button></header><video id="rvid" src="__RVIDEO__" muted playsinline preload="none"></video></div>
+<div id="place">모델 클릭=첫 위치 · <b>화살표</b>이동 · <b>[</b>/<b>]</b>회전 · <b>,</b>/<b>.</b>스케일 · <b>m</b>좌우반전 · <b>PgUp/Dn</b>높이<br><span id="pp" style="color:#cdd6e6"></span></div>
+<div id="bar"><button id="play">▶ 재생</button><button id="placeBtn">위치 지정</button><button id="fcam">촬영자 추적</button><input id="seek" type="range" min="0" max="1000" value="0"><span class="t" id="t">0.0s</span></div>
 <script type="module">
 import * as THREE from 'three';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
@@ -78,12 +78,12 @@ for(const m of MESHES){
 const c0=box.getCenter(new THREE.Vector3()), sz=box.getSize(new THREE.Vector3());
 let cx0=0,cy0=0,cz0=0; for(const p of RAWP){cx0+=p.c[0];cy0+=p.c[1];cz0+=p.c[2];} cx0/=RAWP.length;cy0/=RAWP.length;cz0/=RAWP.length;
 const CANON=RAWP.map(p=>({c:[p.c[0]-cx0,p.c[1]-cy0,p.c[2]-cz0],f:p.f.slice(),u:p.u.slice()}));
-let offset=[cx0,cy0,cz0], yaw=0;
+let offset=[cx0,cy0,cz0], yaw=0, pscale=1, flipX=1;
 function rotY(v,deg){const r=deg*Math.PI/180,c=Math.cos(r),s=Math.sin(r);return [c*v[0]+s*v[2],v[1],-s*v[0]+c*v[2]];}
-function wp(i){const q=CANON[i];const c=rotY(q.c,yaw);return {c:[c[0]+offset[0],c[1]+offset[1],c[2]+offset[2]],f:rotY(q.f,yaw),u:rotY(q.u,yaw)};}
+function wp(i){const q=CANON[i];const cc=[q.c[0]*flipX*pscale,q.c[1]*pscale,q.c[2]*pscale];const c=rotY(cc,yaw);return {c:[c[0]+offset[0],c[1]+offset[1],c[2]+offset[2]],f:rotY([q.f[0]*flipX,q.f[1],q.f[2]],yaw),u:rotY([q.u[0]*flipX,q.u[1],q.u[2]],yaw)};}
 const pathGeo=new THREE.BufferGeometry(); const pathPos=new Float32Array(RAWP.length*3);
 scene.add(new THREE.Line(pathGeo,new THREE.LineBasicMaterial({color:0xffb347})));
-function rebuildPath(){ for(let i=0;i<RAWP.length;i++){const w=wp(i);pathPos[i*3]=w.c[0];pathPos[i*3+1]=w.c[1];pathPos[i*3+2]=w.c[2];} pathGeo.setAttribute('position',new THREE.BufferAttribute(pathPos,3)); pathGeo.attributes.position.needsUpdate=true; pathGeo.computeBoundingSphere(); }
+function rebuildPath(){ for(let i=0;i<RAWP.length;i++){const w=wp(i);pathPos[i*3]=w.c[0];pathPos[i*3+1]=w.c[1];pathPos[i*3+2]=w.c[2];} pathGeo.setAttribute('position',new THREE.BufferAttribute(pathPos,3)); pathGeo.attributes.position.needsUpdate=true; pathGeo.computeBoundingSphere(); const _pp=document.getElementById("pp"); if(_pp)_pp.textContent="위치("+offset[0].toFixed(1)+", "+offset[2].toFixed(1)+") yaw "+yaw.toFixed(0)+"° 스케일 "+pscale.toFixed(2)+(flipX<0?" ⇄반전":""); }
 const frustum=new THREE.Group();
 const cone=new THREE.Mesh(new THREE.ConeGeometry(0.5,1.2,4),new THREE.MeshBasicMaterial({color:0x31d27c,wireframe:true}));cone.rotation.x=Math.PI/2;frustum.add(cone);
 frustum.add(new THREE.Mesh(new THREE.SphereGeometry(0.3,16,12),new THREE.MeshBasicMaterial({color:0x31d27c})));scene.add(frustum);
@@ -94,7 +94,7 @@ function highlight(w){ viewCam.position.set(w.c[0],w.c[1],w.c[2]);viewCam.up.set
   let hit=0; for(const o of MESH_OBJS){for(let k=0;k<o.n;k++){_v.set(o.pos[k*3],o.pos[k*3+1],o.pos[k*3+2]); if(_fr.containsPoint(_v)){o.col[k*3]=0.2;o.col[k*3+1]=1;o.col[k*3+2]=0.55;hit++;}else{o.col[k*3]=o.base[k*3];o.col[k*3+1]=o.base[k*3+1];o.col[k*3+2]=o.base[k*3+2];}}o.mesh.geometry.attributes.color.needsUpdate=true;}
   document.getElementById('finfo').innerHTML='frame '+curFrame+' / '+(RAWP.length-1)+' · 매핑 <span class="hl">'+hit+'</span>';
 }
-let followCam=true; const fbtn=document.getElementById('fcam'), placeBtn=document.getElementById('placeBtn'), placeHud=document.getElementById('place');
+let followCam=false; const fbtn=document.getElementById('fcam'), placeBtn=document.getElementById('placeBtn'), placeHud=document.getElementById('place');
 let placeMode=false;
 function updCtl(){ controls.enabled = placeMode || !followCam; }
 function applyFollow(w){const f=new THREE.Vector3(w.f[0],w.f[1],w.f[2]).normalize(),u=new THREE.Vector3(w.u[0],w.u[1],w.u[2]).normalize();
@@ -107,22 +107,19 @@ placeBtn.onclick=()=>{placeMode=!placeMode;placeBtn.classList.toggle('on',placeM
 updCtl(); rebuildPath(); setFrame(0);
 camera.position.set(c0.x+sz.x*0.7,c0.y+sz.y,c0.z+sz.z*0.7); controls.target.copy(c0); controls.update();
 renderer.domElement.addEventListener('click',e=>{ if(!placeMode)return;
-  mouse.x=(e.clientX/innerWidth)*2-1;mouse.y=-(e.clientY/innerHeight)*2+1;raycaster.setFromCamera(mouse,camera);
+  const rc=renderer.domElement.getBoundingClientRect();mouse.x=((e.clientX-rc.left)/rc.width)*2-1;mouse.y=-((e.clientY-rc.top)/rc.height)*2+1;raycaster.setFromCamera(mouse,camera);
   const hits=raycaster.intersectObjects(MESH_OBJS.map(o=>o.mesh),false);
   if(hits.length){offset[0]=hits[0].point.x;offset[2]=hits[0].point.z;dirty=true;rebuildPath();} });
 addEventListener('keydown',e=>{ if(!placeMode)return; const st=0.2;
   if(e.key==='ArrowLeft')offset[0]-=st; else if(e.key==='ArrowRight')offset[0]+=st;
   else if(e.key==='ArrowUp')offset[2]-=st; else if(e.key==='ArrowDown')offset[2]+=st;
   else if(e.key==='PageUp')offset[1]+=st; else if(e.key==='PageDown')offset[1]-=st;
-  else if(e.key==='[')yaw-=3; else if(e.key===']')yaw+=3; else return;
+  else if(e.key==='[')yaw-=3; else if(e.key===']')yaw+=3; else if(e.key===',')pscale=Math.max(0.2,pscale/1.08); else if(e.key==='.')pscale*=1.08; else if(e.key==='m'||e.key==='M')flipX*=-1; else return;
   e.preventDefault();dirty=true;rebuildPath(); });
 const pip=document.getElementById('pip'); const head=pip.querySelector('header'); let drag=null;
 head.addEventListener('mousedown',e=>{ if(e.target.tagName==='BUTTON')return; drag={x:e.clientX-pip.offsetLeft,y:e.clientY-pip.offsetTop}; e.preventDefault(); });
 addEventListener('mousemove',e=>{ if(drag){pip.style.left=(e.clientX-drag.x)+'px';pip.style.top=(e.clientY-drag.y)+'px';pip.style.right='auto';} });
 addEventListener('mouseup',()=>drag=null);
-let pw=360; const setPw=w=>{pw=Math.max(140,Math.min(960,w));pip.style.width=pw+'px';};
-document.getElementById('psm').onclick=()=>setPw(pw-90);
-document.getElementById('pbg').onclick=()=>setPw(pw+90);
 document.getElementById('pmin').onclick=()=>pip.classList.toggle('min');
 const rvid=document.getElementById('rvid'),seek=document.getElementById('seek'),tlab=document.getElementById('t'),playb=document.getElementById('play');
 let dur=Math.max(META.duration||1,0.1); rvid.addEventListener('loadedmetadata',()=>{dur=rvid.duration||dur;});
