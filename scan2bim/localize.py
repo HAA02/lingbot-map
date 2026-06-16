@@ -54,22 +54,29 @@ def pose_from_lookat(center, forward, up):
     return R, -R @ c
 
 
-def match_by_projection(dets, anchors, K, R, t, *, max_px=90.0, img_wh=None):
+def match_by_projection(dets, anchors, K, R, t, *, max_px=90.0, img_wh=None, max_dist=None):
     """Pair detections to model anchors via a pose prior.
 
     dets:    [{label, cx, cy, score}]  (scan2bim.detect output)
     anchors: [{type, center[x,y,z]}]   (scan2bim.anchors, typed)
+    max_dist: only consider anchors within this range of the camera (the camera
+              sees nearby ceiling fixtures, not the whole floor's hundreds of anchors
+              — without this, nearest-projection matching is meaningless).
     Returns [(P3d(3,), pix2d(2,), type)] for same-type nearest-projection pairs.
     """
+    cc = camera_center(R, t)
     proj: dict = {}
     for a in anchors:
-        uv, z = project(K, R, t, [a["center"]])
+        c3 = np.asarray(a["center"], float)
+        if max_dist is not None and np.linalg.norm(c3 - cc) > max_dist:
+            continue
+        uv, z = project(K, R, t, [c3])
         if z[0] <= 0:
             continue
         u, v = uv[0]
         if img_wh and not (0 <= u <= img_wh[0] and 0 <= v <= img_wh[1]):
             continue
-        proj.setdefault(a["type"], []).append((np.array([u, v]), np.asarray(a["center"], float)))
+        proj.setdefault(a["type"], []).append((np.array([u, v]), c3))
     corr = []
     for d in dets:
         typ = LABEL2TYPE.get(d["label"])
@@ -107,10 +114,12 @@ def solve_pnp(K, pts3d, pts2d, *, ransac_px=14.0, prior=None):
     return R, tvec.ravel(), inl
 
 
-def localize_frame(K, dets, anchors, prior_R, prior_t, *, max_px=90.0, ransac_px=14.0, img_wh=None):
+def localize_frame(K, dets, anchors, prior_R, prior_t, *, max_px=90.0, ransac_px=14.0,
+                   img_wh=None, max_dist=None):
     """One frame: prior pose → match → PnP. Returns {R,t,center,n_corr,n_inlier,
     rmse} or None if not localizable (too few anchor matches)."""
-    corr = match_by_projection(dets, anchors, K, prior_R, prior_t, max_px=max_px, img_wh=img_wh)
+    corr = match_by_projection(dets, anchors, K, prior_R, prior_t, max_px=max_px,
+                               img_wh=img_wh, max_dist=max_dist)
     if len(corr) < 4:
         return None
     P3 = np.array([c[0] for c in corr]); P2 = np.array([c[1] for c in corr])
@@ -125,7 +134,7 @@ def localize_frame(K, dets, anchors, prior_R, prior_t, *, max_px=90.0, ransac_px
 
 
 def localize_trajectory(K, prior_poses, dets_by_frame, anchors, *, min_inliers=5,
-                        max_px=120.0, ransac_px=14.0, max_rmse=25.0, smooth_win=5):
+                        max_px=120.0, ransac_px=14.0, max_rmse=25.0, smooth_win=5, max_dist=None):
     """Per-frame object-anchor PnP over a whole sequence → refined model-frame poses.
 
     prior_poses: [(R,t), ...] world-to-camera priors (from the trajectory).
@@ -138,7 +147,8 @@ def localize_trajectory(K, prior_poses, dets_by_frame, anchors, *, min_inliers=5
     pnp = [None] * n
     for i in range(n):
         Rp, tp = prior_poses[i]
-        out = localize_frame(K, dets_by_frame[i], anchors, Rp, tp, max_px=max_px, ransac_px=ransac_px)
+        out = localize_frame(K, dets_by_frame[i], anchors, Rp, tp, max_px=max_px,
+                             ransac_px=ransac_px, max_dist=max_dist)
         if out and out["n_inlier"] >= min_inliers and out["rmse"] <= max_rmse:
             pnp[i] = out
     loc = [i for i in range(n) if pnp[i] is not None]

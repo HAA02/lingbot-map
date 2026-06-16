@@ -412,6 +412,71 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
                        "path_m": round(plen, 2), "cam_h": round(eye - float(bbox[0][1]), 2)}
 
 
+def _detect_cached(frame_paths, cache_path, threshold=0.2):
+    """Run OWL-ViT once per frame; cache to JSON so re-builds are instant."""
+    cache = {}
+    cp = Path(cache_path)
+    if cp.exists():
+        cache = json.loads(cp.read_text())
+    todo = [f for f in frame_paths if f not in cache]
+    if todo:
+        from scan2bim.detect import detect
+        for i in range(0, len(todo), 16):
+            for r in detect(todo[i:i + 16], threshold=threshold):
+                cache[r["path"]] = r["detections"]
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        cp.write_text(json.dumps(cache))
+    return {f: cache.get(f, []) for f in frame_paths}
+
+
+def place_autolocalize(pose_json, dtdx_files, frames_dir, *, hfov=69.0, stride=3,
+                       cache="reports/coplay/_det_cache.json"):
+    """Refine a PRIOR trajectory (pose_json, model coords) via per-frame object-anchor
+    PnP. Detect AC/light/column on stride-sampled frames → match to model anchors of
+    same type (prior = the input trajectory pose) → solvePnP → drift-free model-locked
+    poses; unsampled/weak frames interpolate. Returns refined pose_json + summary."""
+    import glob as _glob
+    from scan2bim.anchors import anchor_inventory
+    from scan2bim.localize import intrinsics, pose_from_lookat, localize_trajectory, camera_center
+    cat = anchor_inventory(dtdx_files)                      # flip_x=True → display frame (matches pose_json)
+    anchors = [a for typ in ("ac", "light") for a in cat.get(typ, [])]   # distinctive only (cols repeat)
+    frames = sorted(_glob.glob(f"{frames_dir}/*.png"))
+    if not frames or not anchors:
+        return pose_json, {"mode": "auto-localize", "error": "no frames or anchors"}
+    from PIL import Image
+    W, H = Image.open(frames[0]).size
+    K = intrinsics(W, H, hfov)
+    N, Nf = len(pose_json), len(frames)
+    # prior orientation = walk tangent tilted UP toward the ceiling (footage looks up;
+    # the recon per-frame forward is too noisy/flat to project ceiling anchors in view).
+    C = np.array([p["c"] for p in pose_json], float)
+    priors = []
+    for i in range(N):
+        a, b = max(0, i - 1), min(N - 1, i + 1)
+        tang = (C[b] - C[a]).astype(float); tang[1] = 0.0
+        nt = np.linalg.norm(tang)
+        horiz = tang / nt if nt > 1e-6 else np.array([0.0, 0.0, 1.0])
+        fwd = horiz * 0.55 + np.array([0.0, 1.0, 0.0]) * 0.84   # ~57° up toward ceiling
+        fwd /= np.linalg.norm(fwd)
+        up = np.array([0.0, 1.0, 0.0]) - fwd * fwd[1]; up /= (np.linalg.norm(up) + 1e-9)
+        priors.append(pose_from_lookat(C[i], fwd, up))
+    # map pose i -> frame; detect only every `stride`-th (rest interpolate)
+    fidx = [min(Nf - 1, int(round(i / max(N - 1, 1) * (Nf - 1)))) for i in range(N)]
+    sampled = sorted({fidx[i] for i in range(0, N, stride)})
+    det_map = _detect_cached([frames[j] for j in sampled], cache)
+    dets_by_frame = [det_map.get(frames[fidx[i]], []) if (i % stride == 0) else [] for i in range(N)]
+    refined, info = localize_trajectory(K, priors, dets_by_frame, anchors, max_px=160,
+                                        ransac_px=16, max_dist=8.0)
+    out = []
+    for i in range(N):
+        R, c = refined[i]["R"], refined[i]["center"]
+        out.append({"c": [round(float(x), 3) for x in c],
+                    "f": [round(float(x), 4) for x in R[2]],       # forward = +Z_cam row
+                    "u": [round(float(-x), 4) for x in R[1]]})     # up = -Y_cam row
+    info["mode"] = "auto-localize"
+    return out, info
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8767")
@@ -423,6 +488,9 @@ def main():
     ap.add_argument("--anchor", default=None, help="coarse 첫 위치 'x,z' (모델 좌표) → 그 근처 국소 정합")
     ap.add_argument("--gt-path", default=None, help="실제 촬영경로 waypoints 'x1,z1 x2,z2 ...' (모델 XZ) → 궤적을 이에 직접 피팅")
     ap.add_argument("--gt-mode", default="snap", choices=["snap", "umeyama"], help="snap=GT선에 스냅(직선 walk가 직선), umeyama=강체피팅(재구성 곡선 유지)")
+    ap.add_argument("--auto-localize", action="store_true", help="prior 궤적을 프레임별 객체-앵커 PnP로 자동 정제(드리프트 제거)")
+    ap.add_argument("--frames-dir", default=None, help="--auto-localize용 추출 프레임 폴더")
+    ap.add_argument("--hfov", type=float, default=69.0, help="카메라 수평 FOV(도) — PnP 내부파라미터")
     ap.add_argument("--duration", type=float, default=35.3)
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
@@ -463,6 +531,9 @@ def main():
     else:
         pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox, anchor=anchor)
         print("  registration:", reginfo, "anchor:", anchor)
+    if args.auto_localize and args.frames_dir:
+        pose_json, locinfo = place_autolocalize(pose_json, args.dtdx, args.frames_dir, hfov=args.hfov)
+        print("  auto-localize:", locinfo)
 
     legend = []
     for m in sorted(meshes_json, key=lambda x: -len(x["b64"]))[:5]:
