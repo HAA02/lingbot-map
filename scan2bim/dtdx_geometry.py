@@ -89,7 +89,8 @@ def decode_geometry(path: str | Path) -> dict:
     for bid, p, ro, sc in base_place:
         emit(bid, p, ro, sc)
     for lm in o.get("linkMesh") or []:
-        emit(lm.get("lid"), lm.get("p"), lm.get("ro"), lm.get("s"))
+        # DTDWebThree: linkMesh scale = 'sc' (대개 부재→1), 's'는 size(별개) — 절대 scale로 쓰지 말 것
+        emit(lm.get("lid"), lm.get("p"), lm.get("ro"), lm.get("sc"))
 
     meshes = [{"color": c, "positions": (np.concatenate(v) if v else np.zeros((0, 3), np.float32))}
               for c, v in groups.items()]
