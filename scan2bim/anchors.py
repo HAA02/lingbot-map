@@ -96,8 +96,8 @@ def classify_anchor(disc_code: str, size, center, ceiling_y: float) -> str:
     d = (disc_code or "")[:1].upper()
     if d == "S":  # structure
         return COLUMN if dy >= max(dx, dz) * 1.5 and dy > 1.0 else OTHER
-    if d == "H":  # hvac: AC cassette (wide flat) vs duct (long thin)
-        if foot >= 0.5 and dy <= foot * 0.8:
+    if d == "H":  # hvac ceiling fixtures (cassettes/diffusers/vents) — flat MEP on ceiling
+        if foot >= 0.2 and dy <= max(foot, 0.5):   # capture all flat fixtures (OWL-ViT sees these as AC)
             return AC
         return DUCT if foot >= 1.0 else OTHER
     if d == "E":  # electrical: ceiling light

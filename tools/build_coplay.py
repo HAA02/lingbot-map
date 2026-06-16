@@ -439,7 +439,7 @@ def place_autolocalize(pose_json, dtdx_files, frames_dir, *, hfov=69.0, stride=3
     from scan2bim.anchors import anchor_inventory
     from scan2bim.localize import intrinsics, pose_from_lookat, localize_trajectory, camera_center
     cat = anchor_inventory(dtdx_files)                      # flip_x=True → display frame (matches pose_json)
-    anchors = [a for typ in ("ac", "light") for a in cat.get(typ, [])]   # distinctive only (cols repeat)
+    anchors = cat.get("ac", [])                            # HXX 천장기구(디퓨저/벤트) — OWL-ViT가 AC로 검출, 경로 위 분포
     frames = sorted(_glob.glob(f"{frames_dir}/*.png"))
     if not frames or not anchors:
         return pose_json, {"mode": "auto-localize", "error": "no frames or anchors"}
@@ -447,19 +447,8 @@ def place_autolocalize(pose_json, dtdx_files, frames_dir, *, hfov=69.0, stride=3
     W, H = Image.open(frames[0]).size
     K = intrinsics(W, H, hfov)
     N, Nf = len(pose_json), len(frames)
-    # prior orientation = walk tangent tilted UP toward the ceiling (footage looks up;
-    # the recon per-frame forward is too noisy/flat to project ceiling anchors in view).
-    C = np.array([p["c"] for p in pose_json], float)
-    priors = []
-    for i in range(N):
-        a, b = max(0, i - 1), min(N - 1, i + 1)
-        tang = (C[b] - C[a]).astype(float); tang[1] = 0.0
-        nt = np.linalg.norm(tang)
-        horiz = tang / nt if nt > 1e-6 else np.array([0.0, 0.0, 1.0])
-        fwd = horiz * 0.55 + np.array([0.0, 1.0, 0.0]) * 0.84   # ~57° up toward ceiling
-        fwd /= np.linalg.norm(fwd)
-        up = np.array([0.0, 1.0, 0.0]) - fwd * fwd[1]; up /= (np.linalg.norm(up) + 1e-9)
-        priors.append(pose_from_lookat(C[i], fwd, up))
+    # prior = recon per-frame orientation (carries the real ~19° up-look at the ceiling)
+    priors = [pose_from_lookat(p["c"], p["f"], p["u"]) for p in pose_json]
     # map pose i -> frame; detect only every `stride`-th (rest interpolate)
     fidx = [min(Nf - 1, int(round(i / max(N - 1, 1) * (Nf - 1)))) for i in range(N)]
     sampled = sorted({fidx[i] for i in range(0, N, stride)})
@@ -471,8 +460,8 @@ def place_autolocalize(pose_json, dtdx_files, frames_dir, *, hfov=69.0, stride=3
     for i in range(N):
         R, c = refined[i]["R"], refined[i]["center"]
         out.append({"c": [round(float(x), 3) for x in c],
-                    "f": [round(float(x), 4) for x in R[2]],       # forward = +Z_cam row
-                    "u": [round(float(-x), 4) for x in R[1]]})     # up = -Y_cam row
+                    "f": [round(float(x), 4) for x in R[2]],       # forward = +Z row (pose_from_lookat/PnP)
+                    "u": [round(float(x), 4) for x in R[1]]})      # up = +Y row (round-trips pose_from_lookat)
     info["mode"] = "auto-localize"
     return out, info
 
