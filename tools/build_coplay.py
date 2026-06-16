@@ -111,7 +111,7 @@ function highlight(w){ viewCam.position.set(w.c[0],w.c[1],w.c[2]);viewCam.up.set
 }
 let followCam=false; const fbtn=document.getElementById('fcam'), placeBtn=document.getElementById('placeBtn'), placeHud=document.getElementById('place');
 let placeMode=false;
-function updCtl(){ controls.enabled = placeMode || !followCam; }
+function updCtl(){ controls.enabled = placeMode || !followCam; if(typeof frustum!=='undefined'){frustum.visible=!followCam; beacon.visible=!followCam;} }
 const _fe=new THREE.Vector3(),_fl=new THREE.Vector3(),_fu=new THREE.Vector3(0,1,0),_lt=new THREE.Vector3(); let _finit=false;
 function applyFollow(w){const f=new THREE.Vector3(w.f[0],w.f[1],w.f[2]).normalize(),u=new THREE.Vector3(w.u[0],w.u[1],w.u[2]).normalize();
   _fe.set(w.c[0],w.c[1],w.c[2]).addScaledVector(f,-2.2).addScaledVector(u,0.7); _fl.set(w.c[0]+f.x*2,w.c[1]+f.y*2,w.c[2]+f.z*2); _fu.copy(u);
@@ -120,7 +120,7 @@ function setFrame(i){ i=Math.max(0,Math.min(RAWP.length-1,i|0)); curFrame=i; con
   frustum.position.set(w.c[0],w.c[1],w.c[2]);frustum.up.set(w.u[0],w.u[1],w.u[2]);frustum.lookAt(w.c[0]+w.f[0],w.c[1]+w.f[1],w.c[2]+w.f[2]);
   beacon.position.set(w.c[0],c0.y,w.c[2]);
   if(i!==lastHi||dirty){lastHi=i;dirty=false;highlight(w);} if(followCam&&!placeMode)applyFollow(w); }
-fbtn.onclick=()=>{followCam=!followCam;fbtn.classList.toggle('on',followCam);if(followCam)_finit=false;updCtl();};
+fbtn.onclick=()=>{followCam=!followCam;fbtn.classList.toggle('on',followCam);if(followCam)_finit=false;frustum.visible=!followCam;beacon.visible=!followCam;updCtl();};
 placeBtn.onclick=()=>{placeMode=!placeMode;placeBtn.classList.toggle('on',placeMode);placeHud.style.display=placeMode?'block':'none';updCtl();};
 updCtl(); rebuildPath(); setFrame(0);
 // DTDWebThree 기본뷰와 동일 방향: +X+Y+Z 코너 45°H/30°V, up=+Y (반전 인상 제거)
