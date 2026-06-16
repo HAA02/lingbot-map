@@ -29,6 +29,17 @@
 2. `build_coplay.py --demo-html <그HTML> --demo-match 161613 --point-size 0.02`
 3. WebGL: 솔리드 불투명 둥근 점 + `촬영자 시점` follow-cam
 
+## 완전자동 배관추종 배치 (2026-06-16, AutoPM 루프#3) — 권장
+`scan2bim/pipe_path.py` + `build_coplay.py place_pipe_auto`. **수동 waypoint 0개**로
+경로 자동생성: ①lane=메인 FXX런 자동검출(PCA+최밀lane) ②metric스케일=천장높이
+앵커(1.48, 배관직경 1.41과 일치) ③코너=재구성 turn-fraction(2-세그먼트 선적합,
+끝hook 강건)으로 분기 선택 ④회전방향=recon turn 손잡이(X반전 보정). 실행:
+`build_coplay --auto-pipe`. 결과 12.4m/0.35m/s, 배관거리 0.54m, 수동과 lane·방향·
+회전 일치. **자가분석 핵심**: 독립 metric앵커 2개(천장1.22·배관직경1.41)가 ~1.3 일치,
+궤적-런 피팅(3.1)은 "런 전체 보행" 가정으로 과신장 → metric앵커가 정답. HUD 좌상단
+자동/수동 배지 + 하단 전환버튼(`--peer-url`). 잔여 한계=절대 extent(모노큘러 scale
+불일치, metric SLAM 필요). TDD `tests/test_pipe_path.py` 7.
+
 ## FR-2.3 stage-2 객체-앵커 PnP 자동 로컬라이제이션 (2026-06-16, AutoPM)
 `scan2bim/localize.py` (TDD 9) — intrinsics(FOV)·project·pose_from_lookat·match_by_projection
 (거리필터)·solve_pnp(RANSAC+LM)·localize_frame·localize_trajectory(시간일관성 outlier
