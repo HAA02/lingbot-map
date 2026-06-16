@@ -64,7 +64,7 @@ const MESHES=__MESHES__, POSES=__POSES__, SCAN=__SCAN__, META=__META__;
 const renderer=new THREE.WebGLRenderer({canvas:document.getElementById('c'),antialias:true});
 renderer.setSize(innerWidth,innerHeight); renderer.setPixelRatio(Math.min(devicePixelRatio,1.5));
 const scene=new THREE.Scene(); scene.background=new THREE.Color(0x0c0f16);
-const camera=new THREE.PerspectiveCamera(55,innerWidth/innerHeight,0.05,5000);
+const camera=new THREE.PerspectiveCamera(55,innerWidth/innerHeight,0.05,500);
 scene.add(new THREE.AmbientLight(0xffffff,0.8));
 const dl=new THREE.DirectionalLight(0xffffff,0.85); dl.position.set(30,60,30); scene.add(dl);
 scene.add(new THREE.HemisphereLight(0xbfd4ff,0x202830,0.5));
@@ -89,13 +89,17 @@ function discTex(){const cv=document.createElement('canvas');cv.width=cv.height=
 let scanPts=null;
 if(SCAN && SCAN.pos){
   const sp=b64f32(SCAN.pos), sc=b64u8(SCAN.col);
-  const col=new Float32Array(sp.length); for(let i=0;i<sc.length;i++) col[i]=sc[i]/255;
+  // 저조도 재구성 색 약한 톤업(과하면 흰색 wash) — 깊이감은 EDL이 담당
+  const col=new Float32Array(sp.length); for(let i=0;i<sc.length;i++) col[i]=Math.min(1,Math.pow(sc[i]/255,0.80)*1.45);
   const g=new THREE.BufferGeometry(); g.setAttribute('position',new THREE.BufferAttribute(sp,3)); g.setAttribute('color',new THREE.BufferAttribute(col,3));
   // crisp opaque round points (no alpha wash) → photoreal like the demo video
   const pm=new THREE.PointsMaterial({size:__PSIZE__,map:discTex(),vertexColors:true,sizeAttenuation:true,transparent:false,depthWrite:true,alphaTest:0.5});
   scanPts=new THREE.Points(g,pm); scene.add(scanPts);
 }
 const c0=box.getCenter(new THREE.Vector3()), sz=box.getSize(new THREE.Vector3());
+// frame the scan cloud (not the whole 48m model) so points read dense
+let fitB=box; if(scanPts){ fitB=new THREE.Box3().setFromObject(scanPts); }
+const fc=fitB.getCenter(new THREE.Vector3()), fsz=fitB.getSize(new THREE.Vector3());
 const pts=POSES.map(p=>new THREE.Vector3(p.c[0],p.c[1],p.c[2]));
 if(pts.length){ scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),new THREE.LineBasicMaterial({color:0xffb347,transparent:true,opacity:0.9}))); }
 const frustum=new THREE.Group();
@@ -138,18 +142,45 @@ function setFrustum(i){
   if(followCam) applyFollow(i);
 }
 setFrustum(0);
-const d=Math.max(sz.x,sz.y,sz.z)*1.1;
-camera.position.set(c0.x+d,c0.y+d*0.8,c0.z+d); controls.target.copy(c0); controls.update();
+const d=Math.max(fsz.x,fsz.y,fsz.z)*1.4;
+camera.position.set(fc.x+d,fc.y+d*0.5,fc.z+d); controls.target.copy(fc); controls.update();
 const vid=document.getElementById('vid'), seek=document.getElementById('seek'), tlab=document.getElementById('t'), playb=document.getElementById('play');
 let dur=Math.max(META.duration||1,0.1);
 vid.addEventListener('loadedmetadata',()=>{dur=vid.duration||dur;});
 playb.onclick=()=>{ if(vid.paused){vid.play();playb.textContent='⏸ 일시정지';} else {vid.pause();playb.textContent='▶ 재생';} };
 seek.oninput=()=>{ vid.currentTime=(seek.value/1000)*dur; };
 function syncFromTime(t){ const frac=Math.max(0,Math.min(1,t/dur)); seek.value=Math.round(frac*1000); tlab.textContent=t.toFixed(1)+'s'; setFrustum(Math.round(frac*(POSES.length-1))); }
-addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
-function loop(){ requestAnimationFrame(loop); syncFromTime(vid.currentTime||0); controls.update(); renderer.render(scene,camera); }
+// ===== EDL (Eye-Dome Lighting): point-cloud surface definition via depth =====
+function mkRT(){ const w=Math.max(2,Math.floor(innerWidth*renderer.getPixelRatio())), h=Math.max(2,Math.floor(innerHeight*renderer.getPixelRatio()));
+  const dt=new THREE.DepthTexture(w,h); dt.type=THREE.FloatType;
+  return new THREE.WebGLRenderTarget(w,h,{depthTexture:dt,depthBuffer:true,minFilter:THREE.NearestFilter,magFilter:THREE.NearestFilter}); }
+let rt=mkRT();
+const edlScene=new THREE.Scene(), edlCam=new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+const edlMat=new THREE.ShaderMaterial({ uniforms:{ tColor:{value:rt.texture}, tDepth:{value:rt.depthTexture},
+    res:{value:new THREE.Vector2(rt.width,rt.height)}, edlStrength:{value:__EDLSTR__}, edlRadius:{value:1.1}, nearF:{value:camera.near}, farF:{value:camera.far} },
+  vertexShader:'varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.0,1.0);} ',
+  fragmentShader:[
+    'uniform sampler2D tColor,tDepth; uniform vec2 res; uniform float edlStrength,edlRadius,nearF,farF; varying vec2 vUv;',
+    'float linz(vec2 uv){ float z=texture2D(tDepth,uv).x; return nearF*farF/(farF - z*(farF-nearF)); }',
+    'void main(){ vec3 c=texture2D(tColor,vUv).rgb; float d0=linz(vUv);',
+    ' if(d0>=farF*0.999){ gl_FragColor=vec4(c,1.0); return; }',
+    ' vec2 px=edlRadius/res; float s=0.0;',
+    ' vec2 o[8]; o[0]=vec2(1.,0.);o[1]=vec2(-1.,0.);o[2]=vec2(0.,1.);o[3]=vec2(0.,-1.);o[4]=vec2(0.7,0.7);o[5]=vec2(-0.7,0.7);o[6]=vec2(0.7,-0.7);o[7]=vec2(-0.7,-0.7);',
+    ' for(int i=0;i<8;i++){ float dn=linz(vUv+o[i]*px); s+=max(0.0, log2(d0)-log2(dn)); }',
+    ' float shade=exp(-s*edlStrength/8.0); gl_FragColor=vec4(c*shade,1.0); }'
+  ].join('\n') });
+edlScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2,2), edlMat));
+let edlOn=true;
+function resizeAll(){ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth,innerHeight);
+  rt.dispose(); rt=mkRT(); edlMat.uniforms.tColor.value=rt.texture; edlMat.uniforms.tDepth.value=rt.depthTexture; edlMat.uniforms.res.value.set(rt.width,rt.height); }
+addEventListener('resize', resizeAll);
+function loop(){ requestAnimationFrame(loop); syncFromTime(vid.currentTime||0); controls.update();
+  if(edlOn){ edlMat.uniforms.nearF.value=camera.near; edlMat.uniforms.farF.value=camera.far;
+    renderer.setRenderTarget(rt); renderer.render(scene,camera); renderer.setRenderTarget(null); renderer.render(edlScene,edlCam); }
+  else { renderer.setRenderTarget(null); renderer.render(scene,camera); } }
 loop();
-window.__coplay={scene,camera,POSES,MESHES,SCAN,box,setFrustum};
+addEventListener('keydown',e=>{ if(e.key==='e') edlOn=!edlOn; });
+window.__coplay={scene,camera,POSES,MESHES,SCAN,box,setFrustum,setEDL:(v)=>{edlOn=!!v;}};
 </script></body></html>"""
 
 
@@ -270,6 +301,7 @@ def main():
                          "(build_demo_map output) — far higher quality than realtime /scan")
     ap.add_argument("--demo-match", default="161613", help="dataset label/upload to pick from --demo-html")
     ap.add_argument("--point-size", type=float, default=0.025, help="webgl point size (m)")
+    ap.add_argument("--edl-strength", type=float, default=22.0, help="EDL shading strength (0=off-look)")
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
@@ -317,6 +349,7 @@ def main():
             .replace("__NSCAN__", f"{len(scan_pos):,}")
             .replace("__LEGEND__", " ".join(legend))
             .replace("__PSIZE__", repr(float(args.point_size)))
+            .replace("__EDLSTR__", repr(float(args.edl_strength)))
             .replace("__VIDEO__", rel_video))
     out.write_text(html, encoding="utf-8")
     print(f"wrote {out} ({out.stat().st_size/1e6:.1f} MB) tris={tris:,} poses={len(pose_json)} "
