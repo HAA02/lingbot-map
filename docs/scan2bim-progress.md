@@ -14,10 +14,15 @@
 | 2.1 | `scan2bim/registration.py` | Sim3 정합(PCA coarse + Umeyama-ICP, Open3D 불필요) | 3 |
 | 2.2 | `scan2bim/matching.py` | 색↔계통 시맨틱 매칭(텍스트 없이) | 4 |
 | 3 | `scan2bim/progress.py` | 요소 coverage→상태, 일일 원장, day-over-day diff | 5 |
+| 2.3 | `scan2bim/detect.py` | OWL-ViT open-vocab 검출 (실프레임: AC 0.79·조명 0.59·기둥 0.32) | — |
+| 2.3 | `scan2bim/anchors.py` | 인스턴스별 객체 앵커(중심+footprint)+타입분류 (AC 54·조명 31·기둥 615) | 6 |
 | — | `scan2bim/pipeline.py` | 통합: 정합→coverage→실적→색귀속 | 2 |
-| 4 | `tools/build_coplay.py` | 영상↔dtdx WebGL co-play(중력정렬·천장고·follow-cam·매핑 하이라이트) | 헤드리스 |
+| 4 | `tools/build_coplay.py` | 영상↔dtdx WebGL co-play(중력정렬·천장고·follow-cam·매핑·**LH→RH X반전**) | 헤드리스 |
 
-검증: `PYTHONPATH=. .venv/bin/python -m unittest discover -s tests`
+검증: `PYTHONPATH=. .venv/bin/python -m unittest discover -s tests` (38 GREEN)
+
+## 좌우반전(handedness) 수정 — 2026-06-16
+`.dtdx`는 Babylon(왼손좌표) 저작 → Three(오른손좌표) 미변환 로드 시 좌우 거울반전. 정상뷰어(원본 프로그램, 53.57×48.73m)와 맞추려면 **모델 X 부호반전**. `build_coplay.py`는 디코드 직후 `pos[:,0]*=-1`, **DTDWebThree는 `SceneManager` models그룹 `scale.x=-1`**(전체 Gasan top-down 검증 완료). 상세 [[dtdx-handedness-flip]].
 
 ## co-play 품질 레시피 (demo급)
 1. `build_demo_map.py --keep 500000` → dense photoreal cloud(원본 색, 500k)
