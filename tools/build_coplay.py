@@ -414,6 +414,37 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
                        "path_m": round(plen, 2), "cam_h": round(eye - float(bbox[0][1]), 2)}
 
 
+def place_pipe_auto(poses, scan_pts, bbox, fxx_file):
+    """완전 자동 배관추종 배치: lane(메인런) + METRIC 스케일(천장높이 앵커, robust) +
+    코너(B1 turn-fraction) + recon 형상. 수동 waypoint 없이 metric 길이로 배치.
+    핵심: 궤적-런 피팅(런 전체 가정)은 과신장 → 독립 metric 앵커로 실제 보행거리 산출."""
+    from scan2bim.pipe_path import main_pipe_run_L, trajectory_turn_fraction
+    vp = [viewer_pose(p) for p in poses]
+    cen = np.array([v[0] for v in vp]); up_v = np.array([v[2] for v in vp])
+    g = up_v.mean(0); g /= (np.linalg.norm(g) + 1e-9)
+    Rg = _rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
+    Cg = cen @ Rg.T
+    P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0; Pg = P @ Rg.T
+    vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
+    s_m = float((bbox[1][1] - bbox[0][1]) / max(vext, 1e-6))         # 천장높이 metric 스케일
+    traj = Cg[:, [0, 2]]
+    tf, tang = trajectory_turn_fraction(traj)
+    total = float(np.linalg.norm(np.diff(traj, axis=0), axis=1).sum())
+    L1, L2 = tf * total * s_m, (1 - tf) * total * s_m               # metric 세그먼트 길이
+    poly = main_pipe_run_L(fxx_file, turn_fraction=(tf if tang > 30 else None))
+    if len(poly) == 3:
+        corner = poly[1]
+        rd = poly[0] - corner; rd /= (np.linalg.norm(rd) + 1e-9)
+        bd = poly[2] - corner; bd /= (np.linalg.norm(bd) + 1e-9)
+        wps = [(corner + rd * L1).tolist(), corner.tolist(), (corner + bd * L2).tolist()]
+    else:
+        A, B = poly; d = B - A; d /= (np.linalg.norm(d) + 1e-9)
+        wps = [A.tolist(), (A + d * total * s_m).tolist()]
+    pose_json, info = place_gtpath(poses, scan_pts, bbox, wps, snap=True)
+    info["mode"] = "auto-pipe-metric"; info["s_metric"] = round(s_m, 2); info["turn_frac"] = round(tf, 2)
+    return pose_json, info
+
+
 def _detect_cached(frame_paths, cache_path, threshold=0.2):
     """Run OWL-ViT once per frame; cache to JSON so re-builds are instant."""
     cache = {}
@@ -518,17 +549,9 @@ def main():
         poses, scan_pts = fetch_scan(args.base_url, args.upload)
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
     if args.auto_pipe:
-        from scan2bim.pipe_path import main_pipe_run_L, trajectory_turn_fraction
-        # 재구성 궤적의 turn-fraction → 올바른 분기(코너) 선택 (의존성0, B1)
-        vp = [viewer_pose(p) for p in poses]
-        cen = np.array([v[0] for v in vp]); up_v = np.array([v[2] for v in vp])
-        g = up_v.mean(0); g /= (np.linalg.norm(g) + 1e-9)
-        Cg = cen @ _rot_a_to_b(g, np.array([0.0, 1.0, 0.0])).T
-        tf, tang = trajectory_turn_fraction(Cg[:, [0, 2]])
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
-        wps = main_pipe_run_L(fxx, turn_fraction=(tf if tang > 30 else None)).tolist()
-        pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps, snap=(args.gt_mode == "snap"))
-        print(f"  auto-pipe(L): turn_frac={tf:.2f}({tang:.0f}°)", reginfo, "polyline:", [[round(v, 1) for v in w] for w in wps])
+        pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx)
+        print("  auto-pipe(metric):", reginfo)
     elif args.gt_path:
         wps = [[float(v) for v in seg.split(",")] for seg in args.gt_path.split()]
         pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps, snap=(args.gt_mode == "snap"))
