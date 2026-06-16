@@ -179,9 +179,15 @@ def load_demo_cloud(html_path, match):
 
 
 def viewer_pose(p12):
+    """재구성 외부파라미터 [R|t]는 WORLD-TO-CAMERA(여기선 viewer Y-up로 플립).
+    카메라 중심 = -R^T t (t를 그대로 쓰면 회전이 병진으로 새어들어 회전 시 ~4배
+    유령 가속 — 실측 corr(회전,병진) 0.985→0.12로 해소). forward=-R^T col2(걷는
+    방향과 정합 +0.64), up=R^T col1(중력 +Y, 일관도 0.93). 반환 (center, forward, up)."""
     c = np.asarray(p12, dtype=np.float64)
     R = np.array([[c[0], -c[1], -c[2]], [-c[4], c[5], c[6]], [-c[8], c[9], c[10]]])
-    return R, np.array([c[3], -c[7], -c[11]])
+    t = np.array([c[3], -c[7], -c[11]])
+    Rt = R.T
+    return -Rt @ t, -Rt[:, 2], Rt[:, 1]
 
 
 def _rot_a_to_b(a, b):
@@ -193,10 +199,36 @@ def _rot_a_to_b(a, b):
     return np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
 
 
+def _icp_rigid(src, dst, tree, s, R, t, iters=30):
+    """Rigid ICP at FIXED scale s — refine R,t only (Kabsch). Scale comes from the
+    robust vertical/ceiling-height anchor, NOT horizontal ceiling matching which is
+    ambiguous on repeated ceilings (it collapsed to 0.409). apply = s*(src@R.T)+t."""
+    S = s * src
+    for _ in range(iters):
+        d, idx = tree.query(S @ R.T + t, workers=-1)
+        thr = max(float(np.median(d)) * 3.0, 1e-6); m = d < thr
+        if int(m.sum()) < 3:
+            break
+        A, B = S[m], dst[idx[m]]
+        ca, cb = A.mean(0), B.mean(0)
+        U, _, Vt = np.linalg.svd((A - ca).T @ (B - cb))
+        Dd = np.diag([1.0, 1.0, float(np.sign(np.linalg.det(Vt.T @ U.T)))])
+        Rn = Vt.T @ Dd @ U.T
+        tn = cb - ca @ Rn.T
+        done = np.allclose(Rn, R, atol=1e-9) and np.allclose(tn, t, atol=1e-9)
+        R, t = Rn, tn
+        if done:
+            break
+    d, _ = tree.query(S @ R.T + t, workers=-1)
+    rmse = float(np.sqrt((d ** 2).mean()))
+    inl = float((d < max(float(np.median(d)) * 3.0, 0.05)).mean())
+    return s, R, t, rmse, inl
+
+
 def place_gravity(poses, scan_pts, bbox, scale=1.0):
     centers, fwd, up = [], [], []
     for p in poses:
-        R, t = viewer_pose(p); centers.append(t); up.append(R[:, 1]); fwd.append(R[:, 2])
+        center, f, u = viewer_pose(p); centers.append(center); up.append(u); fwd.append(f)
     centers = np.array(centers); up = np.array(up); fwd = np.array(fwd)
     g = up.mean(0); g /= (np.linalg.norm(g) + 1e-9)
     mn, mx = np.array(bbox[0]), np.array(bbox[1]); span = mx - mn
@@ -227,10 +259,9 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
     the model ceiling (grid XY + yaw + scale + Umeyama-ICP). Returns placed
     poses + fit metrics. (Footage looks up → ceiling-to-ceiling locks well.)"""
     from scipy.spatial import cKDTree
-    from scan2bim.registration import _icp
     centers, fwd, up = [], [], []
     for p in poses:
-        R, t = viewer_pose(p); centers.append(t); up.append(R[:, 1]); fwd.append(R[:, 2])
+        center, f, u = viewer_pose(p); centers.append(center); up.append(u); fwd.append(f)
     centers = np.array(centers); up = np.array(up); fwd = np.array(fwd)
     g = up.mean(0); g /= (np.linalg.norm(g) + 1e-9)
     Rg = _rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
@@ -241,6 +272,12 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
     tree = cKDTree(model_ceiling)
     lo, hi = np.array(bbox[0]), np.array(bbox[1])
     yc = float(np.percentile(model_ceiling[:, 1], 50))
+
+    # METRIC scale from the VERTICAL ceiling-height ratio — robust because looking
+    # up captures floor↔ceiling extent well, whereas horizontal ceiling matching is
+    # ambiguous on repeated geometry (it collapsed to 0.409 → 3.6 m phantom walk).
+    vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
+    s_vert = float((hi[1] - lo[1]) / max(vext, 1e-6))
 
     # camera WALK direction (gravity-aligned, horizontal) vs model PIPE direction
     # — pins yaw so the 3D path follows pipes (the video walks straight along them).
@@ -265,7 +302,7 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
         gz = np.linspace(lo[2] + 2, hi[2] - 2, 9)
 
     best = None
-    for s in (1.0, 1.15, 1.3, 1.45, 1.6):
+    for s in (s_vert * 0.92, s_vert, s_vert * 1.08):   # narrow band around metric anchor
         for yaw in range(0, 360, 15):
             R = Ry(yaw)
             align = abs(float(np.cos(np.deg2rad(a_s + yaw - a_p))))  # 1=traj∥pipes
@@ -277,7 +314,7 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
                     if best is None or score > best[0]:
                         best = (score, s, yaw, R, t)
     _sc, s0, yaw, R0, t0 = best
-    s2, R2, t2, rmse, inl2 = _icp(sc, model_ceiling, tree, float(s0), R0, t0, iters=30)
+    s2, R2, t2, rmse, inl2 = _icp_rigid(sc, model_ceiling, tree, float(s0), R0, t0, iters=30)
     Ct = s2 * (Cg @ R2.T) + t2; Ft = Fg @ R2.T; Ut = Ug @ R2.T
     pose_json = [{"c": [round(float(x), 3) for x in Ct[i]], "f": [round(float(x), 4) for x in Ft[i]],
                   "u": [round(float(x), 4) for x in Ut[i]]} for i in range(len(Ct))]
