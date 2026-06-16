@@ -316,10 +316,16 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
     _sc, s0, yaw, R0, t0 = best
     s2, R2, t2, rmse, inl2 = _icp_rigid(sc, model_ceiling, tree, float(s0), R0, t0, iters=30)
     Ct = s2 * (Cg @ R2.T) + t2; Ft = Fg @ R2.T; Ut = Ug @ R2.T
+    # 카메라 EYE-LEVEL 보정: 천장정합은 점군 천장을 맞추지만 카메라는 천장이 아니라
+    # 눈높이에 있음. 재구성의 카메라↔천장 거리가 압축돼 천장 플레넘에 박힘(바닥+2.8m).
+    # 궤적 형태는 두고 높이만 바닥+1.5m(눈높이)로 시프트 → 천장구조 관통 제거.
+    eye = float(bbox[0][1]) + 1.5
+    Ct[:, 1] += eye - float(np.median(Ct[:, 1]))
     pose_json = [{"c": [round(float(x), 3) for x in Ct[i]], "f": [round(float(x), 4) for x in Ft[i]],
                   "u": [round(float(x), 4) for x in Ut[i]]} for i in range(len(Ct))]
     return pose_json, {"inlier": round(float(inl2), 3), "rmse": round(float(rmse), 3),
-                       "scale": round(float(s2), 3), "yaw": int(yaw)}
+                       "scale": round(float(s2), 3), "yaw": int(yaw),
+                       "cam_h": round(eye - float(bbox[0][1]), 2)}
 
 
 def main():
