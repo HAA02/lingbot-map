@@ -29,98 +29,110 @@ import numpy as np
 from scan2bim.dtdx_geometry import decode_geometry
 
 TEMPLATE = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
-<title>co-play · 점군 렌더 ↔ 설계모델 비교</title>
+<title>co-play · dtdx ↔ 점군영상</title>
 <style>
-  *{margin:0;box-sizing:border-box} html,body{height:100%;background:#0a0d13;color:#e8eaf0;font-family:system-ui,sans-serif;overflow:hidden}
-  #wrap{position:fixed;inset:0 0 64px 0;display:flex}
-  #left,#right{position:relative;width:50%;height:100%;overflow:hidden;border-right:1px solid #1c2330}
-  #left{background:#000} #left video{width:100%;height:100%;object-fit:contain;background:#000}
-  #right{background:#0c0f16} #c{width:100%;height:100%;display:block}
-  .lbl{position:absolute;left:12px;top:10px;background:rgba(10,13,19,.78);border:1px solid #283042;border-radius:8px;padding:6px 11px;font-size:13px;font-weight:600;z-index:5}
-  .lbl small{display:block;font-weight:400;color:#9fb0c8;font-size:11px;margin-top:2px}
-  #hud{position:absolute;right:12px;top:10px;background:rgba(10,13,19,.78);border:1px solid #283042;border-radius:8px;padding:8px 11px;font-size:12px;color:#9fb0c8;z-index:5}
-  #hud b{color:#e8eaf0}
-  #bar{position:fixed;left:0;right:0;bottom:0;height:64px;display:flex;gap:12px;align-items:center;background:#0e1219;border-top:1px solid #283042;padding:0 18px}
-  #bar button{background:#1c2433;color:#e8eaf0;border:1px solid #2c3344;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:13px}
-  #bar input[type=range]{flex:1} #bar .t{font-variant-numeric:tabular-nums;color:#9fb0c8;min-width:64px}
-  .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle}
+*{margin:0;box-sizing:border-box} html,body{height:100%;background:#0a0d13;color:#e8eaf0;font-family:system-ui,sans-serif;overflow:hidden}
+#c{position:fixed;inset:0;display:block}
+#hud{position:fixed;left:12px;top:12px;background:rgba(10,13,19,.8);border:1px solid #283042;border-radius:8px;padding:8px 11px;font-size:12px;z-index:5;max-width:360px}
+#hud b{color:#fff} #hud .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px} .hl{color:#31d27c}
+#pip{position:fixed;right:18px;top:18px;width:360px;background:#11151f;border:1px solid #2c3344;border-radius:10px;overflow:hidden;z-index:20;box-shadow:0 8px 30px rgba(0,0,0,.6)}
+#pip header{display:flex;align-items:center;gap:6px;padding:5px 8px;background:#161b26;cursor:move;font-size:12px;color:#cdd6e6;user-select:none}
+#pip header .sp{flex:1} #pip header button{background:#222b3a;color:#cdd6e6;border:1px solid #313c4f;border-radius:5px;padding:0 8px;cursor:pointer;font-size:13px;line-height:18px}
+#pip video{width:100%;display:block;background:#000} #pip.min video{display:none}
+#bar{position:fixed;left:12px;right:12px;bottom:12px;display:flex;gap:10px;align-items:center;background:rgba(14,18,25,.92);border:1px solid #283042;border-radius:10px;padding:8px 14px;z-index:10}
+#bar button{background:#1c2433;color:#e8eaf0;border:1px solid #2c3344;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px}
+#bar button.on{background:#31d27c;color:#06210f;border-color:#31d27c}
+#bar input[type=range]{flex:1} #bar .t{color:#9fb0c8;min-width:60px;font-variant-numeric:tabular-nums}
+#place{position:fixed;left:12px;bottom:60px;background:rgba(10,13,19,.85);border:1px solid #31d27c;border-radius:8px;padding:7px 10px;font-size:12px;color:#9fb0c8;z-index:10;display:none}
+#place b{color:#e8eaf0}
 </style>
 <script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}</script>
 </head><body>
-<div id="wrap">
-  <div id="left"><div class="lbl">정합 렌더링 (점군)<small>GPU 스플랫 photoreal · 촬영자 시점</small></div>
-    <video id="rvid" src="__RVIDEO__" muted playsinline preload="none"></video></div>
-  <div id="right"><div class="lbl">설계 모델 (dtdx)<small>__MODELNAME__ · 현재 위치/방향 + 매핑 객체</small></div>
-    <div id="hud">삼각형 <b>__TRIS__</b> · 포즈 <b>__NPOSES__</b><br><span class="legend">__LEGEND__</span><br><span id="finfo">frame —</span></div>
-    <canvas id="c"></canvas></div>
-</div>
-<div id="bar"><button id="play">▶ 재생</button><button id="fcam">자유 시점</button><input id="seek" type="range" min="0" max="1000" value="0"><span class="t" id="t">0.0s</span></div>
+<canvas id="c"></canvas>
+<div id="hud"><b>설계모델 ↔ 영상 co-play</b><br><span style="color:#9fb0c8">__MODELNAME__ · 삼각형 __TRIS__ · 포즈 __NPOSES__</span><br><span class="legend">__LEGEND__</span><br><span id="finfo" style="color:#9fb0c8">frame —</span></div>
+<div id="pip"><header><span>정합 렌더 영상 (점군)</span><span class="sp"></span><button id="psm" title="축소">−</button><button id="pbg" title="확대">＋</button><button id="pmin" title="최소화">▭</button></header><video id="rvid" src="__RVIDEO__" muted playsinline preload="none"></video></div>
+<div id="place">위치 지정: 모델 클릭 → 첫 위치 · <b>화살표</b>=이동 · <b>[</b>/<b>]</b>=회전 · <b>PgUp/Dn</b>=높이</div>
+<div id="bar"><button id="play">▶ 재생</button><button id="placeBtn">위치 지정</button><button id="fcam" class="on">촬영자 추적</button><input id="seek" type="range" min="0" max="1000" value="0"><span class="t" id="t">0.0s</span></div>
 <script type="module">
 import * as THREE from 'three';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
-const MESHES=__MESHES__, POSES=__POSES__, META=__META__;
-const right=document.getElementById('right');
+const MESHES=__MESHES__, RAWP=__POSES__, META=__META__;
 const renderer=new THREE.WebGLRenderer({canvas:document.getElementById('c'),antialias:true});
-function rsize(){ const w=right.clientWidth,h=right.clientHeight; renderer.setSize(w,h,false); camera.aspect=w/h; camera.updateProjectionMatrix(); }
-renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth,innerHeight); renderer.setPixelRatio(Math.min(devicePixelRatio,2));
 const scene=new THREE.Scene(); scene.background=new THREE.Color(0x0c0f16);
-const camera=new THREE.PerspectiveCamera(55,1,0.05,2000);
+const camera=new THREE.PerspectiveCamera(55,innerWidth/innerHeight,0.05,2000);
 scene.add(new THREE.AmbientLight(0xffffff,0.85));
 const dl=new THREE.DirectionalLight(0xffffff,0.9); dl.position.set(30,60,30); scene.add(dl);
-scene.add(new THREE.HemisphereLight(0xbfd4ff,0x202830,0.5));
-scene.add(new THREE.GridHelper(60,60,0x223,0x182030));
+scene.add(new THREE.HemisphereLight(0xbfd4ff,0x202830,0.5)); scene.add(new THREE.GridHelper(60,60,0x223,0x182030));
 const controls=new OrbitControls(camera,renderer.domElement);
-function b64f32(s){const bin=atob(s);const u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return new Float32Array(u.buffer);}
-const box=new THREE.Box3(); const MESH_OBJS=[];
+function b64f32(s){const b=atob(s),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return new Float32Array(u.buffer);}
+const box=new THREE.Box3(); const MESH_OBJS=[]; const raycaster=new THREE.Raycaster(); const mouse=new THREE.Vector2();
 for(const m of MESHES){
   const pos=b64f32(m.b64); const n=pos.length/3;
   const g=new THREE.BufferGeometry(); g.setAttribute('position',new THREE.BufferAttribute(pos,3)); g.computeVertexNormals();
   const base=new Float32Array(pos.length); for(let i=0;i<n;i++){base[i*3]=m.color[0];base[i*3+1]=m.color[1];base[i*3+2]=m.color[2];}
   const col=base.slice(); g.setAttribute('color',new THREE.BufferAttribute(col,3));
-  const mat=new THREE.MeshStandardMaterial({vertexColors:true,roughness:0.7,metalness:0.05,side:THREE.DoubleSide});
-  const mesh=new THREE.Mesh(g,mat); scene.add(mesh); box.expandByObject(mesh);
-  MESH_OBJS.push({mesh,pos,base,col,n});
+  const mesh=new THREE.Mesh(g,new THREE.MeshStandardMaterial({vertexColors:true,roughness:0.7,metalness:0.05,side:THREE.DoubleSide}));
+  scene.add(mesh); box.expandByObject(mesh); MESH_OBJS.push({mesh,pos,base,col,n});
 }
 const c0=box.getCenter(new THREE.Vector3()), sz=box.getSize(new THREE.Vector3());
-const pts=POSES.map(p=>new THREE.Vector3(p.c[0],p.c[1],p.c[2]));
-if(pts.length){ scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),new THREE.LineBasicMaterial({color:0xffb347,linewidth:2}))); }
+let cx0=0,cy0=0,cz0=0; for(const p of RAWP){cx0+=p.c[0];cy0+=p.c[1];cz0+=p.c[2];} cx0/=RAWP.length;cy0/=RAWP.length;cz0/=RAWP.length;
+const CANON=RAWP.map(p=>({c:[p.c[0]-cx0,p.c[1]-cy0,p.c[2]-cz0],f:p.f.slice(),u:p.u.slice()}));
+let offset=[cx0,cy0,cz0], yaw=0;
+function rotY(v,deg){const r=deg*Math.PI/180,c=Math.cos(r),s=Math.sin(r);return [c*v[0]+s*v[2],v[1],-s*v[0]+c*v[2]];}
+function wp(i){const q=CANON[i];const c=rotY(q.c,yaw);return {c:[c[0]+offset[0],c[1]+offset[1],c[2]+offset[2]],f:rotY(q.f,yaw),u:rotY(q.u,yaw)};}
+const pathGeo=new THREE.BufferGeometry(); const pathPos=new Float32Array(RAWP.length*3);
+scene.add(new THREE.Line(pathGeo,new THREE.LineBasicMaterial({color:0xffb347})));
+function rebuildPath(){ for(let i=0;i<RAWP.length;i++){const w=wp(i);pathPos[i*3]=w.c[0];pathPos[i*3+1]=w.c[1];pathPos[i*3+2]=w.c[2];} pathGeo.setAttribute('position',new THREE.BufferAttribute(pathPos,3)); pathGeo.attributes.position.needsUpdate=true; pathGeo.computeBoundingSphere(); }
 const frustum=new THREE.Group();
-const cone=new THREE.Mesh(new THREE.ConeGeometry(0.5,1.2,4),new THREE.MeshBasicMaterial({color:0x31d27c,wireframe:true})); cone.rotation.x=Math.PI/2; frustum.add(cone);
-frustum.add(new THREE.Mesh(new THREE.SphereGeometry(0.3,16,12),new THREE.MeshBasicMaterial({color:0x31d27c})));
-scene.add(frustum);
+const cone=new THREE.Mesh(new THREE.ConeGeometry(0.5,1.2,4),new THREE.MeshBasicMaterial({color:0x31d27c,wireframe:true}));cone.rotation.x=Math.PI/2;frustum.add(cone);
+frustum.add(new THREE.Mesh(new THREE.SphereGeometry(0.3,16,12),new THREE.MeshBasicMaterial({color:0x31d27c})));scene.add(frustum);
 const viewCam=new THREE.PerspectiveCamera(70,1.5,0.1,Math.max(2,Math.min(sz.x,sz.z)*0.3));
-const _fr=new THREE.Frustum(),_m4=new THREE.Matrix4(),_v=new THREE.Vector3(); let lastHi=-1;
-function highlight(i){ const p=POSES[i]; if(!p)return;
-  viewCam.position.set(p.c[0],p.c[1],p.c[2]); viewCam.up.set(p.u[0],p.u[1],p.u[2]); viewCam.lookAt(p.c[0]+p.f[0],p.c[1]+p.f[1],p.c[2]+p.f[2]);
-  viewCam.updateMatrixWorld(true); viewCam.updateProjectionMatrix(); _fr.setFromProjectionMatrix(_m4.multiplyMatrices(viewCam.projectionMatrix,viewCam.matrixWorldInverse));
-  let hit=0;
-  for(const o of MESH_OBJS){ for(let k=0;k<o.n;k++){ _v.set(o.pos[k*3],o.pos[k*3+1],o.pos[k*3+2]);
-    if(_fr.containsPoint(_v)){o.col[k*3]=0.2;o.col[k*3+1]=1.0;o.col[k*3+2]=0.55;hit++;} else {o.col[k*3]=o.base[k*3];o.col[k*3+1]=o.base[k*3+1];o.col[k*3+2]=o.base[k*3+2];} }
-    o.mesh.geometry.attributes.color.needsUpdate=true; }
-  document.getElementById('finfo').textContent='frame '+i+' / '+(POSES.length-1)+' · 매핑 객체정점 '+hit;
+const _fr=new THREE.Frustum(),_m4=new THREE.Matrix4(),_v=new THREE.Vector3(); let lastHi=-1,dirty=true,curFrame=0;
+function highlight(w){ viewCam.position.set(w.c[0],w.c[1],w.c[2]);viewCam.up.set(w.u[0],w.u[1],w.u[2]);viewCam.lookAt(w.c[0]+w.f[0],w.c[1]+w.f[1],w.c[2]+w.f[2]);
+  viewCam.updateMatrixWorld(true);viewCam.updateProjectionMatrix();_fr.setFromProjectionMatrix(_m4.multiplyMatrices(viewCam.projectionMatrix,viewCam.matrixWorldInverse));
+  let hit=0; for(const o of MESH_OBJS){for(let k=0;k<o.n;k++){_v.set(o.pos[k*3],o.pos[k*3+1],o.pos[k*3+2]); if(_fr.containsPoint(_v)){o.col[k*3]=0.2;o.col[k*3+1]=1;o.col[k*3+2]=0.55;hit++;}else{o.col[k*3]=o.base[k*3];o.col[k*3+1]=o.base[k*3+1];o.col[k*3+2]=o.base[k*3+2];}}o.mesh.geometry.attributes.color.needsUpdate=true;}
+  document.getElementById('finfo').innerHTML='frame '+curFrame+' / '+(RAWP.length-1)+' · 매핑 <span class="hl">'+hit+'</span>';
 }
-let followCam=true; const fbtn=document.getElementById('fcam');
-function applyFollow(i){ const p=POSES[i]; if(!p)return; const fwd=new THREE.Vector3(p.f[0],p.f[1],p.f[2]).normalize(); const up=new THREE.Vector3(p.u[0],p.u[1],p.u[2]).normalize();
-  camera.position.set(p.c[0],p.c[1],p.c[2]).addScaledVector(fwd,-2.2).addScaledVector(up,0.7); camera.up.copy(up); camera.lookAt(p.c[0]+fwd.x*2,p.c[1]+fwd.y*2,p.c[2]+fwd.z*2); }
-fbtn.textContent='자유 시점';
-fbtn.onclick=()=>{ followCam=!followCam; fbtn.textContent=followCam?'자유 시점':'촬영자 시점'; controls.enabled=!followCam; if(followCam) applyFollow(lastHi<0?0:lastHi); };
-function setFrustum(i){ i=Math.max(0,Math.min(POSES.length-1,i|0)); const p=POSES[i]; if(!p)return;
-  frustum.position.set(p.c[0],p.c[1],p.c[2]); frustum.up.set(p.u[0],p.u[1],p.u[2]); frustum.lookAt(p.c[0]+p.f[0],p.c[1]+p.f[1],p.c[2]+p.f[2]);
-  if(i!==lastHi){ lastHi=i; highlight(i); } if(followCam) applyFollow(i); }
-rsize(); setFrustum(0);
-const d=Math.max(sz.x,sz.y,sz.z)*0.6; camera.position.set(c0.x+d,c0.y+d*0.6,c0.z+d); controls.target.copy(c0); controls.update();
-controls.enabled=!followCam;  // follow 모드면 OrbitControls 끔 (충돌 방지)
-// shared timeline driven by the render video
-const rvid=document.getElementById('rvid'), seek=document.getElementById('seek'), tlab=document.getElementById('t'), playb=document.getElementById('play');
-let dur=Math.max(META.duration||1,0.1);
-rvid.addEventListener('loadedmetadata',()=>{dur=rvid.duration||dur;});
-playb.onclick=()=>{ if(rvid.paused){rvid.play();playb.textContent='⏸ 일시정지';} else {rvid.pause();playb.textContent='▶ 재생';} };
-seek.oninput=()=>{ rvid.currentTime=(seek.value/1000)*dur; };
-function sync(t){ const f=Math.max(0,Math.min(1,t/dur)); seek.value=Math.round(f*1000); tlab.textContent=t.toFixed(1)+'s'; setFrustum(Math.round(f*(POSES.length-1))); }
-addEventListener('resize', rsize);
-function loop(){ requestAnimationFrame(loop); sync(rvid.currentTime||0); if(!followCam) controls.update(); renderer.render(scene,camera); }
+let followCam=true; const fbtn=document.getElementById('fcam'), placeBtn=document.getElementById('placeBtn'), placeHud=document.getElementById('place');
+let placeMode=false;
+function updCtl(){ controls.enabled = placeMode || !followCam; }
+function applyFollow(w){const f=new THREE.Vector3(w.f[0],w.f[1],w.f[2]).normalize(),u=new THREE.Vector3(w.u[0],w.u[1],w.u[2]).normalize();
+  camera.position.set(w.c[0],w.c[1],w.c[2]).addScaledVector(f,-2.2).addScaledVector(u,0.7);camera.up.copy(u);camera.lookAt(w.c[0]+f.x*2,w.c[1]+f.y*2,w.c[2]+f.z*2);}
+function setFrame(i){ i=Math.max(0,Math.min(RAWP.length-1,i|0)); curFrame=i; const w=wp(i);
+  frustum.position.set(w.c[0],w.c[1],w.c[2]);frustum.up.set(w.u[0],w.u[1],w.u[2]);frustum.lookAt(w.c[0]+w.f[0],w.c[1]+w.f[1],w.c[2]+w.f[2]);
+  if(i!==lastHi||dirty){lastHi=i;dirty=false;highlight(w);} if(followCam&&!placeMode)applyFollow(w); }
+fbtn.onclick=()=>{followCam=!followCam;fbtn.classList.toggle('on',followCam);updCtl();};
+placeBtn.onclick=()=>{placeMode=!placeMode;placeBtn.classList.toggle('on',placeMode);placeHud.style.display=placeMode?'block':'none';updCtl();};
+updCtl(); rebuildPath(); setFrame(0);
+camera.position.set(c0.x+sz.x*0.7,c0.y+sz.y,c0.z+sz.z*0.7); controls.target.copy(c0); controls.update();
+renderer.domElement.addEventListener('click',e=>{ if(!placeMode)return;
+  mouse.x=(e.clientX/innerWidth)*2-1;mouse.y=-(e.clientY/innerHeight)*2+1;raycaster.setFromCamera(mouse,camera);
+  const hits=raycaster.intersectObjects(MESH_OBJS.map(o=>o.mesh),false);
+  if(hits.length){offset[0]=hits[0].point.x;offset[2]=hits[0].point.z;dirty=true;rebuildPath();} });
+addEventListener('keydown',e=>{ if(!placeMode)return; const st=0.2;
+  if(e.key==='ArrowLeft')offset[0]-=st; else if(e.key==='ArrowRight')offset[0]+=st;
+  else if(e.key==='ArrowUp')offset[2]-=st; else if(e.key==='ArrowDown')offset[2]+=st;
+  else if(e.key==='PageUp')offset[1]+=st; else if(e.key==='PageDown')offset[1]-=st;
+  else if(e.key==='[')yaw-=3; else if(e.key===']')yaw+=3; else return;
+  e.preventDefault();dirty=true;rebuildPath(); });
+const pip=document.getElementById('pip'); const head=pip.querySelector('header'); let drag=null;
+head.addEventListener('mousedown',e=>{ if(e.target.tagName==='BUTTON')return; drag={x:e.clientX-pip.offsetLeft,y:e.clientY-pip.offsetTop}; e.preventDefault(); });
+addEventListener('mousemove',e=>{ if(drag){pip.style.left=(e.clientX-drag.x)+'px';pip.style.top=(e.clientY-drag.y)+'px';pip.style.right='auto';} });
+addEventListener('mouseup',()=>drag=null);
+let pw=360; const setPw=w=>{pw=Math.max(140,Math.min(960,w));pip.style.width=pw+'px';};
+document.getElementById('psm').onclick=()=>setPw(pw-90);
+document.getElementById('pbg').onclick=()=>setPw(pw+90);
+document.getElementById('pmin').onclick=()=>pip.classList.toggle('min');
+const rvid=document.getElementById('rvid'),seek=document.getElementById('seek'),tlab=document.getElementById('t'),playb=document.getElementById('play');
+let dur=Math.max(META.duration||1,0.1); rvid.addEventListener('loadedmetadata',()=>{dur=rvid.duration||dur;});
+playb.onclick=()=>{ if(rvid.paused){rvid.play();playb.textContent='⏸ 일시정지';}else{rvid.pause();playb.textContent='▶ 재생';} };
+seek.oninput=()=>{rvid.currentTime=(seek.value/1000)*dur;};
+function sync(t){const fr=Math.max(0,Math.min(1,t/dur));seek.value=Math.round(fr*1000);tlab.textContent=t.toFixed(1)+'s';setFrame(Math.round(fr*(RAWP.length-1)));}
+addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+function loop(){requestAnimationFrame(loop);sync(rvid.currentTime||0);if(!followCam&&!placeMode)controls.update();renderer.render(scene,camera);}
 loop();
-window.__coplay={scene,camera,POSES,MESHES,box,setFrustum,setFollow:(v)=>{followCam=!!v;}};
+window.__coplay={scene,camera,box,RAWP,setFrame,setFollow:v=>{followCam=!!v;updCtl();}};
 </script></body></html>"""
 
 
