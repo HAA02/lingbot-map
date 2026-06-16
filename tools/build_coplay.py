@@ -56,7 +56,7 @@ TEMPLATE = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
   <div class="row" id="frameinfo">frame —</div>
 </div>
 <div id="vidpanel"><video id="vid" src="__VIDEO__" muted playsinline preload="none"></video><div class="cap">원본 촬영영상 (촬영자 시점)</div></div>
-<div id="bar"><button id="play">▶ 재생</button><input id="seek" type="range" min="0" max="1000" value="0"><span id="t">0.0s</span></div>
+<div id="bar"><button id="play">▶ 재생</button><button id="fcam">촬영자 시점</button><input id="seek" type="range" min="0" max="1000" value="0"><span id="t">0.0s</span></div>
 <script type="module">
 import * as THREE from 'three';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
@@ -85,14 +85,14 @@ for(const m of MESHES){
 }
 // reconstructed scan point cloud (the real ceiling the camera filmed) — demo-quality soft round points
 function discTex(){const cv=document.createElement('canvas');cv.width=cv.height=64;const x=cv.getContext('2d');
-  const grd=x.createRadialGradient(32,32,0,32,32,32);grd.addColorStop(0,'rgba(255,255,255,1)');grd.addColorStop(0.6,'rgba(255,255,255,0.92)');grd.addColorStop(1,'rgba(255,255,255,0)');
-  x.fillStyle=grd;x.fillRect(0,0,64,64);return new THREE.CanvasTexture(cv);}
+  x.fillStyle='#fff';x.beginPath();x.arc(32,32,31,0,Math.PI*2);x.fill();return new THREE.CanvasTexture(cv);}
 let scanPts=null;
 if(SCAN && SCAN.pos){
   const sp=b64f32(SCAN.pos), sc=b64u8(SCAN.col);
   const col=new Float32Array(sp.length); for(let i=0;i<sc.length;i++) col[i]=sc[i]/255;
   const g=new THREE.BufferGeometry(); g.setAttribute('position',new THREE.BufferAttribute(sp,3)); g.setAttribute('color',new THREE.BufferAttribute(col,3));
-  const pm=new THREE.PointsMaterial({size:0.03,map:discTex(),vertexColors:true,sizeAttenuation:true,transparent:true,opacity:0.98,depthWrite:true,alphaTest:0.35});
+  // crisp opaque round points (no alpha wash) → photoreal like the demo video
+  const pm=new THREE.PointsMaterial({size:__PSIZE__,map:discTex(),vertexColors:true,sizeAttenuation:true,transparent:false,depthWrite:true,alphaTest:0.5});
   scanPts=new THREE.Points(g,pm); scene.add(scanPts);
 }
 const c0=box.getCenter(new THREE.Vector3()), sz=box.getSize(new THREE.Vector3());
@@ -120,12 +120,22 @@ function highlight(i){
   }
   document.getElementById('frameinfo').textContent='frame '+i+' / '+(POSES.length-1)+' · 매핑 정점 '+hit;
 }
+let followCam=false; const fbtn=document.getElementById('fcam');
+function applyFollow(i){ const p=POSES[i]; if(!p)return;
+  const fwd=new THREE.Vector3(p.f[0],p.f[1],p.f[2]).normalize();
+  const up=new THREE.Vector3(p.u[0],p.u[1],p.u[2]).normalize();
+  // chase cam: behind + above the photographer, looking where they look
+  camera.position.set(p.c[0],p.c[1],p.c[2]).addScaledVector(fwd,-2.5).addScaledVector(up,0.8);
+  camera.up.copy(up); camera.lookAt(p.c[0]+fwd.x*2,p.c[1]+fwd.y*2,p.c[2]+fwd.z*2);
+}
+fbtn.onclick=()=>{ followCam=!followCam; fbtn.textContent=followCam?'자유 시점':'촬영자 시점'; controls.enabled=!followCam; if(followCam) applyFollow(lastHi<0?0:lastHi); };
 function setFrustum(i){
   i=Math.max(0,Math.min(POSES.length-1,i|0)); const p=POSES[i]; if(!p)return;
   frustum.position.set(p.c[0],p.c[1],p.c[2]);
   const tgt=new THREE.Vector3(p.c[0]+p.f[0],p.c[1]+p.f[1],p.c[2]+p.f[2]);
   frustum.up.set(p.u[0],p.u[1],p.u[2]); frustum.lookAt(tgt);
   if(i!==lastHi){ lastHi=i; highlight(i); }
+  if(followCam) applyFollow(i);
 }
 setFrustum(0);
 const d=Math.max(sz.x,sz.y,sz.z)*1.1;
@@ -152,6 +162,26 @@ def fetch_scan(base_url, upload, max_points=60000):
     pts = np.asarray(d.get("points") or [], dtype=np.float64)
     cols = np.asarray(d.get("colors") or [], dtype=np.uint8)
     return poses, pts, cols
+
+
+def load_demo_cloud(html_path, match):
+    """Load the dense, photoreal demo reconstruction (build_demo_map output) for
+    a dataset matching `match` (label or upload id) from a pointcloud map HTML.
+    Returns (poses, xyz_raw float64, rgb uint8) in the recon frame."""
+    import re
+    html = Path(html_path).read_text(encoding="utf-8")
+    m = (re.search(r'(\[\{"label".*?\}\])\s*[;\)]', html, re.S)
+         or re.search(r'(\[\{.*?"xyz".*?\}\])', html, re.S))
+    if not m:
+        raise ValueError(f"no datasets found in {html_path}")
+    ds = json.loads(m.group(1))
+    d = next((x for x in ds if match in f"{x.get('label','')}|{x.get('up','')}"), ds[-1])
+    xyz = np.frombuffer(base64.b64decode(d["xyz"]), dtype="<f4").reshape(-1, 3).astype(np.float64)
+    if d.get("rgb"):
+        rgb = np.frombuffer(base64.b64decode(d["rgb"]), dtype=np.uint8).reshape(-1, 3)
+    else:
+        rgb = np.full((len(xyz), 3), 180, np.uint8)
+    return (d.get("poses") or []), xyz, rgb
 
 
 def viewer_pose(p12):
@@ -235,6 +265,11 @@ def main():
     ap.add_argument("--scan-points", type=int, default=250000)
     ap.add_argument("--scale", type=float, default=1.0,
                     help="recon→model scale (≈1 = metric; Metric3D refines)")
+    ap.add_argument("--demo-html", default=None,
+                    help="pointcloud map HTML with the dense photoreal demo cloud "
+                         "(build_demo_map output) — far higher quality than realtime /scan")
+    ap.add_argument("--demo-match", default="161613", help="dataset label/upload to pick from --demo-html")
+    ap.add_argument("--point-size", type=float, default=0.025, help="webgl point size (m)")
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
@@ -253,7 +288,10 @@ def main():
     allp = np.concatenate(model_pts) if model_pts else np.zeros((1, 3), np.float32)
     bbox = (allp.min(0).tolist(), allp.max(0).tolist())
 
-    poses, scan_pts, scan_cols = fetch_scan(args.base_url, args.upload, args.scan_points)
+    if args.demo_html:
+        poses, scan_pts, scan_cols = load_demo_cloud(args.demo_html, args.demo_match)
+    else:
+        poses, scan_pts, scan_cols = fetch_scan(args.base_url, args.upload, args.scan_points)
     pose_json, scan_pos, info = place_gravity(poses, scan_pts, bbox, scale=args.scale)
     scan_json = None
     if len(scan_pos):
@@ -278,6 +316,7 @@ def main():
             .replace("__NPOSES__", str(len(pose_json)))
             .replace("__NSCAN__", f"{len(scan_pos):,}")
             .replace("__LEGEND__", " ".join(legend))
+            .replace("__PSIZE__", repr(float(args.point_size)))
             .replace("__VIDEO__", rel_video))
     out.write_text(html, encoding="utf-8")
     print(f"wrote {out} ({out.stat().st_size/1e6:.1f} MB) tris={tris:,} poses={len(pose_json)} "
