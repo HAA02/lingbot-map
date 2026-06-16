@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 
-from scan2bim.pipe_path import main_pipe_run, run_centerline
+from scan2bim.pipe_path import main_pipe_run, main_pipe_run_L, run_centerline, run_L_polyline
 
 FXX = next(f for f in glob.glob(os.path.join(os.path.dirname(__file__), "..", "models", "Gasan_7F", "*.dtdx"))
            if "FXX" in f)
@@ -33,6 +33,23 @@ class TestPipePath(unittest.TestCase):
     def test_endpoints_finite(self):
         run = main_pipe_run(FXX)
         self.assertTrue(np.isfinite(run).all())
+
+    def test_L_polyline_synthetic(self):
+        rng = np.random.RandomState(1)
+        # main run X=5, Z[0,30] + branch at corner Z=5 going -X to X=0
+        main = np.column_stack([5 + rng.normal(0, 0.08, 4000), rng.uniform(0, 30, 4000)])
+        branch = np.column_stack([rng.uniform(0, 5, 300), 8 + rng.normal(0, 0.08, 300)])
+        poly = run_L_polyline(np.vstack([main, branch]))
+        self.assertEqual(len(poly), 3)                       # start, corner, branch_end
+        # start far from corner (high Z end, since branch is at Z=5 near the low end)
+        self.assertGreater(abs(poly[0][1] - poly[1][1]), 10)
+        # branch_end departs in X from the corner
+        self.assertGreater(abs(poly[2][0] - poly[1][0]), 2)
+
+    def test_L_polyline_real_fxx(self):
+        poly = main_pipe_run_L(FXX)
+        self.assertIn(len(poly), (2, 3))
+        self.assertTrue(np.isfinite(poly).all())
 
 
 if __name__ == "__main__":

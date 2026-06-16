@@ -58,7 +58,7 @@ TEMPLATE = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
 <script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}</script>
 </head><body>
 <canvas id="c"></canvas>
-<div id="hud"><b>설계모델 ↔ 영상 co-play</b><br><span style="color:#9fb0c8">__MODELNAME__ · 삼각형 __TRIS__ · 포즈 __NPOSES__</span><br><span class="legend">__LEGEND__</span><br><span id="finfo" style="color:#9fb0c8">frame —</span></div>
+<div id="hud"><b>설계모델 ↔ 영상 co-play</b> <span id="pmode" style="font-weight:700;padding:2px 8px;border-radius:6px;background:__PMODECOL__;color:#0a0d13">__PMODE__</span><br><span style="color:#9fb0c8">__MODELNAME__ · 삼각형 __TRIS__ · 포즈 __NPOSES__</span><br><span class="legend">__LEGEND__</span><br><span id="finfo" style="color:#9fb0c8">frame —</span></div>
 <div id="pip"><header><span>정합 렌더 영상 (점군)</span><span class="sp"></span><button id="pmin" title="최소화">▭</button></header><video id="rvid" src="__RVIDEO__" muted playsinline preload="none"></video><div class="rsz n"></div><div class="rsz s"></div><div class="rsz e"></div><div class="rsz w"></div><div class="rsz ne"></div><div class="rsz nw"></div><div class="rsz se"></div><div class="rsz sw"></div></div>
 <div id="place">모델 클릭=첫 위치 · <b>화살표</b>이동 · <b>[</b>/<b>]</b>회전 · <b>,</b>/<b>.</b>스케일 · <b>m</b>좌우반전 · <b>PgUp/Dn</b>높이<br><span id="pp" style="color:#cdd6e6"></span></div>
 <div id="bar"><button id="play">▶ 재생</button><button id="placeBtn">위치 지정</button><button id="fcam">촬영자 추적</button><input id="seek" type="range" min="0" max="1000" value="0"><span class="t" id="t">0.0s</span></div>
@@ -515,11 +515,11 @@ def main():
         poses, scan_pts = fetch_scan(args.base_url, args.upload)
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
     if args.auto_pipe:
-        from scan2bim.pipe_path import main_pipe_run
+        from scan2bim.pipe_path import main_pipe_run_L
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
-        wps = main_pipe_run(fxx).tolist()
+        wps = main_pipe_run_L(fxx).tolist()   # [start, corner, branch] — turn at a real pipe junction
         pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps, snap=(args.gt_mode == "snap"))
-        print("  auto-pipe:", reginfo, "run:", [[round(v, 1) for v in w] for w in wps])
+        print("  auto-pipe(L):", reginfo, "polyline:", [[round(v, 1) for v in w] for w in wps])
     elif args.gt_path:
         wps = [[float(v) for v in seg.split(",")] for seg in args.gt_path.split()]
         pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps, snap=(args.gt_mode == "snap"))
@@ -530,6 +530,16 @@ def main():
     if args.auto_localize and args.frames_dir:
         pose_json, locinfo = place_autolocalize(pose_json, args.dtdx, args.frames_dir, hfov=args.hfov)
         print("  auto-localize:", locinfo)
+
+    # 좌상단 배지: 자동(초록) vs 수동(주황) 구별
+    if args.auto_localize and args.frames_dir:
+        pmode, pcol = "🤖 자동 · 객체 PnP", "#31d27c"
+    elif args.auto_pipe:
+        pmode, pcol = "🤖 자동 · 배관런 검출", "#31d27c"
+    elif args.gt_path:
+        pmode, pcol = "✋ 수동 · GT경로 입력", "#ffb347"
+    else:
+        pmode, pcol = "🤖 자동 · 천장정합", "#31d27c"
 
     legend = []
     for m in sorted(meshes_json, key=lambda x: -len(x["b64"]))[:5]:
@@ -545,6 +555,8 @@ def main():
             .replace("__TRIS__", f"{tris:,}")
             .replace("__NPOSES__", str(len(pose_json)))
             .replace("__LEGEND__", " ".join(legend))
+            .replace("__PMODE__", pmode)
+            .replace("__PMODECOL__", pcol)
             .replace("__RVIDEO__", rel_video))
     out.write_text(html, encoding="utf-8")
     print(f"wrote {out} ({out.stat().st_size/1e6:.1f} MB) tris={tris:,} poses={len(pose_json)} render={rel_video}")
