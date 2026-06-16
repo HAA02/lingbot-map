@@ -267,6 +267,10 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
     Rg = _rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
     P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0; Pg = P @ Rg.T
     Cg = centers @ Rg.T; Fg = fwd @ Rg.T; Ug = up @ Rg.T
+    # 모델은 X반전(미러)됨 — 스캔/궤적도 같은 chirality로 수평 반사해야 좌/우 회전과
+    # 복도가 일치. proper rotation만으론 거울차이를 못 메움(평행배관 천장은 대칭이라
+    # inlier는 높아도 궤적 회전이 뒤집힘 → "영상 좌회전=모델 우회전"+벽 통과).
+    Pg[:, 0] *= -1.0; Cg[:, 0] *= -1.0; Fg[:, 0] *= -1.0; Ug[:, 0] *= -1.0
     Sc = Pg[Pg[:, 1] >= np.percentile(Pg[:, 1], 55)]
     sc = Sc[np.linspace(0, len(Sc) - 1, min(2500, len(Sc))).astype(int)]; scan_c = sc.mean(0)
     tree = cKDTree(model_ceiling)
