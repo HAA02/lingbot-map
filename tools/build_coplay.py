@@ -116,7 +116,10 @@ function setFrame(i){ i=Math.max(0,Math.min(RAWP.length-1,i|0)); curFrame=i; con
 fbtn.onclick=()=>{followCam=!followCam;fbtn.classList.toggle('on',followCam);if(followCam)_finit=false;updCtl();};
 placeBtn.onclick=()=>{placeMode=!placeMode;placeBtn.classList.toggle('on',placeMode);placeHud.style.display=placeMode?'block':'none';updCtl();};
 updCtl(); rebuildPath(); setFrame(0);
-camera.position.set(c0.x+sz.x*0.7,c0.y+sz.y,c0.z+sz.z*0.7); controls.target.copy(c0); controls.update();
+// DTDWebThree 기본뷰와 동일 방향: +X+Y+Z 코너 45°H/30°V, up=+Y (반전 인상 제거)
+{const _md=Math.max(sz.x,sz.y,sz.z),_fv=camera.fov*Math.PI/180,_d=Math.abs(_md/Math.sin(_fv/2))*0.85;
+ camera.position.set(c0.x+_d*0.612,c0.y+_d*0.5,c0.z+_d*0.612); camera.up.set(0,1,0);}
+controls.target.copy(c0); controls.update();
 renderer.domElement.addEventListener('click',e=>{ if(!placeMode)return;
   const rc=renderer.domElement.getBoundingClientRect();mouse.x=((e.clientX-rc.left)/rc.width)*2-1;mouse.y=-((e.clientY-rc.top)/rc.height)*2+1;raycaster.setFromCamera(mouse,camera);
   const hits=raycaster.intersectObjects(MESH_OBJS.map(o=>o.mesh),false);
@@ -301,9 +304,10 @@ def main():
     for f in args.dtdx:
         g = decode_geometry(f); names.append(g["discipline_code"]); tris += g["triangle_count"]
         for m in g["meshes"]:
-            pos = np.asarray(m["positions"], dtype=np.float32)
+            pos = np.asarray(m["positions"], dtype=np.float32).copy()
             if not len(pos):
                 continue
+            pos[:, 0] *= -1.0   # Babylon(LH)→Three(RH): X 반전해야 원본 저작뷰어(정상)와 좌우 일치
             model_pts.append(pos)
             if len(pos) > RENDER_CAP:  # decimate by whole triangles
                 ntri = len(pos) // 3
@@ -312,8 +316,8 @@ def main():
             meshes_json.append({"color": [round(c, 4) for c in m["color"]],
                                 "b64": base64.b64encode(np.ascontiguousarray(pos).tobytes()).decode("ascii")})
     allp = np.concatenate(model_pts).astype(np.float64)
-    lo = np.percentile(allp, 1, axis=0); hi = np.percentile(allp, 99, axis=0)
-    allc = allp[((allp >= lo) & (allp <= hi)).all(1)]   # robust (clip outliers)
+    med = np.median(allp, axis=0)
+    allc = allp[(np.abs(allp - med) < 60).all(1)]       # drop only extreme outliers; keep full building (incl. SXX wing)
     bbox = (allc.min(0).tolist(), allc.max(0).tolist())
     ceil = allc[allc[:, 1] >= (bbox[1][1] - 1.5)]        # top 1.5 m = ceiling band
     ceil = ceil[np.linspace(0, len(ceil) - 1, min(60000, len(ceil))).astype(int)]
