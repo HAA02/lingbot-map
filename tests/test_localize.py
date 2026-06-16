@@ -9,7 +9,8 @@ import unittest
 import numpy as np
 
 from scan2bim.localize import (
-    camera_center, intrinsics, localize_frame, match_by_projection, project, solve_pnp,
+    camera_center, intrinsics, localize_frame, localize_trajectory, match_by_projection,
+    pose_from_lookat, project, solve_pnp,
 )
 
 
@@ -70,6 +71,17 @@ class TestLocalize(unittest.TestCase):
         dets = [{"label": "ceiling light", "cx": float(uv[0, 0]), "cy": float(uv[0, 1]), "score": 0.7}]
         self.assertEqual(len(match_by_projection(dets, anchors, self.K, self.R, self.t)), 0)
 
+    def test_pose_from_lookat_roundtrip(self):
+        center = np.array([2.0, 1.4, 5.0]); fwd = np.array([0.2, 0.9, 0.4]); up = np.array([0, 1, 0.0])
+        R, t = pose_from_lookat(center, fwd, up)
+        np.testing.assert_allclose(camera_center(R, t), center, atol=1e-9)
+        self.assertAlmostEqual(float(np.linalg.det(R)), 1.0, places=6)   # proper rotation
+        # a point along forward projects near the image center
+        K = intrinsics(1920, 1080, 69)
+        uv, z = project(K, R, t, [center + fwd / np.linalg.norm(fwd) * 5])
+        self.assertGreater(z[0], 0)
+        self.assertLess(np.linalg.norm(uv[0] - [960, 540]), 60)
+
     def test_localize_frame_refines_noisy_prior(self):
         uv, _ = project(self.K, self.R, self.t, self.P)
         anchors = [{"type": "ac", "center": p.tolist()} for p in self.P]
@@ -81,6 +93,63 @@ class TestLocalize(unittest.TestCase):
         self.assertIsNotNone(out)
         np.testing.assert_allclose(out["center"], self.C, atol=1e-2)
         self.assertLess(out["rmse"], 1.0)
+
+
+class TestLocalizeTrajectory(unittest.TestCase):
+    """Synthetic walk: camera moves along X looking up at a ceiling anchor grid.
+    Detections = projected anchors; priors = true poses + noise; some frames blanked
+    (too few dets) to exercise interpolation."""
+    def setUp(self):
+        self.K = intrinsics(1920, 1080, 69.0)
+        rng = np.random.RandomState(0)
+        # anchor cloud with DEPTH variation (non-coplanar) ahead/above the corridor
+        self.anchors = [{"type": "ac", "center": [float(rng.uniform(-2.5, 2.5)),
+                         float(rng.uniform(1.8, 3.6)), float(z)]}
+                        for z in rng.uniform(1, 22, 70)]
+        self.true = []   # walk +Z, looking forward-and-up
+        for tz in np.linspace(2.0, 14.0, 20):
+            R, t = pose_from_lookat([0.0, 1.5, tz], [0.0, 0.55, 0.84], [0.0, 0.84, -0.55])
+            self.true.append((R, t))
+
+    def _dets(self, blank_frames=()):
+        dets = []
+        for i, (R, t) in enumerate(self.true):
+            if i in blank_frames:
+                dets.append([]); continue
+            fr = []
+            for a in self.anchors:
+                uv, z = project(self.K, R, t, [a["center"]])
+                if z[0] > 0 and 0 <= uv[0, 0] <= 1920 and 0 <= uv[0, 1] <= 1080:
+                    fr.append({"label": "ceiling air conditioner", "cx": float(uv[0, 0]),
+                               "cy": float(uv[0, 1]), "score": 0.7})
+            dets.append(fr)
+        return dets
+
+    def _priors(self):
+        rng = np.random.RandomState(1); pri = []
+        for (R, t) in self.true:
+            dR = _rot("XYZ", rng.uniform(-3, 3, 3))          # ≤3° orientation noise
+            Rn = dR @ R
+            c = camera_center(R, t) + rng.uniform(-0.3, 0.3, 3)   # ≤0.3m position noise
+            pri.append((Rn, -Rn @ c))
+        return pri
+
+    def test_recovers_centers(self):
+        out, info = localize_trajectory(self.K, self._priors(), self._dets(), self.anchors,
+                                        max_px=200, smooth_win=1)
+        self.assertGreater(info["pnp_frac"], 0.6)   # most frames localized
+        err = [np.linalg.norm(out[i]["center"] - camera_center(*self.true[i]))
+               for i in range(len(self.true)) if out[i]["status"] == "pnp"]
+        self.assertLess(float(np.mean(err)), 0.15)   # outlier rejection keeps survivors accurate
+
+    def test_interpolates_blank_frames(self):
+        blanks = {5, 6, 7}
+        out, info = localize_trajectory(self.K, self._priors(), self._dets(blanks), self.anchors,
+                                        max_px=200, smooth_win=1)
+        for i in blanks:
+            self.assertEqual(out[i]["status"], "interp")
+            # interpolated center still near the true straight-line path
+            self.assertLess(np.linalg.norm(out[i]["center"] - camera_center(*self.true[i])), 0.4)
 
 
 if __name__ == "__main__":

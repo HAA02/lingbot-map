@@ -42,6 +42,18 @@ def camera_center(R, t) -> np.ndarray:
     return -np.asarray(R, float).T @ np.asarray(t, float)
 
 
+def pose_from_lookat(center, forward, up):
+    """(camera center, forward=look dir, up) in world → world-to-camera (R, t).
+    OpenCV: camera looks +Z_cam. Used to turn co-play trajectory poses {c,f,u}
+    into PnP priors. center = -Rᵀ t; det(R)=+1."""
+    c = np.asarray(center, float); f = np.asarray(forward, float); u = np.asarray(up, float)
+    z = f / (np.linalg.norm(f) + 1e-12)
+    x = np.cross(u, z); x /= (np.linalg.norm(x) + 1e-12)
+    y = np.cross(z, x)
+    R = np.array([x, y, z])           # rows = camera axes in world
+    return R, -R @ c
+
+
 def match_by_projection(dets, anchors, K, R, t, *, max_px=90.0, img_wh=None):
     """Pair detections to model anchors via a pose prior.
 
@@ -110,3 +122,51 @@ def localize_frame(K, dets, anchors, prior_R, prior_t, *, max_px=90.0, ransac_px
     rmse = float(np.sqrt(((uv - P2[inl]) ** 2).sum(1).mean()))
     return {"R": R, "t": t, "center": camera_center(R, t),
             "n_corr": len(corr), "n_inlier": int(len(inl)), "rmse": rmse}
+
+
+def localize_trajectory(K, prior_poses, dets_by_frame, anchors, *, min_inliers=5,
+                        max_px=120.0, ransac_px=14.0, max_rmse=25.0, smooth_win=5):
+    """Per-frame object-anchor PnP over a whole sequence → refined model-frame poses.
+
+    prior_poses: [(R,t), ...] world-to-camera priors (from the trajectory).
+    dets_by_frame: [[det,...], ...] aligned with prior_poses.
+    Frames with enough confident anchor matches get a PnP pose; the rest have their
+    camera CENTER linearly interpolated from the PnP frames (orientation kept from
+    prior). Centers are moving-average smoothed. Returns (per-frame dicts, summary).
+    """
+    n = len(prior_poses)
+    pnp = [None] * n
+    for i in range(n):
+        Rp, tp = prior_poses[i]
+        out = localize_frame(K, dets_by_frame[i], anchors, Rp, tp, max_px=max_px, ransac_px=ransac_px)
+        if out and out["n_inlier"] >= min_inliers and out["rmse"] <= max_rmse:
+            pnp[i] = out
+    loc = [i for i in range(n) if pnp[i] is not None]
+    # temporal-consistency outlier rejection: planar ceilings make some PnP poses
+    # jump (low pixel-rmse but wrong depth). Demote frames whose center deviates
+    # from the local median of PnP centers → they get interpolated instead.
+    if len(loc) >= 5:
+        pc = np.array([pnp[i]["center"] for i in loc])
+        med = np.array([np.median(pc[max(0, j - 2):j + 3], axis=0) for j in range(len(loc))])
+        for j, i in enumerate(loc):
+            if np.linalg.norm(pc[j] - med[j]) > 0.5:
+                pnp[i] = None
+        loc = [i for i in range(n) if pnp[i] is not None]
+    centers = np.array([camera_center(*prior_poses[i]) for i in range(n)], float)  # fallback = prior
+    if loc:
+        pc = np.array([pnp[i]["center"] for i in loc])
+        for k in range(3):
+            centers[:, k] = np.interp(np.arange(n), loc, pc[:, k])
+    if smooth_win > 1 and n >= smooth_win:
+        ker = np.ones(smooth_win) / smooth_win
+        pad = smooth_win // 2
+        for k in range(3):
+            ext = np.concatenate([np.repeat(centers[0, k], pad), centers[:, k], np.repeat(centers[-1, k], pad)])
+            centers[:, k] = np.convolve(ext, ker, "valid")[:n]
+    out_list = []
+    for i in range(n):
+        R = pnp[i]["R"] if pnp[i] else prior_poses[i][0]
+        out_list.append({"R": R, "t": -R @ centers[i], "center": centers[i],
+                         "status": "pnp" if pnp[i] else "interp",
+                         "n_inlier": pnp[i]["n_inlier"] if pnp[i] else 0})
+    return out_list, {"n_frames": n, "n_pnp": len(loc), "pnp_frac": round(len(loc) / max(n, 1), 3)}
