@@ -83,7 +83,7 @@ def trajectory_turn_fraction(xz, *, n_samp: int = 60, min_frac: float = 0.15):
 
 
 def run_L_polyline(xz, *, lane_width: float = 1.0, branch_min_span: float = 4.0,
-                   turn_fraction=None) -> np.ndarray:
+                   turn_fraction=None, turn_handedness=None) -> np.ndarray:
     """Main run + a perpendicular branch → L-polyline [start, corner, branch_end].
     start = run end FAR from the branch cluster (you turn near the walk's end).
     turn_fraction (from the recon trajectory): pick the branch whose corner sits at
@@ -116,12 +116,24 @@ def run_L_polyline(xz, *, lane_width: float = 1.0, branch_min_span: float = 4.0,
     else:
         c, span, side = max(cands, key=lambda k: k[1])
     corner = A + dirv * c
-    branch_end = corner + perp * (span if side > 0 else -span)
+    # branch side: by recon turn handedness if given (matches which way the camera
+    # turned), else the denser pipe side. L handedness = sgn·(+1 if start@A else -1).
+    if turn_handedness is not None:
+        # L 분기 측면: recon turn 손잡이(이미 X반전 반영) → perp 부호.
+        # start@B(역방향)일 때 +, start@A일 때 − (배치 chirality·yaw 관통 보정).
+        sgn = float(np.sign(turn_handedness)) * (-1.0 if start_at_A else 1.0)
+        band = (np.abs(s - c) < 1.0) & (np.abs(o) > lane_width) & (np.sign(o) == sgn)
+        if band.sum() >= 100:
+            span = float(np.percentile(np.abs(o[band]), 90))
+    else:
+        sgn = 1.0 if side > 0 else -1.0
+    branch_end = corner + perp * span * sgn
     start = A if start_at_A else B
     return np.array([start, corner, branch_end])
 
 
 def main_pipe_run_L(dtdx_path, *, flip_x: bool = True, lane_width: float = 1.0,
-                    turn_fraction=None) -> np.ndarray:
+                    turn_fraction=None, turn_handedness=None) -> np.ndarray:
     """L-polyline [start, corner, branch_end] for the dominant FXX run + its branch."""
-    return run_L_polyline(_fxx_xz(dtdx_path, flip_x), lane_width=lane_width, turn_fraction=turn_fraction)
+    return run_L_polyline(_fxx_xz(dtdx_path, flip_x), lane_width=lane_width,
+                          turn_fraction=turn_fraction, turn_handedness=turn_handedness)

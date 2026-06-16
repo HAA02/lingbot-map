@@ -431,7 +431,13 @@ def place_pipe_auto(poses, scan_pts, bbox, fxx_file):
     tf, tang = trajectory_turn_fraction(traj)
     total = float(np.linalg.norm(np.diff(traj, axis=0), axis=1).sum())
     L1, L2 = tf * total * s_m, (1 - tf) * total * s_m               # metric 세그먼트 길이
-    poly = main_pipe_run_L(fxx_file, turn_fraction=(tf if tang > 30 else None))
+    # recon turn 손잡이 (chirality X-flip 후, 모델 프레임 기준) → 분기 좌/우 선택
+    ti = int(np.clip(tf * len(traj), 15, len(traj) - 16))
+    d1 = traj[ti] - traj[ti - 15]; d2 = traj[ti + 15] - traj[ti]
+    d1f, d2f = np.array([-d1[0], d1[1]]), np.array([-d2[0], d2[1]])   # X반전
+    h_recon = float(np.sign(d1f[0] * d2f[1] - d1f[1] * d2f[0]))
+    poly = main_pipe_run_L(fxx_file, turn_fraction=(tf if tang > 30 else None),
+                           turn_handedness=(h_recon if tang > 30 else None))
     if len(poly) == 3:
         corner = poly[1]
         rd = poly[0] - corner; rd /= (np.linalg.norm(rd) + 1e-9)
