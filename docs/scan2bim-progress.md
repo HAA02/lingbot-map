@@ -29,6 +29,15 @@
 2. `build_coplay.py --demo-html <그HTML> --demo-match 161613 --point-size 0.02`
 3. WebGL: 솔리드 불투명 둥근 점 + `촬영자 시점` follow-cam
 
+## FR-2.3 stage-2 객체-앵커 PnP 자동 로컬라이제이션 (2026-06-16, AutoPM)
+`scan2bim/localize.py` (TDD 9) — intrinsics(FOV)·project·pose_from_lookat·match_by_projection
+(거리필터)·solve_pnp(RANSAC+LM)·localize_frame·localize_trajectory(시간일관성 outlier
+제거+보간+평활). **합성 GT에서 완벽**(중심오차 0.003m). `build_coplay --auto-localize
+--frames-dir`로 prior 궤적을 프레임별 PnP 정제(검출 캐시, graceful fallback=락실패시 prior유지).
+**실데이터 락 미달(experimental)** — 파이프라인 정상, 데이터 대응 난제: ①모델 AC앵커가 경로
+측면 5-7m라 천장뷰 화면밖 ②검출(조명 1493)↔모델앵커(31) granularity 불일치 ③prior 방향
+정확도. 다음: 앵커추출 밀도/정밀화, FOV 캘리브, prior-free 전역 reloc(또는 metric SLAM 교체).
+
 ## 남은 작업
 - **FR-1.3 메트릭 스케일(Metric3D)**: Python 3.14용 휠 부재로 보류. 대안 = 기준길이 1점 캘리브 또는 환경 분리. 현재는 scale≈1.0(거의 metric) 가정.
 - **FR-2.3 토폴로지/직경 시그니처**: `connector`(609) 디코드해 반복 인스턴스 확정 — 색만으로 안 되는 회색(공조) 보완.
