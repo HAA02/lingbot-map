@@ -339,6 +339,56 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
                        "cam_h": round(eye - float(bbox[0][1]), 2)}
 
 
+def _resample(pts, n):
+    pts = np.asarray(pts, float)
+    d = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
+    if d[-1] < 1e-9:
+        return np.repeat(pts[:1], n, axis=0)
+    u = np.linspace(0, d[-1], n)
+    return np.column_stack([np.interp(u, d, pts[:, k]) for k in range(pts.shape[1])])
+
+
+def _umeyama2d(src, dst):
+    ms, md = src.mean(0), dst.mean(0)
+    Xs, Xd = src - ms, dst - md
+    U, D, Vt = np.linalg.svd((Xd.T @ Xs) / len(src))
+    S = np.eye(2)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[-1, -1] = -1
+    R = U @ S @ Vt
+    s = float((D * np.diag(S)).sum() / ((Xs ** 2).sum() / len(src)))
+    return s, R, md - s * (R @ ms)   # dst ≈ s*(src@R.T)+t
+
+
+def place_gtpath(poses, scan_pts, bbox, waypoints):
+    """Fit the camera trajectory to a USER-GIVEN ground-truth path (model XZ
+    waypoints). Ceiling auto-registration is ambiguous on parallel pipe columns
+    (it picked the wrong corridor); the drawn path resolves it. Gravity-align +
+    chirality-flip the trajectory, then arc-length resample both and Umeyama-2D
+    fit (scale+rot+trans). Vertical = eye level. [[alignment-monocular-scale]]"""
+    centers, fwd, up = [], [], []
+    for p in poses:
+        c, f, u = viewer_pose(p); centers.append(c); up.append(u); fwd.append(f)
+    centers = np.array(centers); up = np.array(up); fwd = np.array(fwd)
+    g = up.mean(0); g /= (np.linalg.norm(g) + 1e-9)
+    Rg = _rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
+    Cg = centers @ Rg.T; Fg = fwd @ Rg.T; Ug = up @ Rg.T
+    Cg[:, 0] *= -1; Fg[:, 0] *= -1; Ug[:, 0] *= -1   # chirality (model is X-mirrored)
+    gt = np.asarray(waypoints, float)
+    s, R2, t2 = _umeyama2d(_resample(Cg[:, [0, 2]], 120), _resample(gt, 120))
+    XZ = s * (Cg[:, [0, 2]] @ R2.T) + t2
+    Fxz = Fg[:, [0, 2]] @ R2.T; Uxz = Ug[:, [0, 2]] @ R2.T
+    eye = float(bbox[0][1]) + 1.5
+    Y = eye + (Cg[:, 1] - np.median(Cg[:, 1])) * s
+    pose_json = [{"c": [round(float(XZ[i, 0]), 3), round(float(Y[i]), 3), round(float(XZ[i, 1]), 3)],
+                  "f": [round(float(Fxz[i, 0]), 4), round(float(Fg[i, 1]), 4), round(float(Fxz[i, 1]), 4)],
+                  "u": [round(float(Uxz[i, 0]), 4), round(float(Ug[i, 1]), 4), round(float(Uxz[i, 1]), 4)]}
+                 for i in range(len(XZ))]
+    plen = float(np.linalg.norm(np.diff(XZ, axis=0), axis=1).sum())
+    return pose_json, {"mode": "gt-path", "scale": round(s, 3), "path_m": round(plen, 2),
+                       "cam_h": round(eye - float(bbox[0][1]), 2)}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8767")
@@ -348,6 +398,7 @@ def main():
     ap.add_argument("--demo-html", default=None, help="pointcloud map HTML for poses (build_demo_map)")
     ap.add_argument("--demo-match", default="161613")
     ap.add_argument("--anchor", default=None, help="coarse 첫 위치 'x,z' (모델 좌표) → 그 근처 국소 정합")
+    ap.add_argument("--gt-path", default=None, help="실제 촬영경로 waypoints 'x1,z1 x2,z2 ...' (모델 XZ) → 궤적을 이에 직접 피팅")
     ap.add_argument("--duration", type=float, default=35.3)
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
@@ -381,8 +432,13 @@ def main():
     else:
         poses, scan_pts = fetch_scan(args.base_url, args.upload)
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
-    pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox, anchor=anchor)
-    print("  registration:", reginfo, "anchor:", anchor)
+    if args.gt_path:
+        wps = [[float(v) for v in seg.split(",")] for seg in args.gt_path.split()]
+        pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps)
+        print("  gt-path fit:", reginfo, "waypoints:", wps)
+    else:
+        pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox, anchor=anchor)
+        print("  registration:", reginfo, "anchor:", anchor)
 
     legend = []
     for m in sorted(meshes_json, key=lambda x: -len(x["b64"]))[:5]:
