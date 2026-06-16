@@ -35,10 +35,11 @@ TEMPLATE = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
 #c{position:fixed;inset:0;display:block}
 #hud{position:fixed;left:12px;top:12px;background:rgba(10,13,19,.8);border:1px solid #283042;border-radius:8px;padding:8px 11px;font-size:12px;z-index:5;max-width:360px}
 #hud b{color:#fff} #hud .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px} .hl{color:#31d27c}
-#pip{position:fixed;right:18px;top:18px;width:360px;height:235px;background:#11151f;border:1px solid #2c3344;border-radius:10px;overflow:hidden;z-index:20;box-shadow:0 8px 30px rgba(0,0,0,.6);display:flex;flex-direction:column;resize:both;min-width:160px;min-height:110px;max-width:92vw;max-height:88vh}
+#pip{position:fixed;right:18px;top:18px;width:360px;height:235px;background:#11151f;border:1px solid #2c3344;border-radius:10px;overflow:hidden;z-index:20;box-shadow:0 8px 30px rgba(0,0,0,.6);display:flex;flex-direction:column;min-width:160px;min-height:110px;max-width:92vw;max-height:88vh}
 #pip header{display:flex;align-items:center;gap:6px;padding:5px 8px;background:#161b26;cursor:move;font-size:12px;color:#cdd6e6;user-select:none}
 #pip header .sp{flex:1} #pip header button{background:#222b3a;color:#cdd6e6;border:1px solid #313c4f;border-radius:5px;padding:0 8px;cursor:pointer;font-size:13px;line-height:18px}
-#pip video{width:100%;flex:1;min-height:0;display:block;object-fit:contain;background:#000} #pip.min{height:auto!important;resize:none} #pip.min video{display:none}
+#pip video{width:100%;flex:1;min-height:0;display:block;object-fit:contain;background:#000} #pip.min{height:auto!important} #pip.min video{display:none}
+#prs{position:absolute;right:0;bottom:0;width:20px;height:20px;cursor:nwse-resize;z-index:30;background:linear-gradient(135deg,transparent 42%,#5a6a82 42%,#5a6a82 60%,transparent 60%)}
 #bar{position:fixed;left:12px;right:12px;bottom:12px;display:flex;gap:10px;align-items:center;background:rgba(14,18,25,.92);border:1px solid #283042;border-radius:10px;padding:8px 14px;z-index:10}
 #bar button{background:#1c2433;color:#e8eaf0;border:1px solid #2c3344;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px}
 #bar button.on{background:#31d27c;color:#06210f;border-color:#31d27c}
@@ -50,7 +51,7 @@ TEMPLATE = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
 </head><body>
 <canvas id="c"></canvas>
 <div id="hud"><b>설계모델 ↔ 영상 co-play</b><br><span style="color:#9fb0c8">__MODELNAME__ · 삼각형 __TRIS__ · 포즈 __NPOSES__</span><br><span class="legend">__LEGEND__</span><br><span id="finfo" style="color:#9fb0c8">frame —</span></div>
-<div id="pip"><header><span>정합 렌더 영상 (점군)</span><span class="sp"></span><button id="pmin" title="최소화">▭</button></header><video id="rvid" src="__RVIDEO__" muted playsinline preload="none"></video></div>
+<div id="pip"><header><span>정합 렌더 영상 (점군)</span><span class="sp"></span><button id="pmin" title="최소화">▭</button></header><video id="rvid" src="__RVIDEO__" muted playsinline preload="none"></video><div id="prs"></div></div>
 <div id="place">모델 클릭=첫 위치 · <b>화살표</b>이동 · <b>[</b>/<b>]</b>회전 · <b>,</b>/<b>.</b>스케일 · <b>m</b>좌우반전 · <b>PgUp/Dn</b>높이<br><span id="pp" style="color:#cdd6e6"></span></div>
 <div id="bar"><button id="play">▶ 재생</button><button id="placeBtn">위치 지정</button><button id="fcam">촬영자 추적</button><input id="seek" type="range" min="0" max="1000" value="0"><span class="t" id="t">0.0s</span></div>
 <script type="module">
@@ -97,12 +98,14 @@ function highlight(w){ viewCam.position.set(w.c[0],w.c[1],w.c[2]);viewCam.up.set
 let followCam=false; const fbtn=document.getElementById('fcam'), placeBtn=document.getElementById('placeBtn'), placeHud=document.getElementById('place');
 let placeMode=false;
 function updCtl(){ controls.enabled = placeMode || !followCam; }
+const _fe=new THREE.Vector3(),_fl=new THREE.Vector3(),_fu=new THREE.Vector3(0,1,0),_lt=new THREE.Vector3(); let _finit=false;
 function applyFollow(w){const f=new THREE.Vector3(w.f[0],w.f[1],w.f[2]).normalize(),u=new THREE.Vector3(w.u[0],w.u[1],w.u[2]).normalize();
-  camera.position.set(w.c[0],w.c[1],w.c[2]).addScaledVector(f,-2.2).addScaledVector(u,0.7);camera.up.copy(u);camera.lookAt(w.c[0]+f.x*2,w.c[1]+f.y*2,w.c[2]+f.z*2);}
+  _fe.set(w.c[0],w.c[1],w.c[2]).addScaledVector(f,-2.2).addScaledVector(u,0.7); _fl.set(w.c[0]+f.x*2,w.c[1]+f.y*2,w.c[2]+f.z*2); _fu.copy(u);
+  if(!_finit){camera.position.copy(_fe);_lt.copy(_fl);_finit=true;}}
 function setFrame(i){ i=Math.max(0,Math.min(RAWP.length-1,i|0)); curFrame=i; const w=wp(i);
   frustum.position.set(w.c[0],w.c[1],w.c[2]);frustum.up.set(w.u[0],w.u[1],w.u[2]);frustum.lookAt(w.c[0]+w.f[0],w.c[1]+w.f[1],w.c[2]+w.f[2]);
   if(i!==lastHi||dirty){lastHi=i;dirty=false;highlight(w);} if(followCam&&!placeMode)applyFollow(w); }
-fbtn.onclick=()=>{followCam=!followCam;fbtn.classList.toggle('on',followCam);updCtl();};
+fbtn.onclick=()=>{followCam=!followCam;fbtn.classList.toggle('on',followCam);if(followCam)_finit=false;updCtl();};
 placeBtn.onclick=()=>{placeMode=!placeMode;placeBtn.classList.toggle('on',placeMode);placeHud.style.display=placeMode?'block':'none';updCtl();};
 updCtl(); rebuildPath(); setFrame(0);
 camera.position.set(c0.x+sz.x*0.7,c0.y+sz.y,c0.z+sz.z*0.7); controls.target.copy(c0); controls.update();
@@ -118,8 +121,10 @@ addEventListener('keydown',e=>{ if(!placeMode)return; const st=0.2;
   e.preventDefault();dirty=true;rebuildPath(); });
 const pip=document.getElementById('pip'); const head=pip.querySelector('header'); let drag=null;
 head.addEventListener('mousedown',e=>{ if(e.target.tagName==='BUTTON')return; drag={x:e.clientX-pip.offsetLeft,y:e.clientY-pip.offsetTop}; e.preventDefault(); });
-addEventListener('mousemove',e=>{ if(drag){pip.style.left=(e.clientX-drag.x)+'px';pip.style.top=(e.clientY-drag.y)+'px';pip.style.right='auto';} });
-addEventListener('mouseup',()=>drag=null);
+const prs=document.getElementById('prs'); let rsz=null;
+prs.addEventListener('mousedown',e=>{ rsz={x:e.clientX,y:e.clientY,w:pip.offsetWidth,h:pip.offsetHeight}; e.preventDefault(); e.stopPropagation(); });
+addEventListener('mousemove',e=>{ if(drag){pip.style.left=(e.clientX-drag.x)+'px';pip.style.top=(e.clientY-drag.y)+'px';pip.style.right='auto';} else if(rsz){pip.style.width=Math.max(160,rsz.w+e.clientX-rsz.x)+'px';pip.style.height=Math.max(110,rsz.h+e.clientY-rsz.y)+'px';} });
+addEventListener('mouseup',()=>{drag=null;rsz=null;});
 document.getElementById('pmin').onclick=()=>pip.classList.toggle('min');
 const rvid=document.getElementById('rvid'),seek=document.getElementById('seek'),tlab=document.getElementById('t'),playb=document.getElementById('play');
 let dur=Math.max(META.duration||1,0.1); rvid.addEventListener('loadedmetadata',()=>{dur=rvid.duration||dur;});
@@ -127,7 +132,10 @@ playb.onclick=()=>{ if(rvid.paused){rvid.play();playb.textContent='⏸ 일시정
 seek.oninput=()=>{rvid.currentTime=(seek.value/1000)*dur;};
 function sync(t){const fr=Math.max(0,Math.min(1,t/dur));seek.value=Math.round(fr*1000);tlab.textContent=t.toFixed(1)+'s';setFrame(Math.round(fr*(RAWP.length-1)));}
 addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
-function loop(){requestAnimationFrame(loop);sync(rvid.currentTime||0);if(!followCam&&!placeMode)controls.update();renderer.render(scene,camera);}
+function loop(){requestAnimationFrame(loop);sync(rvid.currentTime||0);
+  if(followCam&&!placeMode){camera.position.lerp(_fe,0.12);_lt.lerp(_fl,0.12);camera.up.lerp(_fu,0.12);camera.lookAt(_lt);}
+  else if(!placeMode){controls.update();}
+  renderer.render(scene,camera);}
 loop();
 window.__coplay={scene,camera,box,RAWP,setFrame,setFollow:v=>{followCam=!!v;updCtl();}};
 </script></body></html>"""
