@@ -91,11 +91,17 @@ let offset=[cx0,cy0,cz0], yaw=0, pscale=1, flipX=1;
 function rotY(v,deg){const r=deg*Math.PI/180,c=Math.cos(r),s=Math.sin(r);return [c*v[0]+s*v[2],v[1],-s*v[0]+c*v[2]];}
 function wp(i){const q=CANON[i];const cc=[q.c[0]*flipX*pscale,q.c[1]*pscale,q.c[2]*pscale];const c=rotY(cc,yaw);return {c:[c[0]+offset[0],c[1]+offset[1],c[2]+offset[2]],f:rotY([q.f[0]*flipX,q.f[1],q.f[2]],yaw),u:rotY([q.u[0]*flipX,q.u[1],q.u[2]],yaw)};}
 const pathGeo=new THREE.BufferGeometry(); const pathPos=new Float32Array(RAWP.length*3);
-scene.add(new THREE.Line(pathGeo,new THREE.LineBasicMaterial({color:0xffb347})));
+// 경로: depth-test 끄고 항상 위에 그려 객체 뒤에 있어도 보이게 (오버라이드)
+const pathLine=new THREE.Line(pathGeo,new THREE.LineBasicMaterial({color:0xffc04a,depthTest:false,depthWrite:false,transparent:true}));pathLine.renderOrder=990;scene.add(pathLine);
+const pathDots=new THREE.Points(pathGeo,new THREE.PointsMaterial({color:0xffe08a,size:5,sizeAttenuation:false,depthTest:false,depthWrite:false,transparent:true}));pathDots.renderOrder=991;scene.add(pathDots);
 function rebuildPath(){ for(let i=0;i<RAWP.length;i++){const w=wp(i);pathPos[i*3]=w.c[0];pathPos[i*3+1]=w.c[1];pathPos[i*3+2]=w.c[2];} pathGeo.setAttribute('position',new THREE.BufferAttribute(pathPos,3)); pathGeo.attributes.position.needsUpdate=true; pathGeo.computeBoundingSphere(); const _pp=document.getElementById("pp"); if(_pp)_pp.textContent="위치("+offset[0].toFixed(1)+", "+offset[2].toFixed(1)+") yaw "+yaw.toFixed(0)+"° 스케일 "+pscale.toFixed(2)+(flipX<0?" ⇄반전":""); }
+// 카메라 마커: 방향 콘(초록) + 위치 구(빨강), depth-test 끄고 항상 위에 (객체 뒤에서도 보임)
 const frustum=new THREE.Group();
-const cone=new THREE.Mesh(new THREE.ConeGeometry(0.5,1.2,4),new THREE.MeshBasicMaterial({color:0x31d27c,wireframe:true}));cone.rotation.x=Math.PI/2;frustum.add(cone);
-frustum.add(new THREE.Mesh(new THREE.SphereGeometry(0.3,16,12),new THREE.MeshBasicMaterial({color:0x31d27c})));scene.add(frustum);
+const cone=new THREE.Mesh(new THREE.ConeGeometry(0.6,1.6,4),new THREE.MeshBasicMaterial({color:0x31d27c,depthTest:false,depthWrite:false,transparent:true}));cone.rotation.x=Math.PI/2;frustum.add(cone);
+frustum.add(new THREE.Mesh(new THREE.SphereGeometry(0.42,18,14),new THREE.MeshBasicMaterial({color:0xff4466,depthTest:false,depthWrite:false,transparent:true})));
+frustum.traverse(o=>{o.renderOrder=999;});scene.add(frustum);
+// 수직 빔(beacon): 현재 카메라 위치를 바닥~천장 관통하는 기둥으로 표시 → 3D에서 위치 즉시 파악
+const beacon=new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,-sz.y,0),new THREE.Vector3(0,sz.y,0)]),new THREE.LineBasicMaterial({color:0xff6688,depthTest:false,depthWrite:false,transparent:true,opacity:0.55}));beacon.renderOrder=995;scene.add(beacon);
 const viewCam=new THREE.PerspectiveCamera(70,1.5,0.1,Math.max(2,Math.min(sz.x,sz.z)*0.3));
 const _fr=new THREE.Frustum(),_m4=new THREE.Matrix4(),_v=new THREE.Vector3(); let lastHi=-1,dirty=true,curFrame=0;
 function highlight(w){ viewCam.position.set(w.c[0],w.c[1],w.c[2]);viewCam.up.set(w.u[0],w.u[1],w.u[2]);viewCam.lookAt(w.c[0]+w.f[0],w.c[1]+w.f[1],w.c[2]+w.f[2]);
@@ -112,6 +118,7 @@ function applyFollow(w){const f=new THREE.Vector3(w.f[0],w.f[1],w.f[2]).normaliz
   if(!_finit){camera.position.copy(_fe);_lt.copy(_fl);_finit=true;}}
 function setFrame(i){ i=Math.max(0,Math.min(RAWP.length-1,i|0)); curFrame=i; const w=wp(i);
   frustum.position.set(w.c[0],w.c[1],w.c[2]);frustum.up.set(w.u[0],w.u[1],w.u[2]);frustum.lookAt(w.c[0]+w.f[0],w.c[1]+w.f[1],w.c[2]+w.f[2]);
+  beacon.position.set(w.c[0],c0.y,w.c[2]);
   if(i!==lastHi||dirty){lastHi=i;dirty=false;highlight(w);} if(followCam&&!placeMode)applyFollow(w); }
 fbtn.onclick=()=>{followCam=!followCam;fbtn.classList.toggle('on',followCam);if(followCam)_finit=false;updCtl();};
 placeBtn.onclick=()=>{placeMode=!placeMode;placeBtn.classList.toggle('on',placeMode);placeHud.style.display=placeMode?'block':'none';updCtl();};
