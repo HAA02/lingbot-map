@@ -189,6 +189,49 @@ def place_gravity(poses, scan_pts, bbox, scale=1.0):
              "u": [round(float(x), 4) for x in U[i]]} for i in range(len(C))]
 
 
+def place_registered(poses, scan_pts, model_ceiling, bbox):
+    """Real registration: gravity-align scan, then register its CEILING band to
+    the model ceiling (grid XY + yaw + scale + Umeyama-ICP). Returns placed
+    poses + fit metrics. (Footage looks up → ceiling-to-ceiling locks well.)"""
+    from scipy.spatial import cKDTree
+    from scan2bim.registration import _icp
+    centers, fwd, up = [], [], []
+    for p in poses:
+        R, t = viewer_pose(p); centers.append(t); up.append(R[:, 1]); fwd.append(R[:, 2])
+    centers = np.array(centers); up = np.array(up); fwd = np.array(fwd)
+    g = up.mean(0); g /= (np.linalg.norm(g) + 1e-9)
+    Rg = _rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
+    P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0; Pg = P @ Rg.T
+    Cg = centers @ Rg.T; Fg = fwd @ Rg.T; Ug = up @ Rg.T
+    Sc = Pg[Pg[:, 1] >= np.percentile(Pg[:, 1], 55)]
+    sc = Sc[np.linspace(0, len(Sc) - 1, min(2500, len(Sc))).astype(int)]; scan_c = sc.mean(0)
+    tree = cKDTree(model_ceiling)
+    lo, hi = np.array(bbox[0]), np.array(bbox[1])
+    yc = float(np.percentile(model_ceiling[:, 1], 50))
+
+    def Ry(a):
+        r = np.deg2rad(a); return np.array([[np.cos(r), 0, np.sin(r)], [0, 1, 0], [-np.sin(r), 0, np.cos(r)]])
+
+    best = None
+    for s in (1.0, 1.15, 1.3, 1.45, 1.6):
+        for yaw in range(0, 360, 20):
+            R = Ry(yaw)
+            for cx in np.linspace(lo[0] + 2, hi[0] - 2, 7):
+                for cz in np.linspace(lo[2] + 2, hi[2] - 2, 9):
+                    t = np.array([cx, yc, cz]) - s * (R @ scan_c)
+                    d, _ = tree.query(s * (sc @ R.T) + t, workers=-1)
+                    inl = float((d < 0.25).mean())
+                    if best is None or inl > best[0]:
+                        best = (inl, s, yaw, R, t)
+    _inl, s0, yaw, R0, t0 = best
+    s2, R2, t2, rmse, inl2 = _icp(sc, model_ceiling, tree, float(s0), R0, t0, iters=30)
+    Ct = s2 * (Cg @ R2.T) + t2; Ft = Fg @ R2.T; Ut = Ug @ R2.T
+    pose_json = [{"c": [round(float(x), 3) for x in Ct[i]], "f": [round(float(x), 4) for x in Ft[i]],
+                  "u": [round(float(x), 4) for x in Ut[i]]} for i in range(len(Ct))]
+    return pose_json, {"inlier": round(float(inl2), 3), "rmse": round(float(rmse), 3),
+                       "scale": round(float(s2), 3), "yaw": int(yaw)}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8767")
@@ -203,23 +246,33 @@ def main():
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
 
     meshes_json, tris, names, model_pts = [], 0, [], []
+    RENDER_CAP = 90000  # per color group (triangle-soup) for the browser
     for f in args.dtdx:
-        g = decode_geometry(f); names.append(Path(f).name); tris += g["triangle_count"]
+        g = decode_geometry(f); names.append(g["discipline_code"]); tris += g["triangle_count"]
         for m in g["meshes"]:
             pos = np.asarray(m["positions"], dtype=np.float32)
             if not len(pos):
                 continue
             model_pts.append(pos)
+            if len(pos) > RENDER_CAP:  # decimate by whole triangles
+                ntri = len(pos) // 3
+                keep = np.linspace(0, ntri - 1, RENDER_CAP // 3).astype(int)
+                pos = pos.reshape(-1, 3, 3)[keep].reshape(-1, 3)
             meshes_json.append({"color": [round(c, 4) for c in m["color"]],
-                                "b64": base64.b64encode(pos.tobytes()).decode("ascii")})
-    allp = np.concatenate(model_pts) if model_pts else np.zeros((1, 3), np.float32)
-    bbox = (allp.min(0).tolist(), allp.max(0).tolist())
+                                "b64": base64.b64encode(np.ascontiguousarray(pos).tobytes()).decode("ascii")})
+    allp = np.concatenate(model_pts).astype(np.float64)
+    lo = np.percentile(allp, 1, axis=0); hi = np.percentile(allp, 99, axis=0)
+    allc = allp[((allp >= lo) & (allp <= hi)).all(1)]   # robust (clip outliers)
+    bbox = (allc.min(0).tolist(), allc.max(0).tolist())
+    ceil = allc[allc[:, 1] >= (bbox[1][1] - 1.5)]        # top 1.5 m = ceiling band
+    ceil = ceil[np.linspace(0, len(ceil) - 1, min(60000, len(ceil))).astype(int)]
 
     if args.demo_html:
         poses, scan_pts = load_demo_cloud(args.demo_html, args.demo_match)
     else:
         poses, scan_pts = fetch_scan(args.base_url, args.upload)
-    pose_json = place_gravity(poses, scan_pts, bbox)
+    pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox)
+    print("  registration:", reginfo)
 
     legend = []
     for m in sorted(meshes_json, key=lambda x: -len(x["b64"]))[:5]:
