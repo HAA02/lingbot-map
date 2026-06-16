@@ -518,11 +518,17 @@ def main():
         poses, scan_pts = fetch_scan(args.base_url, args.upload)
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
     if args.auto_pipe:
-        from scan2bim.pipe_path import main_pipe_run_L
+        from scan2bim.pipe_path import main_pipe_run_L, trajectory_turn_fraction
+        # 재구성 궤적의 turn-fraction → 올바른 분기(코너) 선택 (의존성0, B1)
+        vp = [viewer_pose(p) for p in poses]
+        cen = np.array([v[0] for v in vp]); up_v = np.array([v[2] for v in vp])
+        g = up_v.mean(0); g /= (np.linalg.norm(g) + 1e-9)
+        Cg = cen @ _rot_a_to_b(g, np.array([0.0, 1.0, 0.0])).T
+        tf, tang = trajectory_turn_fraction(Cg[:, [0, 2]])
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
-        wps = main_pipe_run_L(fxx).tolist()   # [start, corner, branch] — turn at a real pipe junction
+        wps = main_pipe_run_L(fxx, turn_fraction=(tf if tang > 30 else None)).tolist()
         pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps, snap=(args.gt_mode == "snap"))
-        print("  auto-pipe(L):", reginfo, "polyline:", [[round(v, 1) for v in w] for w in wps])
+        print(f"  auto-pipe(L): turn_frac={tf:.2f}({tang:.0f}°)", reginfo, "polyline:", [[round(v, 1) for v in w] for w in wps])
     elif args.gt_path:
         wps = [[float(v) for v in seg.split(",")] for seg in args.gt_path.split()]
         pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps, snap=(args.gt_mode == "snap"))
