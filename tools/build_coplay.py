@@ -209,21 +209,31 @@ def place_registered(poses, scan_pts, model_ceiling, bbox):
     lo, hi = np.array(bbox[0]), np.array(bbox[1])
     yc = float(np.percentile(model_ceiling[:, 1], 50))
 
+    # camera WALK direction (gravity-aligned, horizontal) vs model PIPE direction
+    # — pins yaw so the 3D path follows pipes (the video walks straight along them).
+    Ch = Cg[:, [0, 2]] - Cg[:, [0, 2]].mean(0)
+    traj2d = np.linalg.eigh(Ch.T @ Ch)[1][:, -1]
+    a_s = np.degrees(np.arctan2(traj2d[1], traj2d[0]))
+    Mh = model_ceiling[:, [0, 2]] - model_ceiling[:, [0, 2]].mean(0)
+    pipe2d = np.linalg.eigh(Mh.T @ Mh)[1][:, -1]
+    a_p = np.degrees(np.arctan2(pipe2d[1], pipe2d[0]))
+
     def Ry(a):
         r = np.deg2rad(a); return np.array([[np.cos(r), 0, np.sin(r)], [0, 1, 0], [-np.sin(r), 0, np.cos(r)]])
 
     best = None
     for s in (1.0, 1.15, 1.3, 1.45, 1.6):
-        for yaw in range(0, 360, 20):
+        for yaw in range(0, 360, 15):
             R = Ry(yaw)
+            align = abs(float(np.cos(np.deg2rad(a_s + yaw - a_p))))  # 1=traj∥pipes
             for cx in np.linspace(lo[0] + 2, hi[0] - 2, 7):
                 for cz in np.linspace(lo[2] + 2, hi[2] - 2, 9):
                     t = np.array([cx, yc, cz]) - s * (R @ scan_c)
                     d, _ = tree.query(s * (sc @ R.T) + t, workers=-1)
-                    inl = float((d < 0.25).mean())
-                    if best is None or inl > best[0]:
-                        best = (inl, s, yaw, R, t)
-    _inl, s0, yaw, R0, t0 = best
+                    score = float((d < 0.25).mean()) + 0.25 * align
+                    if best is None or score > best[0]:
+                        best = (score, s, yaw, R, t)
+    _sc, s0, yaw, R0, t0 = best
     s2, R2, t2, rmse, inl2 = _icp(sc, model_ceiling, tree, float(s0), R0, t0, iters=30)
     Ct = s2 * (Cg @ R2.T) + t2; Ft = Fg @ R2.T; Ut = Ug @ R2.T
     pose_json = [{"c": [round(float(x), 3) for x in Ct[i]], "f": [round(float(x), 4) for x in Ft[i]],
