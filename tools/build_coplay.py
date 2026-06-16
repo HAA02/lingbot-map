@@ -39,7 +39,15 @@ TEMPLATE = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
 #pip header{display:flex;align-items:center;gap:6px;padding:5px 8px;background:#161b26;cursor:move;font-size:12px;color:#cdd6e6;user-select:none}
 #pip header .sp{flex:1} #pip header button{background:#222b3a;color:#cdd6e6;border:1px solid #313c4f;border-radius:5px;padding:0 8px;cursor:pointer;font-size:13px;line-height:18px}
 #pip video{width:100%;flex:1;min-height:0;display:block;object-fit:contain;background:#000} #pip.min{height:auto!important} #pip.min video{display:none}
-#prs{position:absolute;right:0;bottom:0;width:20px;height:20px;cursor:nwse-resize;z-index:30;background:linear-gradient(135deg,transparent 42%,#5a6a82 42%,#5a6a82 60%,transparent 60%)}
+#pip .rsz{position:absolute;z-index:31}
+#pip .rsz.n{top:-3px;left:10px;right:10px;height:8px;cursor:ns-resize}
+#pip .rsz.s{bottom:-3px;left:10px;right:10px;height:8px;cursor:ns-resize}
+#pip .rsz.e{right:-3px;top:10px;bottom:10px;width:8px;cursor:ew-resize}
+#pip .rsz.w{left:-3px;top:10px;bottom:10px;width:8px;cursor:ew-resize}
+#pip .rsz.ne{top:-3px;right:-3px;width:14px;height:14px;cursor:nesw-resize}
+#pip .rsz.nw{top:-3px;left:-3px;width:14px;height:14px;cursor:nwse-resize}
+#pip .rsz.se{bottom:-3px;right:-3px;width:14px;height:14px;cursor:nwse-resize}
+#pip .rsz.sw{bottom:-3px;left:-3px;width:14px;height:14px;cursor:nesw-resize}
 #bar{position:fixed;left:12px;right:12px;bottom:12px;display:flex;gap:10px;align-items:center;background:rgba(14,18,25,.92);border:1px solid #283042;border-radius:10px;padding:8px 14px;z-index:10}
 #bar button{background:#1c2433;color:#e8eaf0;border:1px solid #2c3344;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px}
 #bar button.on{background:#31d27c;color:#06210f;border-color:#31d27c}
@@ -51,7 +59,7 @@ TEMPLATE = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
 </head><body>
 <canvas id="c"></canvas>
 <div id="hud"><b>설계모델 ↔ 영상 co-play</b><br><span style="color:#9fb0c8">__MODELNAME__ · 삼각형 __TRIS__ · 포즈 __NPOSES__</span><br><span class="legend">__LEGEND__</span><br><span id="finfo" style="color:#9fb0c8">frame —</span></div>
-<div id="pip"><header><span>정합 렌더 영상 (점군)</span><span class="sp"></span><button id="pmin" title="최소화">▭</button></header><video id="rvid" src="__RVIDEO__" muted playsinline preload="none"></video><div id="prs"></div></div>
+<div id="pip"><header><span>정합 렌더 영상 (점군)</span><span class="sp"></span><button id="pmin" title="최소화">▭</button></header><video id="rvid" src="__RVIDEO__" muted playsinline preload="none"></video><div class="rsz n"></div><div class="rsz s"></div><div class="rsz e"></div><div class="rsz w"></div><div class="rsz ne"></div><div class="rsz nw"></div><div class="rsz se"></div><div class="rsz sw"></div></div>
 <div id="place">모델 클릭=첫 위치 · <b>화살표</b>이동 · <b>[</b>/<b>]</b>회전 · <b>,</b>/<b>.</b>스케일 · <b>m</b>좌우반전 · <b>PgUp/Dn</b>높이<br><span id="pp" style="color:#cdd6e6"></span></div>
 <div id="bar"><button id="play">▶ 재생</button><button id="placeBtn">위치 지정</button><button id="fcam">촬영자 추적</button><input id="seek" type="range" min="0" max="1000" value="0"><span class="t" id="t">0.0s</span></div>
 <script type="module">
@@ -121,9 +129,14 @@ addEventListener('keydown',e=>{ if(!placeMode)return; const st=0.2;
   e.preventDefault();dirty=true;rebuildPath(); });
 const pip=document.getElementById('pip'); const head=pip.querySelector('header'); let drag=null;
 head.addEventListener('mousedown',e=>{ if(e.target.tagName==='BUTTON')return; drag={x:e.clientX-pip.offsetLeft,y:e.clientY-pip.offsetTop}; e.preventDefault(); });
-const prs=document.getElementById('prs'); let rsz=null;
-prs.addEventListener('mousedown',e=>{ rsz={x:e.clientX,y:e.clientY,w:pip.offsetWidth,h:pip.offsetHeight}; e.preventDefault(); e.stopPropagation(); });
-addEventListener('mousemove',e=>{ if(drag){pip.style.left=(e.clientX-drag.x)+'px';pip.style.top=(e.clientY-drag.y)+'px';pip.style.right='auto';} else if(rsz){pip.style.width=Math.max(160,rsz.w+e.clientX-rsz.x)+'px';pip.style.height=Math.max(110,rsz.h+e.clientY-rsz.y)+'px';} });
+let rsz=null;
+document.querySelectorAll('#pip .rsz').forEach(h=>h.addEventListener('mousedown',e=>{ rsz={dir:h.classList[1],x:e.clientX,y:e.clientY,w:pip.offsetWidth,h:pip.offsetHeight,l:pip.offsetLeft,t:pip.offsetTop}; e.preventDefault(); e.stopPropagation(); }));
+addEventListener('mousemove',e=>{ if(drag){pip.style.left=(e.clientX-drag.x)+'px';pip.style.top=(e.clientY-drag.y)+'px';pip.style.right='auto';}
+  else if(rsz){const dx=e.clientX-rsz.x,dy=e.clientY-rsz.y,d=rsz.dir; let w=rsz.w,h=rsz.h,l=rsz.l,t=rsz.t;
+   if(d.indexOf('e')>=0)w=rsz.w+dx; if(d.indexOf('w')>=0)w=rsz.w-dx; if(d.indexOf('s')>=0)h=rsz.h+dy; if(d.indexOf('n')>=0)h=rsz.h-dy;
+   w=Math.max(160,Math.min(innerWidth*0.92,w)); h=Math.max(110,Math.min(innerHeight*0.88,h));
+   if(d.indexOf('w')>=0)l=rsz.l+(rsz.w-w); if(d.indexOf('n')>=0)t=rsz.t+(rsz.h-h);
+   pip.style.width=w+'px';pip.style.height=h+'px';pip.style.left=l+'px';pip.style.top=t+'px';pip.style.right='auto';} });
 addEventListener('mouseup',()=>{drag=null;rsz=null;});
 document.getElementById('pmin').onclick=()=>pip.classList.toggle('min');
 const rvid=document.getElementById('rvid'),seek=document.getElementById('seek'),tlab=document.getElementById('t'),playb=document.getElementById('play');
