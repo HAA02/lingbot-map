@@ -27,3 +27,9 @@ video/_demo_ref/
 out_demo_render/
 out_kakao/
 out_kakao_fmt/
+
+# AutoPM session/gate + large data & generated reports (not source)
+.autopm-session.json
+.autopm-gate-state
+models/Gasan_7F/
+reports/
