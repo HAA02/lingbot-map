@@ -83,12 +83,17 @@ for(const m of MESHES){
   const mesh=new THREE.Mesh(g,mat); scene.add(mesh); box.expandByObject(mesh);
   MESH_OBJS.push({mesh,pos,base,col,n});
 }
-// reconstructed scan point cloud (the real ceiling the camera filmed)
+// reconstructed scan point cloud (the real ceiling the camera filmed) — demo-quality soft round points
+function discTex(){const cv=document.createElement('canvas');cv.width=cv.height=64;const x=cv.getContext('2d');
+  const grd=x.createRadialGradient(32,32,0,32,32,32);grd.addColorStop(0,'rgba(255,255,255,1)');grd.addColorStop(0.6,'rgba(255,255,255,0.92)');grd.addColorStop(1,'rgba(255,255,255,0)');
+  x.fillStyle=grd;x.fillRect(0,0,64,64);return new THREE.CanvasTexture(cv);}
+let scanPts=null;
 if(SCAN && SCAN.pos){
   const sp=b64f32(SCAN.pos), sc=b64u8(SCAN.col);
   const col=new Float32Array(sp.length); for(let i=0;i<sc.length;i++) col[i]=sc[i]/255;
   const g=new THREE.BufferGeometry(); g.setAttribute('position',new THREE.BufferAttribute(sp,3)); g.setAttribute('color',new THREE.BufferAttribute(col,3));
-  scene.add(new THREE.Points(g,new THREE.PointsMaterial({size:0.04,vertexColors:true,sizeAttenuation:true,transparent:true,opacity:0.85,depthWrite:false})));
+  const pm=new THREE.PointsMaterial({size:0.03,map:discTex(),vertexColors:true,sizeAttenuation:true,transparent:true,opacity:0.98,depthWrite:true,alphaTest:0.35});
+  scanPts=new THREE.Points(g,pm); scene.add(scanPts);
 }
 const c0=box.getCenter(new THREE.Vector3()), sz=box.getSize(new THREE.Vector3());
 const pts=POSES.map(p=>new THREE.Vector3(p.c[0],p.c[1],p.c[2]));
@@ -167,7 +172,7 @@ def _rot_a_to_b(a, b):
     return np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
 
 
-def place_gravity(poses, scan_pts, bbox, clearance=2.5):
+def place_gravity(poses, scan_pts, bbox, clearance=2.5, scale=1.0):
     """Gravity-align scan+path to the model up-axis and seat the camera below
     the pipe layer. Returns (pose_json, scan_pos_f32, info)."""
     centers, fwd, up = [], [], []
@@ -195,8 +200,7 @@ def place_gravity(poses, scan_pts, bbox, clearance=2.5):
 
     horiz = [i for i in range(3) if i != upax]
     base_pts = P if P.size else C
-    rec_h = float(np.linalg.norm(base_pts[:, horiz].max(0) - base_pts[:, horiz].min(0))) or 1.0
-    s = 0.5 * float(min(span[horiz[0]], span[horiz[1]])) / rec_h
+    s = float(scale)  # recon is ~metric (auto-place found scale≈1.0); Metric3D refines.
     if P.size:
         P *= s
     C *= s
@@ -228,7 +232,9 @@ def main():
     ap.add_argument("--dtdx", nargs="+", required=True)
     ap.add_argument("--video", required=True)
     ap.add_argument("--duration", type=float, default=35.3)
-    ap.add_argument("--scan-points", type=int, default=60000)
+    ap.add_argument("--scan-points", type=int, default=250000)
+    ap.add_argument("--scale", type=float, default=1.0,
+                    help="recon→model scale (≈1 = metric; Metric3D refines)")
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
@@ -248,7 +254,7 @@ def main():
     bbox = (allp.min(0).tolist(), allp.max(0).tolist())
 
     poses, scan_pts, scan_cols = fetch_scan(args.base_url, args.upload, args.scan_points)
-    pose_json, scan_pos, info = place_gravity(poses, scan_pts, bbox)
+    pose_json, scan_pos, info = place_gravity(poses, scan_pts, bbox, scale=args.scale)
     scan_json = None
     if len(scan_pos):
         if len(scan_cols) != len(scan_pos):
