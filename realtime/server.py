@@ -131,6 +131,12 @@ class FrameConsumer:
 app = FastAPI()
 if MODELS_DIR.exists():
     app.mount("/models", StaticFiles(directory=str(MODELS_DIR)), name="models")
+_OUT_KAKAO_FMT = ROOT.parent / "out_kakao_fmt"
+if _OUT_KAKAO_FMT.exists():
+    app.mount("/out_kakao_fmt", StaticFiles(directory=str(_OUT_KAKAO_FMT)), name="out_kakao_fmt")
+
+# per-upload coplay: dtdx files used when auto-generating coplay HTML
+_COPLAY_DTDX = sorted((ROOT.parent / "models/Gasan_7F").glob("G7F_FAB_*_7F-0_Central_1.dtdx")) if (ROOT.parent / "models/Gasan_7F").exists() else []
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -180,8 +186,62 @@ async def coverage_report_html_page():
     return FileResponse(ROOT / "coverage_report.html", headers={"Cache-Control": "no-store"})
 
 
+def _serve_per_upload_coplay(upload: str) -> HTMLResponse:
+    """Serve a built per-upload coplay.html, rewriting the PiP <video> src to the
+    upload's video API so poses and footage come from the SAME upload."""
+    import re as _re
+    content = (UPLOAD_DIR / f"{upload}.coplay.html").read_text(encoding="utf-8")
+    content = _re.sub(
+        r'(<video\b[^>]*\s+src=")[^"]*(")',
+        f'\\1/api/uploads/{upload}/video\\2',
+        content,
+    )
+    return HTMLResponse(content, headers={"Cache-Control": "no-store"})
+
+
+def _latest_coplay_upload() -> str | None:
+    """Most recent upload_id that has a built coplay.html."""
+    best, best_ts = None, -1
+    for p in UPLOAD_DIR.glob("*.coplay.html"):
+        uid = p.name.removesuffix(".coplay.html")
+        ts = _upload_ts_ms(uid)
+        if ts > best_ts:
+            best, best_ts = uid, ts
+    return best
+
+
+@app.get("/coplay", response_class=HTMLResponse)
+async def coplay_page(upload: str | None = None):
+    if upload:
+        if (UPLOAD_DIR / f"{upload}.coplay.html").exists():
+            return _serve_per_upload_coplay(upload)
+        # coplay not built yet for this upload
+        return HTMLResponse(
+            f'<html><body style="background:#111;color:#eee;font:15px sans-serif;padding:20px">'
+            f'<p>upload <b>{upload}</b> coplay 아직 준비 중입니다.</p>'
+            f'<p>잠시 후 새로고침하거나 <a href="/coplay" style="color:#88bbff">기본 coplay</a>를 확인하세요.</p>'
+            f'</body></html>',
+            status_code=202,
+        )
+    # no upload param → serve the latest built per-upload coplay (poses+video consistent)
+    latest = _latest_coplay_upload()
+    if latest:
+        return _serve_per_upload_coplay(latest)
+    fallback = ROOT / "coplay.html"
+    if not fallback.exists():
+        return HTMLResponse("<html><body>coplay.html not found</body></html>", status_code=404)
+    return FileResponse(fallback, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/coplay.html", response_class=HTMLResponse)
+async def coplay_html_page(upload: str | None = None):
+    return await coplay_page(upload)
+
+
 UPLOAD_DIR = ROOT / "_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+_jobs: dict = {}  # upload_id → {status, ...result}
 BIM_DIR = ROOT / "_bim"
 BIM_DIR.mkdir(exist_ok=True)
 AUDIT_RESULTS = ROOT / "audit_results.json"
@@ -905,27 +965,118 @@ async def upload_video(file: UploadFile = File(...), target_frames: int = 48):
             f.write(chunk)
             size += len(chunk)
     log.info("received upload %s (%.1f MB)", dest.name, size / 1e6)
-    t0 = time.time()
-    _payload, _thumbs, info = await STATE.worker.process_video_file(dest, target_frames=target_frames)
-    dt = time.time() - t0
-    # persist payload + thumbnails alongside the video so it can be replayed later
-    upload_id = dest.stem  # e.g. "upload_1716329123456"
-    if _payload is not None:
-        (UPLOAD_DIR / f"{upload_id}.lbp2").write_bytes(_payload)
-        if _thumbs:
-            (UPLOAD_DIR / f"{upload_id}.thumbs.json").write_text(
-                json.dumps([base64.b64encode(t).decode("ascii") for t in _thumbs])
-            )
-    return JSONResponse({
-        "ok": _payload is not None,
-        "id": upload_id,
-        "file": dest.name,
-        "coverage_url": f"/coverage.html?model={next(iter(_model_registry()), 'pxx')}&upload={upload_id}",
-        "report_url": f"/coverage-report.html?model={next(iter(_model_registry()), 'pxx')}&upload={upload_id}",
-        "bytes": size,
-        "elapsed_s": round(dt, 2),
-        **info,
-    })
+    upload_id = dest.stem
+    _jobs[upload_id] = {"status": "processing", "queued_at": time.time()}
+    asyncio.get_event_loop().create_task(_process_upload_job(upload_id, dest, target_frames))
+    return JSONResponse({"ok": True, "queued": True, "id": upload_id, "file": dest.name, "bytes": size})
+
+
+async def _process_upload_job(upload_id: str, dest: Path, target_frames: int) -> None:
+    try:
+        t0 = time.time()
+        _payload, _thumbs, info = await STATE.worker.process_video_file(dest, target_frames=target_frames)
+        dt = time.time() - t0
+        if _payload is not None:
+            (UPLOAD_DIR / f"{upload_id}.lbp2").write_bytes(_payload)
+            if _thumbs:
+                (UPLOAD_DIR / f"{upload_id}.thumbs.json").write_text(
+                    json.dumps([base64.b64encode(t).decode("ascii") for t in _thumbs])
+                )
+        model_id = next(iter(_model_registry()), "pxx")
+        _jobs[upload_id] = {
+            "status": "done" if _payload is not None else "error",
+            "ok": _payload is not None,
+            "id": upload_id,
+            "file": dest.name,
+            "coverage_url": f"/coverage.html?model={model_id}&upload={upload_id}",
+            "report_url": f"/coverage-report.html?model={model_id}&upload={upload_id}",
+            "coplay_url": f"/coplay?upload={upload_id}",
+            "elapsed_s": round(dt, 2),
+            **info,
+        }
+        log.info("job %s done in %.1fs ok=%s", upload_id, dt, _payload is not None)
+        if _payload is not None:
+            asyncio.get_event_loop().create_task(_build_coplay_for_upload(upload_id, dest))
+    except Exception as e:
+        log.exception("job %s failed", upload_id)
+        _jobs[upload_id] = {"status": "error", "error": str(e)}
+
+
+async def _render_demo_video(upload_id: str, raw_video: Path) -> Path | None:
+    """Render the team-standard point-cloud demo video (H.264) for a raw upload.
+
+    Phone uploads are often HEVC/4K which browsers cannot decode; the demo render
+    re-projects the reconstruction into an H.264 follow+birdeye composite that the
+    coplay PiP can play. Runs in the isolated .venv-lbdemo (micromamba) env.
+    """
+    script = ROOT.parent / "tools/render_demo_format.sh"
+    prefix = ROOT.parent / ".venv-lbdemo"
+    if not script.exists() or not prefix.exists():
+        log.info("demo render skip %s: tool/env missing", upload_id)
+        return None
+    out_dir = UPLOAD_DIR / "_demo" / upload_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = ["bash", str(script), str(raw_video), str(out_dir), "8"]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=str(ROOT.parent),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        demo = _demo_video_path(upload_id)
+        if proc.returncode == 0 and demo is not None:
+            log.info("demo video rendered for %s → %s", upload_id, demo.name)
+            return demo
+        log.warning("demo render failed for %s: %s", upload_id, stdout.decode(errors="replace")[-400:])
+    except Exception as e:
+        log.warning("demo render error for %s: %s", upload_id, e)
+    return None
+
+
+async def _build_coplay_for_upload(upload_id: str, video_path: Path) -> None:
+    """Build a per-upload coplay.html after GPU processing.
+
+    Step 1: render the point-cloud demo video (PiP source must be the H.264 demo,
+            not the raw HEVC upload). Step 2: build coplay.html with it.
+    """
+    if not _COPLAY_DTDX:
+        log.info("coplay skip %s: no dtdx files configured", upload_id)
+        return
+    demo = await _render_demo_video(upload_id, video_path)
+    render_video = demo or video_path  # fall back to raw if demo render unavailable
+    out = UPLOAD_DIR / f"{upload_id}.coplay.html"
+    cmd = [
+        str(ROOT.parent / ".venv/bin/python"),
+        str(ROOT.parent / "tools/build_coplay.py"),
+        "--upload", upload_id,
+        "--dtdx", *[str(d) for d in _COPLAY_DTDX],
+        "--render-video", str(render_video),
+        "--auto-pipe",
+        "--out", str(out),
+        "--base-url", "http://127.0.0.1:8767",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(ROOT.parent),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            log.info("coplay built for %s → %s (video=%s)", upload_id, out.name, render_video.name)
+        else:
+            log.warning("coplay build failed for %s: %s", upload_id, stdout.decode(errors="replace")[-400:])
+    except Exception as e:
+        log.warning("coplay build error for %s: %s", upload_id, e)
+
+
+@app.get("/api/jobs/{upload_id}/status")
+async def job_status(upload_id: str):
+    job = _jobs.get(upload_id)
+    if job is None:
+        return JSONResponse({"status": "unknown"}, status_code=404)
+    return JSONResponse(job)
 
 
 @app.post("/api/bim/upload")
@@ -1064,8 +1215,9 @@ async def list_uploads():
             "payloads": payloads,
             "payload_bytes": max((v["bytes"] for v in payloads.values()), default=0),
             "ts_ms": ts_ms,
-            "coverage_url": f"/coverage.html?model=pxx&upload={upload_id}",
-            "report_url": f"/coverage-report.html?model=pxx&upload={upload_id}",
+            "coverage_url": f"/coverage.html?model={_default_model_id()}&upload={upload_id}",
+            "report_url": f"/coverage-report.html?model={_default_model_id()}&upload={upload_id}",
+            "coplay_url": f"/coplay?upload={upload_id}",
         })
     return {"uploads": items}
 
@@ -1107,6 +1259,12 @@ def _upload_video_path(upload_id: str) -> Path | None:
         if p.exists():
             return p
     return None
+
+
+def _demo_video_path(upload_id: str) -> Path | None:
+    """Browser-playable point-cloud demo render (H.264) for an upload, if built."""
+    p = UPLOAD_DIR / "_demo" / upload_id / f"{upload_id}_demo_format.mp4"
+    return p if p.exists() else None
 
 
 def _upload_ts_ms(upload_id: str) -> int:
@@ -1273,6 +1431,22 @@ async def model_objects(model_id: str, limit: int = 5000):
     except Exception as e:
         log.exception("model objects failed: %s", e)
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/uploads/{upload_id}/video")
+async def upload_video_file(upload_id: str, raw: bool = False):
+    """Serve the point-cloud demo render (H.264, browser-playable) for coplay PiP.
+
+    Falls back to the raw upload when the demo render is not ready or raw=true is
+    requested. The raw phone video may be HEVC/4K and not decode in browsers.
+    """
+    p = None if raw else _demo_video_path(upload_id)
+    if p is None:
+        p = _upload_video_path(upload_id)
+    if p is None:
+        return JSONResponse({"error": "video not found"}, status_code=404)
+    media = "video/mp4" if p.suffix.lower() == ".mp4" else "application/octet-stream"
+    return FileResponse(p, media_type=media, filename=p.name, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/uploads/{upload_id}/scan")

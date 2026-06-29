@@ -58,14 +58,14 @@ TEMPLATE = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
 <script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}</script>
 </head><body>
 <canvas id="c"></canvas>
-<div id="hud"><b>설계모델 ↔ 영상 co-play</b> <span id="pmode" style="font-weight:700;padding:2px 8px;border-radius:6px;background:__PMODECOL__;color:#0a0d13">__PMODE__</span><br><span style="color:#9fb0c8">__MODELNAME__ · 삼각형 __TRIS__ · 포즈 __NPOSES__</span><br><span class="legend">__LEGEND__</span><br><span id="finfo" style="color:#9fb0c8">frame —</span></div>
+<div id="hud"><b>설계모델 ↔ 영상 co-play</b> <span id="pmode" style="font-weight:700;padding:2px 8px;border-radius:6px;background:__PMODECOL__;color:#0a0d13">__PMODE__</span><br><span style="color:#9fb0c8">__MODELNAME__ · 삼각형 __TRIS__ · 포즈 __NPOSES__</span><div id="mfilter" style="margin-top:5px;display:flex;flex-wrap:wrap;gap:2px 2px"></div><span id="finfo" style="color:#9fb0c8">frame —</span></div>
 <div id="pip"><header><span>정합 렌더 영상 (점군)</span><span class="sp"></span><button id="pmin" title="최소화">▭</button></header><video id="rvid" src="__RVIDEO__" muted playsinline preload="none"></video><div class="rsz n"></div><div class="rsz s"></div><div class="rsz e"></div><div class="rsz w"></div><div class="rsz ne"></div><div class="rsz nw"></div><div class="rsz se"></div><div class="rsz sw"></div></div>
 <div id="place">모델 클릭=첫 위치 · <b>화살표</b>이동 · <b>[</b>/<b>]</b>회전 · <b>,</b>/<b>.</b>스케일 · <b>m</b>좌우반전 · <b>PgUp/Dn</b>높이<br><span id="pp" style="color:#cdd6e6"></span></div>
 <div id="bar"><button id="play">▶ 재생</button><button id="placeBtn">위치 지정</button><button id="fcam">촬영자 추적</button><button id="peer" style="display:__PEERSHOW__;background:__PEERCOL__;color:#0a0d13;font-weight:700" onclick="location.href='__PEERURL__'">__PEERLABEL__</button><input id="seek" type="range" min="0" max="1000" value="0"><span class="t" id="t">0.0s</span></div>
 <script type="module">
 import * as THREE from 'three';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
-const MESHES=__MESHES__, RAWP=__POSES__, META=__META__;
+const MESHES=__MESHES__, MODELS=__MODELS__, RAWP=__POSES__, META=__META__;
 const renderer=new THREE.WebGLRenderer({canvas:document.getElementById('c'),antialias:true});
 renderer.setSize(innerWidth,innerHeight); renderer.setPixelRatio(Math.min(devicePixelRatio,2));
 const scene=new THREE.Scene(); scene.background=new THREE.Color(0x0c0f16);
@@ -75,15 +75,26 @@ const dl=new THREE.DirectionalLight(0xffffff,0.9); dl.position.set(30,60,30); sc
 scene.add(new THREE.HemisphereLight(0xbfd4ff,0x202830,0.5)); scene.add(new THREE.GridHelper(60,60,0x223,0x182030));
 const controls=new OrbitControls(camera,renderer.domElement);
 function b64f32(s){const b=atob(s),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return new Float32Array(u.buffer);}
-const box=new THREE.Box3(); const MESH_OBJS=[]; const raycaster=new THREE.Raycaster(); const mouse=new THREE.Vector2();
+const box=new THREE.Box3(); const MESH_OBJS=[]; const MODEL_GROUPS={}; const raycaster=new THREE.Raycaster(); const mouse=new THREE.Vector2();
+const MODEL_ON={}; MODELS.forEach(d=>MODEL_ON[d.name]=d.on);
 for(const m of MESHES){
   const pos=b64f32(m.b64); const n=pos.length/3;
   const g=new THREE.BufferGeometry(); g.setAttribute('position',new THREE.BufferAttribute(pos,3)); g.computeVertexNormals();
   const base=new Float32Array(pos.length); for(let i=0;i<n;i++){base[i*3]=m.color[0];base[i*3+1]=m.color[1];base[i*3+2]=m.color[2];}
   const col=base.slice(); g.setAttribute('color',new THREE.BufferAttribute(col,3));
   const mesh=new THREE.Mesh(g,new THREE.MeshStandardMaterial({vertexColors:true,roughness:0.7,metalness:0.05,side:THREE.DoubleSide}));
-  scene.add(mesh); box.expandByObject(mesh); MESH_OBJS.push({mesh,pos,base,col,n});
+  mesh.visible=(MODEL_ON[m.model]!==false);
+  scene.add(mesh);
+  if(m.model!=='SXX') box.expandByObject(mesh);   // 외벽 제외하고 내부 기준으로 카메라 프레이밍
+  const o={mesh,pos,base,col,n}; MESH_OBJS.push(o); (MODEL_GROUPS[m.model]=MODEL_GROUPS[m.model]||[]).push(o);
 }
+// 좌상단 모델 on/off 필터
+{const mf=document.getElementById('mfilter');
+ MODELS.forEach(d=>{const hx='#'+d.color.slice(0,3).map(c=>Math.round(Math.max(0,Math.min(1,c))*255).toString(16).padStart(2,'0')).join('');
+   const lab=document.createElement('label'); lab.style.cssText='display:inline-flex;align-items:center;gap:3px;margin-right:8px;cursor:pointer;white-space:nowrap';
+   lab.innerHTML='<input type="checkbox" '+(d.on?'checked':'')+' data-m="'+d.name+'" style="margin:0;vertical-align:middle"><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:'+hx+'"></i>'+d.name;
+   mf.appendChild(lab);});
+ mf.addEventListener('change',e=>{if(e.target.tagName!=='INPUT')return;(MODEL_GROUPS[e.target.dataset.m]||[]).forEach(o=>o.mesh.visible=e.target.checked);dirty=true;});}
 const c0=box.getCenter(new THREE.Vector3()), sz=box.getSize(new THREE.Vector3());
 let cx0=0,cy0=0,cz0=0; for(const p of RAWP){cx0+=p.c[0];cy0+=p.c[1];cz0+=p.c[2];} cx0/=RAWP.length;cy0/=RAWP.length;cz0/=RAWP.length;
 const CANON=RAWP.map(p=>({c:[p.c[0]-cx0,p.c[1]-cy0,p.c[2]-cz0],f:p.f.slice(),u:p.u.slice()}));
@@ -414,10 +425,12 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
                        "path_m": round(plen, 2), "cam_h": round(eye - float(bbox[0][1]), 2)}
 
 
-def place_pipe_auto(poses, scan_pts, bbox, fxx_file):
+def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False):
     """완전 자동 배관추종 배치: lane(메인런) + METRIC 스케일(천장높이 앵커, robust) +
     코너(B1 turn-fraction) + recon 형상. 수동 waypoint 없이 metric 길이로 배치.
-    핵심: 궤적-런 피팅(런 전체 가정)은 과신장 → 독립 metric 앵커로 실제 보행거리 산출."""
+    핵심: 궤적-런 피팅(런 전체 가정)은 과신장 → 독립 metric 앵커로 실제 보행거리 산출.
+    fit_run=True: 세그먼트 길이를 FXX 런 실측 기하에 스냅(천장높이 스케일이 단안 모호성으로
+    과소산출될 때). 방향·분기선택은 recon 유지, 길이만 모델 기준 — 코리더 전 구간을 걸은 경우."""
     from scan2bim.pipe_path import main_pipe_run_L, trajectory_turn_fraction
     vp = [viewer_pose(p) for p in poses]
     cen = np.array([v[0] for v in vp]); up_v = np.array([v[2] for v in vp])
@@ -442,12 +455,16 @@ def place_pipe_auto(poses, scan_pts, bbox, fxx_file):
         corner = poly[1]
         rd = poly[0] - corner; rd /= (np.linalg.norm(rd) + 1e-9)
         bd = poly[2] - corner; bd /= (np.linalg.norm(bd) + 1e-9)
+        if fit_run:   # 길이를 FXX 런 실측 기하에 스냅 (천장높이 스케일 과소산출 보정)
+            L1 = float(np.linalg.norm(poly[0] - corner)); L2 = float(np.linalg.norm(poly[2] - corner))
         wps = [(corner + rd * L1).tolist(), corner.tolist(), (corner + bd * L2).tolist()]
     else:
         A, B = poly; d = B - A; d /= (np.linalg.norm(d) + 1e-9)
-        wps = [A.tolist(), (A + d * total * s_m).tolist()]
+        end_len = float(np.linalg.norm(B - A)) if fit_run else total * s_m
+        wps = [A.tolist(), (A + d * end_len).tolist()]
     pose_json, info = place_gtpath(poses, scan_pts, bbox, wps, snap=True)
-    info["mode"] = "auto-pipe-metric"; info["s_metric"] = round(s_m, 2); info["turn_frac"] = round(tf, 2)
+    info["mode"] = "auto-pipe-fitrun" if fit_run else "auto-pipe-metric"
+    info["s_metric"] = round(s_m, 2); info["turn_frac"] = round(tf, 2)
     return pose_json, info
 
 
@@ -517,6 +534,7 @@ def main():
     ap.add_argument("--gt-path", default=None, help="실제 촬영경로 waypoints 'x1,z1 x2,z2 ...' (모델 XZ) → 궤적을 이에 직접 피팅")
     ap.add_argument("--gt-mode", default="snap", choices=["snap", "umeyama"], help="snap=GT선에 스냅(직선 walk가 직선), umeyama=강체피팅(재구성 곡선 유지)")
     ap.add_argument("--auto-pipe", action="store_true", help="메인 소화배관(FXX) 런 자동검출 → 그 아래로 경로 자동(수동 waypoint 불요)")
+    ap.add_argument("--fit-run", action="store_true", help="auto-pipe 세그먼트 길이를 FXX 런 실측 기하에 스냅(천장높이 스케일 과소산출 보정·코리더 전구간 보행 시)")
     ap.add_argument("--auto-localize", action="store_true", help="prior 궤적을 프레임별 객체-앵커 PnP로 자동 정제(드리프트 제거)")
     ap.add_argument("--frames-dir", default=None, help="--auto-localize용 추출 프레임 폴더")
     ap.add_argument("--hfov", type=float, default=69.0, help="카메라 수평 FOV(도) — PnP 내부파라미터")
@@ -526,23 +544,26 @@ def main():
     args = ap.parse_args()
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
 
-    meshes_json, tris, names, model_pts = [], 0, [], []
+    meshes_json, tris, names, model_pts, model_pts_mdl = [], 0, [], [], []
     RENDER_CAP = 90000  # per color group (triangle-soup) for the browser
     for f in args.dtdx:
-        g = decode_geometry(f); names.append(g["discipline_code"]); tris += g["triangle_count"]
+        g = decode_geometry(f); code = g["discipline_code"]; names.append(code); tris += g["triangle_count"]
         for m in g["meshes"]:
             pos = np.asarray(m["positions"], dtype=np.float32).copy()
             if not len(pos):
                 continue
             pos[:, 0] *= -1.0   # Babylon(LH)→Three(RH): X 반전해야 원본 저작뷰어(정상)와 좌우 일치
-            model_pts.append(pos)
+            model_pts.append(pos); model_pts_mdl.append(code)
             if len(pos) > RENDER_CAP:  # decimate by whole triangles
                 ntri = len(pos) // 3
                 keep = np.linspace(0, ntri - 1, RENDER_CAP // 3).astype(int)
                 pos = pos.reshape(-1, 3, 3)[keep].reshape(-1, 3)
             meshes_json.append({"color": [round(c, 4) for c in m["color"]],
-                                "b64": base64.b64encode(np.ascontiguousarray(pos).tobytes()).decode("ascii")})
-    allp = np.concatenate(model_pts).astype(np.float64)
+                                "b64": base64.b64encode(np.ascontiguousarray(pos).tobytes()).decode("ascii"),
+                                "model": code})
+    # 배치/스케일 bbox는 내부 MEP·건축만 사용 — 외벽(SXX)은 천장높이 metric 앵커를 왜곡하므로 제외(렌더는 함)
+    interior = [p for p, c in zip(model_pts, model_pts_mdl) if c != "SXX"] or model_pts
+    allp = np.concatenate(interior).astype(np.float64)
     med = np.median(allp, axis=0)
     allc = allp[(np.abs(allp - med) < 60).all(1)]       # drop only extreme outliers; keep full building (incl. SXX wing)
     bbox = (allc.min(0).tolist(), allc.max(0).tolist())
@@ -556,7 +577,7 @@ def main():
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
     if args.auto_pipe:
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
-        pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx)
+        pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx, fit_run=args.fit_run)
         print("  auto-pipe(metric):", reginfo)
     elif args.gt_path:
         wps = [[float(v) for v in seg.split(",")] for seg in args.gt_path.split()]
@@ -583,20 +604,24 @@ def main():
     peer_col = "#31d27c" if is_manual else "#ffb347"
     peer_show = "inline-block" if args.peer_url else "none"
 
-    legend = []
-    for m in sorted(meshes_json, key=lambda x: -len(x["b64"]))[:5]:
-        hexc = "#%02x%02x%02x" % tuple(int(max(0, min(1, c)) * 255) for c in m["color"][:3])
-        legend.append(f'<i style="background:{hexc}"></i>')
+    # 모델 필터용: 모델별 대표색(가장 큰 메시) + 기본 표시여부(외벽 SXX는 내부 가림 방지로 기본 꺼짐)
+    _mdl_best = {}
+    for e in meshes_json:
+        mdl, blen = e["model"], len(e["b64"])
+        if blen > _mdl_best.get(mdl, (-1, None))[0]:
+            _mdl_best[mdl] = (blen, e["color"])
+    models_json = [{"name": mdl, "color": _mdl_best[mdl][1], "on": mdl != "SXX"}
+                   for mdl in dict.fromkeys(e["model"] for e in meshes_json)]
 
     rel_video = os.path.relpath(Path(args.render_video).resolve(), out.parent.resolve())
     html = (TEMPLATE
             .replace("__MESHES__", json.dumps(meshes_json))
+            .replace("__MODELS__", json.dumps(models_json))
             .replace("__POSES__", json.dumps(pose_json))
             .replace("__META__", json.dumps({"duration": args.duration}))
             .replace("__MODELNAME__", " + ".join(names))
             .replace("__TRIS__", f"{tris:,}")
             .replace("__NPOSES__", str(len(pose_json)))
-            .replace("__LEGEND__", " ".join(legend))
             .replace("__PMODE__", pmode)
             .replace("__PMODECOL__", pcol)
             .replace("__PEERURL__", args.peer_url or "#")

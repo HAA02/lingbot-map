@@ -138,33 +138,32 @@ async function startUpload(f) {
     }
   };
   xhr.upload.onload = () => {
-    $('bar').style.width = '60%';
-    $('status').textContent = `추론 중 (~${(n*0.15).toFixed(1)}s)...`;
+    $('bar').style.width = '65%';
+    $('status').textContent = '파일 전송 완료 · 처리 시작 중...';
   };
   xhr.onload = () => {
-    $('bar').style.width = '100%';
-    $('pickBtn').classList.remove('disabled');
-    $('captureBtn').classList.remove('disabled');
-    $('file').disabled = false;
-    $('captureFile').disabled = false;
-    uploading = false;
     let data = null;
     try { data = JSON.parse(xhr.responseText); } catch { data = {raw: xhr.responseText}; }
-    $('result').style.display = 'block';
-    $('result').textContent = JSON.stringify(data, null, 2);
-    if (xhr.status === 200 && data && data.ok) {
-      $('status').className = 'status ok';
-      const coverageUrl = data.coverage_url || `/coverage.html?upload=${encodeURIComponent(data.id)}`;
-      const reportUrl = data.report_url || `/coverage-report.html?upload=${encodeURIComponent(data.id)}`;
-      $('status').innerHTML = `완료 · ${data.elapsed_s}s · ${data.frames_used}프레임 — 아래 3D 뷰 확인 · <a class="inline-btn" href="${coverageUrl}" target="_blank">모델 기준 evidence</a> <a class="inline-btn" href="${reportUrl}" target="_blank">검수 리포트</a>`;
-      const f = $('viewerFrame');
-      f.style.display = 'block';
-      // reload viewer so it picks up the fresh WS payload from this upload
-      f.src = '/viewer?t=' + Date.now();
-      loadHistory();
+    if (xhr.status === 200 && data && data.queued) {
+      $('bar').style.width = '70%';
+      $('status').textContent = `GPU 처리 중 (${data.id})...`;
+      pollJob(data.id);
     } else {
-      $('status').className = 'status err';
-      $('status').textContent = `실패 (HTTP ${xhr.status}) · ${data?.error || ''}`;
+      // 에러 or 구버전 동기 응답
+      $('bar').style.width = '100%';
+      $('pickBtn').classList.remove('disabled');
+      $('captureBtn').classList.remove('disabled');
+      $('file').disabled = false;
+      $('captureFile').disabled = false;
+      uploading = false;
+      $('result').style.display = 'block';
+      $('result').textContent = JSON.stringify(data, null, 2);
+      if (xhr.status === 200 && data && data.ok) {
+        showDone(data);
+      } else {
+        $('status').className = 'status err';
+        $('status').textContent = `실패 (HTTP ${xhr.status}) · ${data?.error || ''}`;
+      }
     }
   };
   xhr.onerror = () => {
@@ -177,6 +176,47 @@ async function startUpload(f) {
     $('status').textContent = '네트워크 오류';
   };
   xhr.send(fd);
+}
+
+function showDone(data) {
+  $('status').className = 'status ok';
+  const coverageUrl = data.coverage_url || `/coverage.html?upload=${encodeURIComponent(data.id)}`;
+  const reportUrl = data.report_url || `/coverage-report.html?upload=${encodeURIComponent(data.id)}`;
+  const coplayUrl = data.coplay_url || `/coplay?upload=${encodeURIComponent(data.id)}`;
+  $('status').innerHTML = `완료 · ${data.elapsed_s}s · ${data.frames_used}프레임 — <a class="inline-btn" href="${coverageUrl}" target="_blank">모델 evidence</a> <a class="inline-btn" href="${reportUrl}" target="_blank">검수 리포트</a> <a class="inline-btn" href="${coplayUrl}" target="_blank">▶ 재생</a>`;
+  $('viewerFrame').style.display = 'block';
+  $('viewerFrame').src = '/viewer?t=' + Date.now();
+  loadHistory();
+}
+
+function pollJob(jobId) {
+  const iv = setInterval(async () => {
+    try {
+      const r = await fetch(`/api/jobs/${jobId}/status`).then(r => r.json());
+      if (r.status === 'processing') {
+        const cur = parseFloat($('bar').style.width) || 70;
+        if (cur < 95) $('bar').style.width = (cur + 1) + '%';
+        return;
+      }
+      clearInterval(iv);
+      $('bar').style.width = '100%';
+      $('pickBtn').classList.remove('disabled');
+      $('captureBtn').classList.remove('disabled');
+      $('file').disabled = false;
+      $('captureFile').disabled = false;
+      uploading = false;
+      $('result').style.display = 'block';
+      $('result').textContent = JSON.stringify(r, null, 2);
+      if (r.status === 'done' && r.ok) {
+        showDone(r);
+      } else {
+        $('status').className = 'status err';
+        $('status').textContent = `처리 실패 · ${r.error || ''}`;
+      }
+    } catch (_) {
+      // 일시적 네트워크 오류 → 다음 tick에 재시도
+    }
+  }, 2000);
 }
 
 async function loadHistory() {
@@ -193,9 +233,11 @@ async function loadHistory() {
       const mb = (it.payload_bytes / 1024).toFixed(0);
       const coverageUrl = it.coverage_url || `/coverage.html?upload=${encodeURIComponent(it.id)}`;
       const reportUrl = it.report_url || `/coverage-report.html?upload=${encodeURIComponent(it.id)}`;
+      const coplayUrl = it.coplay_url || `/coplay?upload=${encodeURIComponent(it.id)}`;
       return `<div style="display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid #222">
         <span style="flex:1">${when} · ${it.video || it.id} · ${mb} KB</span>
         <button data-id="${it.id}" class="replay" style="width:auto;padding:6px 10px;margin:0;font-size:12px">▶ 보기</button>
+        <a class="inline-btn" href="${coplayUrl}" target="_blank">▶ 재생</a>
         <a class="inline-btn" href="${coverageUrl}" target="_blank">모델 evidence</a>
         <a class="inline-btn" href="${reportUrl}" target="_blank">리포트</a>
       </div>`;
