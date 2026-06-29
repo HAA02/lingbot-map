@@ -33,3 +33,9 @@ out_kakao_fmt/
 .autopm-gate-state
 models/Gasan_7F/
 reports/
+
+# upstream additions
+.claude-remote
+weights/
+.DS_Store
+**/.DS_Store
