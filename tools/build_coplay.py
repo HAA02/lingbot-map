@@ -295,11 +295,20 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
     lo, hi = np.array(bbox[0]), np.array(bbox[1])
     yc = float(np.percentile(model_ceiling[:, 1], 50))
 
-    # METRIC scale from the VERTICAL ceiling-height ratio — robust because looking
-    # up captures floor↔ceiling extent well, whereas horizontal ceiling matching is
-    # ambiguous on repeated geometry (it collapsed to 0.409 → 3.6 m phantom walk).
+    # METRIC scale from TWO independent anchors, fused: (1) VERTICAL ceiling-height
+    # ratio — robust because looking up captures floor↔ceiling extent well, but
+    # silently over/under-shoots if the scan doesn't capture the full span; (2)
+    # assumed camera-carry height vs the recon's own camera-to-floor distance,
+    # unaffected by ceiling capture completeness. Horizontal ceiling matching is
+    # ambiguous on repeated geometry (it collapsed to 0.409 → 3.6 m phantom walk),
+    # so scale never comes from that.
+    from scan2bim.metric_scale import bbox_height_warning, camera_height_scale, estimate_floor_level, fuse_scale_estimates
     vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
     s_vert = float((hi[1] - lo[1]) / max(vext, 1e-6))
+    floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
+    s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
+    s_m, scale_info = fuse_scale_estimates([s_vert, s_cam])
+    bbox_warn = bbox_height_warning(float(hi[1] - lo[1]))
 
     # camera WALK direction (gravity-aligned, horizontal) vs model PIPE direction
     # — pins yaw so the 3D path follows pipes (the video walks straight along them).
@@ -324,7 +333,7 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
         gz = np.linspace(lo[2] + 2, hi[2] - 2, 9)
 
     best = None
-    for s in (s_vert * 0.92, s_vert, s_vert * 1.08):   # narrow band around metric anchor
+    for s in (s_m * 0.92, s_m, s_m * 1.08):   # narrow band around fused metric anchor
         for yaw in range(0, 360, 15):
             R = Ry(yaw)
             align = abs(float(np.cos(np.deg2rad(a_s + yaw - a_p))))  # 1=traj∥pipes
@@ -345,9 +354,13 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
     Ct[:, 1] += eye - float(np.median(Ct[:, 1]))
     pose_json = [{"c": [round(float(x), 3) for x in Ct[i]], "f": [round(float(x), 4) for x in Ft[i]],
                   "u": [round(float(x), 4) for x in Ut[i]]} for i in range(len(Ct))]
-    return pose_json, {"inlier": round(float(inl2), 3), "rmse": round(float(rmse), 3),
-                       "scale": round(float(s2), 3), "yaw": int(yaw),
-                       "cam_h": round(eye - float(bbox[0][1]), 2)}
+    info = {"inlier": round(float(inl2), 3), "rmse": round(float(rmse), 3),
+            "scale": round(float(s2), 3), "yaw": int(yaw),
+            "cam_h": round(eye - float(bbox[0][1]), 2),
+            "scale_anchors": scale_info}
+    if bbox_warn:
+        info["warning"] = bbox_warn
+    return pose_json, info
 
 
 def _resample(pts, n):
@@ -425,12 +438,18 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
                        "path_m": round(plen, 2), "cam_h": round(eye - float(bbox[0][1]), 2)}
 
 
-def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False):
-    """완전 자동 배관추종 배치: lane(메인런) + METRIC 스케일(천장높이 앵커, robust) +
-    코너(B1 turn-fraction) + recon 형상. 수동 waypoint 없이 metric 길이로 배치.
+def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=None):
+    """완전 자동 배관추종 배치: lane(메인런) + METRIC 스케일(천장높이+카메라높이 두 앵커 융합,
+    robust) + 코너(B1 turn-fraction) + recon 형상. 수동 waypoint 없이 metric 길이로 배치.
     핵심: 궤적-런 피팅(런 전체 가정)은 과신장 → 독립 metric 앵커로 실제 보행거리 산출.
-    fit_run=True: 세그먼트 길이를 FXX 런 실측 기하에 스냅(천장높이 스케일이 단안 모호성으로
-    과소산출될 때). 방향·분기선택은 recon 유지, 길이만 모델 기준 — 코리더 전 구간을 걸은 경우."""
+    단일 앵커(천장높이)는 스캔이 전체 층고를 못 담으면 과소/과대산출될 수 있어 카메라높이
+    앵커(가정 눈높이 vs 바닥까지 거리)로 교차검증 — 불일치시 info에 노출(자동 확정 아님).
+    fit_run=True: 세그먼트 길이를 FXX 런 실측 기하에 스냅(metric 스케일이 단안 모호성으로
+    과소산출될 때). 방향·분기선택은 recon 유지, 길이만 모델 기준 — 코리더 전 구간을 걸은 경우.
+    duration(초, 실제 영상 길이): 주어지면 산출 경로장/속도가 비현실적일 때 경고."""
+    from scan2bim.metric_scale import (
+        bbox_height_warning, camera_height_scale, estimate_floor_level, fuse_scale_estimates, speed_warning,
+    )
     from scan2bim.pipe_path import main_pipe_run_L, trajectory_turn_fraction
     vp = [viewer_pose(p) for p in poses]
     cen = np.array([v[0] for v in vp]); up_v = np.array([v[2] for v in vp])
@@ -439,7 +458,11 @@ def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False):
     Cg = cen @ Rg.T
     P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0; Pg = P @ Rg.T
     vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
-    s_m = float((bbox[1][1] - bbox[0][1]) / max(vext, 1e-6))         # 천장높이 metric 스케일
+    s_vert = float((bbox[1][1] - bbox[0][1]) / max(vext, 1e-6))     # 천장높이 metric 스케일
+    bbox_warn = bbox_height_warning(float(bbox[1][1] - bbox[0][1]))
+    floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
+    s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
+    s_m, scale_info = fuse_scale_estimates([s_vert, s_cam])
     traj = Cg[:, [0, 2]]
     tf, tang = trajectory_turn_fraction(traj)
     total = float(np.linalg.norm(np.diff(traj, axis=0), axis=1).sum())
@@ -465,6 +488,10 @@ def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False):
     pose_json, info = place_gtpath(poses, scan_pts, bbox, wps, snap=True)
     info["mode"] = "auto-pipe-fitrun" if fit_run else "auto-pipe-metric"
     info["s_metric"] = round(s_m, 2); info["turn_frac"] = round(tf, 2)
+    info["scale_anchors"] = scale_info
+    warnings = [w for w in (bbox_warn, speed_warning(info["path_m"], duration)) if w]
+    if warnings:
+        info["warning"] = "; ".join(warnings)
     return pose_json, info
 
 
@@ -577,7 +604,7 @@ def main():
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
     if args.auto_pipe:
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
-        pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx, fit_run=args.fit_run)
+        pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx, fit_run=args.fit_run, duration=args.duration)
         print("  auto-pipe(metric):", reginfo)
     elif args.gt_path:
         wps = [[float(v) for v in seg.split(",")] for seg in args.gt_path.split()]
