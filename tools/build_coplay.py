@@ -291,7 +291,8 @@ def model_corridor_widths(points: np.ndarray, *, is_triangle_soup: bool = False,
     return widths, info
 
 
-def _split_trajectory_legs(cam_xz: np.ndarray, min_angle_deg: float = 20.0, min_frac: float = 0.15):
+def _split_trajectory_legs(cam_xz: np.ndarray, margin: float = 0.0,
+                           min_angle_deg: float = 20.0, min_frac: float = 0.15):
     """Split a 2D XZ trajectory into two straight legs at its main corner, IF the
     corner is a real turn — root cause (verified directly against
     scan2bim/wall_anchor.py on upload_1781521406685): _horizontal_axes(xz,
@@ -311,9 +312,28 @@ def _split_trajectory_legs(cam_xz: np.ndarray, min_angle_deg: float = 20.0, min_
     returns None so the caller falls back to its original single whole-path call
     unchanged (no effect on straight-corridor uploads).
 
-    Returns ((leg_a_xz | None, frac_a), (leg_b_xz | None, frac_b), tf, angle_deg)
-    or None if there's no usable turn to split on. A leg is None (excluded) if
-    it's shorter than min_frac of the total arclength or has too few points."""
+    margin: arclength (recon-local units, same frame as cam_xz — callers pass
+    vext, one ceiling-height, matching the trajectory_radius proximity filter
+    already used for the wall search) by which each leg OVERLAPS past the
+    corner into the other leg's territory: leg A = [0, turn_idx+margin_idx],
+    leg B = [turn_idx-margin_idx, end]. A hard cut exactly at the corner
+    removes the wall-support points immediately around it (real-data finding:
+    leg A hard-cut found only 1 wall vs. the whole path's 2 — the whole path's
+    trajectory_radius filter draws proximity support from BOTH legs near the
+    corner; a hard-cut leg alone loses that). trajectory_radius filtering
+    itself is untouched — the overlap only changes which cam_xz points are fed
+    into it, restoring support on both sides of the corner. Risk: leg B's
+    overlap region could pick up leg A's own wall pair — left to
+    estimate_wall_scale's straddle gate (cam_t must fall strictly between the
+    pair) to reject; verify empirically, don't assume.
+
+    Returns ((leg_a_xz | None, frac_a), (leg_b_xz | None, frac_b), tf,
+    angle_deg, margin_frac) or None if there's no usable turn to split on.
+    frac_a/frac_b are the CORE (unpadded) arclength fractions — used for the
+    majority-leg decision and the min_frac viability check; the returned leg
+    arrays themselves ARE padded by margin. A leg is None (excluded) if its
+    CORE arclength is shorter than min_frac of the total or has too few
+    points (viability is judged on the core split, not inflated by padding)."""
     from scan2bim.pipe_path import trajectory_turn_fraction
     xz = np.asarray(cam_xz, dtype=np.float64)
     if len(xz) < 10:
@@ -329,14 +349,20 @@ def _split_trajectory_legs(cam_xz: np.ndarray, min_angle_deg: float = 20.0, min_
     # of arclength, so re-locate the corner on the ORIGINAL (unresampled) arclength
     # rather than assuming index alignment with the resampled curve.
     turn_idx = int(np.clip(np.searchsorted(arclen, tf * total), 1, len(xz) - 2))
-    leg_a, leg_b = xz[:turn_idx + 1], xz[turn_idx:]
     frac_a = float(arclen[turn_idx] / total)
     frac_b = 1.0 - frac_a
-    leg_a_out = leg_a if (frac_a >= min_frac and len(leg_a) >= 5) else None
-    leg_b_out = leg_b if (frac_b >= min_frac and len(leg_b) >= 5) else None
-    if leg_a_out is None and leg_b_out is None:
+    core_a_ok = frac_a >= min_frac and len(xz[:turn_idx + 1]) >= 5
+    core_b_ok = frac_b >= min_frac and len(xz[turn_idx:]) >= 5
+    if not core_a_ok and not core_b_ok:
         return None
-    return (leg_a_out, frac_a), (leg_b_out, frac_b), float(tf), float(ang)
+
+    margin = max(0.0, float(margin))
+    a_end_idx = int(np.clip(np.searchsorted(arclen, arclen[turn_idx] + margin), turn_idx, len(xz) - 1))
+    b_start_idx = int(np.clip(np.searchsorted(arclen, arclen[turn_idx] - margin), 0, turn_idx))
+    leg_a_out = xz[:a_end_idx + 1] if core_a_ok else None
+    leg_b_out = xz[b_start_idx:] if core_b_ok else None
+    margin_frac = float(margin / total)
+    return (leg_a_out, frac_a), (leg_b_out, frac_b), float(tf), float(ang), margin_frac
 
 
 def compute_wall_anchor(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: float):
@@ -362,14 +388,16 @@ def compute_wall_anchor(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: f
     Returns (s_wall, info); s_wall is None on any failure, info always carries a
     "fail" key in that case plus whatever diagnostics were available. info also
     carries "leg_used" ("whole"/"A"/"B"/"none"), and when split was attempted,
-    "turn_fraction"/"turn_angle_deg"."""
+    "turn_fraction"/"turn_angle_deg"/"leg_margin_frac". margin=vext (one
+    ceiling-height, arclength units) is passed to _split_trajectory_legs so
+    each leg overlaps the corner rather than being hard-cut there."""
     if wall_points is None or not len(wall_points):
         return None, {"fail": "wall_points not provided"}
     widths, widths_info = model_corridor_widths(wall_points, is_triangle_soup=True)
     if not widths:
         return None, widths_info
 
-    legs = _split_trajectory_legs(cam_xz)
+    legs = _split_trajectory_legs(cam_xz, margin=vext)
     if legs is None:
         s_wall, recon_info = wall_scale_anchor(Pg, cam_xz, widths, vext)
         info = dict(widths_info)
@@ -379,7 +407,7 @@ def compute_wall_anchor(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: f
             info["fail"] = recon_info.get("fail", "recon-side wall match failed")
         return s_wall, info
 
-    (leg_a, frac_a), (leg_b, frac_b), tf, ang = legs
+    (leg_a, frac_a), (leg_b, frac_b), tf, ang, margin_frac = legs
     s_a, info_a = (wall_scale_anchor(Pg, leg_a, widths, vext) if leg_a is not None
                    else (None, {"fail": "leg shorter than min_frac"}))
     s_b, info_b = (wall_scale_anchor(Pg, leg_b, widths, vext) if leg_b is not None
@@ -388,6 +416,7 @@ def compute_wall_anchor(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: f
     info = dict(widths_info)
     info["turn_fraction"] = round(tf, 3)
     info["turn_angle_deg"] = round(ang, 1)
+    info["leg_margin_frac"] = round(margin_frac, 4)
     info["leg_a"] = {"arclength_frac": round(frac_a, 3), "match": info_a}
     info["leg_b"] = {"arclength_frac": round(frac_b, 3), "match": info_b}
 

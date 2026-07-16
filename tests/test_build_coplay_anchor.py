@@ -211,6 +211,8 @@ class TestLegSplitAxisSkew(unittest.TestCase):
         Pg = P @ Rg.T
         cam_xz = Cg[:, [0, 2]]
         self.assertIsNone(bc._split_trajectory_legs(cam_xz), "a straight path must not split")
+        self.assertIsNone(bc._split_trajectory_legs(cam_xz, margin=5.0),
+                          "margin must not matter when there's no real turn to split on")
         vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
 
         s_split, info_split = bc.compute_wall_anchor(Pg, cam_xz, wall_points, vext)
@@ -243,6 +245,110 @@ class TestLegSplitAxisSkew(unittest.TestCase):
         s_wall, info = bc.compute_wall_anchor(Pg, cam_xz, open_space, vext)
         self.assertIsNone(s_wall)
         self.assertIn("fail", info)
+
+
+class TestLegMargin(unittest.TestCase):
+    """Cycle 7: a hard cut exactly at turn_idx removes wall-support points near
+    the corner itself (real-data finding: leg A hard-cut found only 1 wall vs.
+    the whole path's 2 — trajectory_radius support near the corner comes from
+    BOTH legs' cameras combined). _split_trajectory_legs(margin=vext) now lets
+    each leg overlap the corner by one ceiling-height of arclength."""
+
+    def test_margin_extends_leg_arrays_past_corner(self):
+        """Deterministic proof of the array mechanism, independent of any wall-
+        detection thresholds: margin grows each leg's queried camera array past
+        the hard-cut boundary, while the CORE arclength fractions (used for the
+        majority-leg decision) stay exactly the same as the unpadded split."""
+        za = np.linspace(0.0, 10.0, 50)
+        leg_a_pts = np.column_stack([np.zeros(50), za])
+        xb = np.linspace(0.0, 5.0, 25)
+        leg_b_pts = np.column_stack([xb, np.full(25, 10.0)])
+        cam_xz = np.vstack([leg_a_pts, leg_b_pts])
+
+        legs0 = bc._split_trajectory_legs(cam_xz, margin=0.0)
+        legsM = bc._split_trajectory_legs(cam_xz, margin=2.0)
+        self.assertIsNotNone(legs0); self.assertIsNotNone(legsM)
+        (la0, fa0), (lb0, fb0), tf0, ang0, mf0 = legs0
+        (laM, faM), (lbM, fbM), tfM, angM, mfM = legsM
+
+        self.assertEqual(mf0, 0.0)
+        self.assertGreater(mfM, 0.0)
+        self.assertGreater(len(laM), len(la0), "margin must grow leg A past the corner")
+        self.assertGreater(len(lbM), len(lb0), "margin must grow leg B past the corner")
+        self.assertGreater(laM[:, 0].max(), la0[:, 0].max(),
+                           "leg A's padded tail must reach into leg B's X range")
+        self.assertLess(lbM[:, 1].min(), lb0[:, 1].min(),
+                        "leg B's padded head must reach back into leg A's Z range")
+        # majority-leg decision basis (core, unpadded fractions) is unaffected by margin
+        self.assertEqual(fa0, faM)
+        self.assertEqual(fb0, fbM)
+        self.assertEqual(round(tf0, 6), round(tfM, 6))
+
+    @unittest.skipUnless(_UPLOAD.exists(), "upload_1781521406685 fixture not present in this worktree")
+    def test_margin_restores_leg_a_wall_count_on_real_data(self):
+        """Real-data evidence (the exact case the fix targets): leg A (majority,
+        77.3% arclength), hard-cut at the corner, sees only 1 wall — margin
+        restores the 2nd wall (matching what the whole, unsplit path always
+        found). This does not by itself guarantee a straddling PAIR (see the
+        real-data report), only that the point-support/wall-COUNT loss caused
+        by the hard cut is what margin fixes — verified directly, not assumed."""
+        import struct
+        data = _UPLOAD.read_bytes()
+        _magic, _flags, num_pts, num_poses, _seq = struct.unpack("<4sIIII", data[:20])
+        off = 20
+        xyz = np.frombuffer(data, dtype="<f4", count=num_pts * 3, offset=off).reshape(-1, 3).astype(np.float64)
+        off += num_pts * 3 * 4 + num_pts * 3 + num_pts * 3 * 4 + num_pts * 4 + num_pts * 4
+        poses = np.frombuffer(data, dtype="<f4", count=num_poses * 12, offset=off).reshape(-1, 12).astype(np.float64)
+
+        vp = [bc.viewer_pose(p) for p in poses]
+        centers = np.array([v[0] for v in vp]); up_v = np.array([v[2] for v in vp])
+        g = up_v.mean(0); g /= np.linalg.norm(g) + 1e-9
+        Rg = bc._rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
+        Cg = centers @ Rg.T
+        P = xyz.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0
+        Pg = P @ Rg.T
+        cam_xz = Cg[:, [0, 2]]
+        vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
+
+        legs0 = bc._split_trajectory_legs(cam_xz, margin=0.0)
+        legsM = bc._split_trajectory_legs(cam_xz, margin=vext)
+        (la0, _), _, _, _, _ = legs0
+        (laM, _), _, _, _, _ = legsM
+        _, info0 = bc.wall_scale_anchor(Pg, la0, [2.14, 3.29, 1.97, 3.13, 5.76], vext)
+        _, infoM = bc.wall_scale_anchor(Pg, laM, [2.14, 3.29, 1.97, 3.13, 5.76], vext)
+        self.assertEqual(info0.get("n_walls"), 1)
+        self.assertEqual(infoM.get("n_walls"), 2)
+
+    def test_margin_does_not_contaminate_leg_b_with_leg_a_walls(self):
+        """Margin extends leg B backward into leg A's territory, which risks leg
+        B's query set picking up leg A's OWN wall pair. Proves the straddle gate
+        (leg B's own cam_t must fall between whatever pair it detects) still
+        rejects that — leg B does not spuriously report leg A's scale."""
+        GT = 2.0
+        width_a, width_b, len_a, len_b, height = 2.4, 3.6, 10.0, 3.0, 3.0
+        left = _wall_mesh_triangles(-width_a / 2, (0, len_a), height, seed=11)
+        right = _wall_mesh_triangles(width_a / 2, (0, len_a), height, seed=12)
+        far1 = _wall_mesh_triangles(-width_b / 2, (0, len_b), height, seed=13)
+        far2 = _wall_mesh_triangles(width_b / 2, (0, len_b), height, seed=14)
+        wall_points = np.concatenate([left, right, far1, far2], axis=0)
+        poses, scan_pts = _l_shaped_recon(width_a / GT, width_b / GT, len_a / GT, len_b / GT,
+                                          height / GT, 1.5 / GT)
+        vp = [bc.viewer_pose(p) for p in poses]
+        centers = np.array([v[0] for v in vp]); up_v = np.array([v[2] for v in vp])
+        g = up_v.mean(0); g /= np.linalg.norm(g) + 1e-9
+        Rg = bc._rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
+        Cg = centers @ Rg.T
+        P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0
+        Pg = P @ Rg.T
+        cam_xz = Cg[:, [0, 2]]
+        vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
+
+        s_wall, info = bc.compute_wall_anchor(Pg, cam_xz, wall_points, vext)
+        # leg A (majority) correctly wins; leg B — now overlapping into leg A's
+        # territory via margin — must NOT independently claim a (wrong) scale.
+        self.assertEqual(info["leg_used"], "A")
+        self.assertIsNone(info["leg_b"]["match"].get("scale"))
+        self.assertAlmostEqual(s_wall, GT, delta=GT * 0.1)
 
 
 class TestThreeAnchorFusionPath(unittest.TestCase):
