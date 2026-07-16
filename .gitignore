@@ -40,3 +40,12 @@ reports/
 weights/
 .DS_Store
 **/.DS_Store
+
+# loop-engineering (local-only state)
+PROGRESS.md
+fix_plan.md
+AGENT.md
+# worktree-only symlinks
+.venv
+realtime/_uploads
+models/Gasan_7F

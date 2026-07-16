@@ -217,6 +217,299 @@ def _rot_a_to_b(a, b):
     return np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
 
 
+def model_corridor_widths(points: np.ndarray, *, is_triangle_soup: bool = False,
+                          min_vertical_span: float = 1.5,
+                          width_range: tuple = (1.5, 6.0),
+                          top_n: int = 5) -> tuple[list, dict]:
+    """Wall-source model vertices -> candidate corridor widths (metres), reusing
+    scan2bim.wall_anchor's wall-peak detector on the building's dominant
+    horizontal axis. Width magnitudes are invariant to the X-mirror chirality
+    flip applied elsewhere in this file (mirroring preserves pairwise gaps), so
+    either raw decode_geometry output or the mirrored model_pts works.
+
+    Real-data finding: AXX (architecture) is furniture-dominated (zero triangles
+    with vertical span > 1.5m) — its "corridor width" candidates are actually
+    furniture gaps. SXX (structure) carries the real walls/glass partitions
+    (9009 triangles > 1.5m span on Gasan_7F). Use SXX with is_triangle_soup=True.
+
+    is_triangle_soup=True: `points` is a flat (3*T, 3) non-indexed triangle soup
+    (decode_geometry's output format) — triangles whose vertical (Y) span is
+    below min_vertical_span are dropped first (furniture/fixtures, not walls).
+    False (default) treats `points` as an already-filtered point cloud (prior/
+    synthetic-test behavior, unchanged).
+
+    width_range clamps candidate gaps to plausible corridor widths so a
+    building-perimeter wall-to-wall span (tens of metres) is never proposed.
+    info always carries up to `top_n` candidates ranked by peak-pair prominence
+    (min of the two flanking wall peaks' prominence), for manual risk review,
+    even when widths is non-empty. Returns ([], info) with a "fail" reason when
+    no clean in-range wall-pair gap is found."""
+    from scan2bim.wall_anchor import _horizontal_axes, _wall_peaks
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.size == 0:
+        return [], {"fail": "no wall-source points"}
+    if is_triangle_soup:
+        if len(pts) % 3 != 0:
+            return [], {"fail": f"triangle soup length {len(pts)} not divisible by 3"}
+        tris = pts.reshape(-1, 3, 3)
+        yspan = tris[:, :, 1].max(axis=1) - tris[:, :, 1].min(axis=1)
+        wall_tris = tris[yspan > min_vertical_span]
+        if len(wall_tris) == 0:
+            return [], {"fail": f"no triangles with vertical span > {min_vertical_span}m"}
+        pts = wall_tris.reshape(-1, 3)
+    med = np.median(pts, axis=0)
+    keep = (np.abs(pts - med) < 60).all(axis=1)
+    allc = pts[keep] if keep.any() else pts
+    y = allc[:, 1]
+    ylo, yhi = float(y.min()), float(y.max())
+    yr = yhi - ylo
+    if yr < 1e-6:
+        return [], {"fail": "degenerate model vertical extent"}
+    band = (y > ylo + 0.15 * yr) & (y < yhi - 0.15 * yr)
+    wall_pts = allc[band]
+    if len(wall_pts) < 50:
+        return [], {"fail": "no mid-band wall points in model"}
+    xz = wall_pts[:, [0, 2]]
+    _axis, normal = _horizontal_axes(xz, None)
+    t = xz @ normal
+    peaks = _wall_peaks(t)
+    if peaks is None:
+        return [], {"fail": "no wall density peaks in model"}
+    pos, prom = peaks
+    lo, hi = width_range
+    candidates = []
+    for i in range(len(pos) - 1):
+        gap = float(pos[i + 1] - pos[i])
+        if lo <= gap <= hi:
+            candidates.append((round(gap, 2), float(min(prom[i], prom[i + 1]))))
+    candidates.sort(key=lambda c: -c[1])
+    info = {"n_wall_peaks": int(len(pos)), "top_candidates": candidates[:top_n]}
+    if not candidates:
+        info["fail"] = f"no wall-pair gap in width_range {width_range}"
+        return [], info
+    widths = sorted({g for g, _conf in candidates})
+    return widths, info
+
+
+def _split_trajectory_legs(cam_xz: np.ndarray, margin: float = 0.0,
+                           min_angle_deg: float = 20.0, min_frac: float = 0.15):
+    """Split a 2D XZ trajectory into two straight legs at its main corner, IF the
+    corner is a real turn — root cause (verified directly against
+    scan2bim/wall_anchor.py on upload_1781521406685): _horizontal_axes(xz,
+    cam_xz) fixes ONE PCA axis/normal over the WHOLE trajectory. On an L-shaped
+    path (~90deg corridor turn, tf~0.77-0.78 here: leg A 77%, leg B 23%) that
+    axis is a compromise skewed toward the majority leg, so the minority leg's
+    points project onto the wrong side of the wall-normal — cam_t (the
+    trajectory-wide median) then lands outside the detected wall span even
+    though a real straddling pair exists on the majority leg alone (measured:
+    wall_positions=[-0.099,0.779] but cam_t=-0.231, same side as both — straddle
+    fails before _choose_scale's candidate-width mapping even runs).
+
+    scan2bim.wall_anchor.estimate_wall_scale's docstring already assumes a
+    single straight corridor (by design) — the fix belongs in the CALLER, which
+    knows about multi-leg paths (it already reuses trajectory_turn_fraction for
+    routing in place_pipe_auto). A near-straight path (turn angle < min_angle_deg)
+    returns None so the caller falls back to its original single whole-path call
+    unchanged (no effect on straight-corridor uploads).
+
+    margin: arclength (recon-local units, same frame as cam_xz — callers pass
+    vext, one ceiling-height, matching the trajectory_radius proximity filter
+    already used for the wall search) by which each leg OVERLAPS past the
+    corner into the other leg's territory: leg A = [0, turn_idx+margin_idx],
+    leg B = [turn_idx-margin_idx, end]. A hard cut exactly at the corner
+    removes the wall-support points immediately around it (real-data finding:
+    leg A hard-cut found only 1 wall vs. the whole path's 2 — the whole path's
+    trajectory_radius filter draws proximity support from BOTH legs near the
+    corner; a hard-cut leg alone loses that). trajectory_radius filtering
+    itself is untouched — the overlap only changes which cam_xz points are fed
+    into it, restoring support on both sides of the corner. Risk: leg B's
+    overlap region could pick up leg A's own wall pair — left to
+    estimate_wall_scale's straddle gate (cam_t must fall strictly between the
+    pair) to reject; verify empirically, don't assume.
+
+    Returns ((leg_a_xz | None, frac_a), (leg_b_xz | None, frac_b), tf,
+    angle_deg, margin_frac) or None if there's no usable turn to split on.
+    frac_a/frac_b are the CORE (unpadded) arclength fractions — used for the
+    majority-leg decision and the min_frac viability check; the returned leg
+    arrays themselves ARE padded by margin. A leg is None (excluded) if its
+    CORE arclength is shorter than min_frac of the total or has too few
+    points (viability is judged on the core split, not inflated by padding)."""
+    from scan2bim.pipe_path import trajectory_turn_fraction
+    xz = np.asarray(cam_xz, dtype=np.float64)
+    if len(xz) < 10:
+        return None
+    tf, ang = trajectory_turn_fraction(xz, min_frac=min_frac)
+    if ang < min_angle_deg:
+        return None
+    arclen = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xz, axis=0), axis=1))])
+    total = float(arclen[-1])
+    if total < 1e-6:
+        return None
+    # trajectory_turn_fraction resamples internally (n_samp=60); tf is a FRACTION
+    # of arclength, so re-locate the corner on the ORIGINAL (unresampled) arclength
+    # rather than assuming index alignment with the resampled curve.
+    turn_idx = int(np.clip(np.searchsorted(arclen, tf * total), 1, len(xz) - 2))
+    frac_a = float(arclen[turn_idx] / total)
+    frac_b = 1.0 - frac_a
+    core_a_ok = frac_a >= min_frac and len(xz[:turn_idx + 1]) >= 5
+    core_b_ok = frac_b >= min_frac and len(xz[turn_idx:]) >= 5
+    if not core_a_ok and not core_b_ok:
+        return None
+
+    margin = max(0.0, float(margin))
+    a_end_idx = int(np.clip(np.searchsorted(arclen, arclen[turn_idx] + margin), turn_idx, len(xz) - 1))
+    b_start_idx = int(np.clip(np.searchsorted(arclen, arclen[turn_idx] - margin), 0, turn_idx))
+    leg_a_out = xz[:a_end_idx + 1] if core_a_ok else None
+    leg_b_out = xz[b_start_idx:] if core_b_ok else None
+    margin_frac = float(margin / total)
+    return (leg_a_out, frac_a), (leg_b_out, frac_b), float(tf), float(ang), margin_frac
+
+
+def _resolve_horizontal_scale(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: float, s_v: float,
+                              corridor_width_hint: float | None = None,
+                              horizontal_scale_override: float | None = None):
+    """Resolve s_h (the horizontal axis-split scale) for place_pipe_auto/
+    place_registered. Two independent escape hatches, in priority order:
+
+    horizontal_scale_override: sets s_h DIRECTLY — compute_wall_anchor() is
+    never called, so estimate_wall_scale/model_corridor_widths never run: no
+    peak-finding, no straddle gate, no _choose_scale. A pure verification
+    override for isolating whether a downstream stage (e.g. apply_axis_split_
+    scale's routing) is itself broken, independent of whether the wall anchor
+    can find a value at all. Distinct from corridor_width_hint, which still
+    runs full detection (peak-finding + straddle gate) with a single candidate
+    width — ceiling-gate review found this upload's blocker is the straddle
+    gate itself (_select_pair, upstream of where a width hint is consumed by
+    _choose_scale), so a hint alone cannot reach past it; the override can.
+    info["source"]="manual_override_bypasses_detection" marks this explicitly,
+    distinct from "manual_hint" (corridor_width_hint) and auto-detected results.
+
+    corridor_width_hint: passed through to compute_wall_anchor() unchanged
+    (see its docstring) — full detection pipeline still runs.
+
+    Neither given: normal compute_wall_anchor() automatic SXX detection.
+    In all cases, s_h falls back to s_v (with fallback_reason) if the wall
+    anchor (or override) doesn't produce a value — override always produces a
+    value by construction, so it never falls back.
+
+    Returns (s_h, fallback_reason, wall_info)."""
+    if horizontal_scale_override is not None:
+        s_h = float(horizontal_scale_override)
+        wall_info = {"source": "manual_override_bypasses_detection",
+                     "horizontal_scale_override": s_h}
+        return s_h, None, wall_info
+    s_wall, wall_info = compute_wall_anchor(Pg, cam_xz, wall_points, vext,
+                                            corridor_width_hint=corridor_width_hint)
+    if s_wall is not None:
+        return s_wall, None, wall_info
+    return s_v, wall_info.get("fail", "wall anchor unavailable"), wall_info
+
+
+def compute_wall_anchor(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: float,
+                        corridor_width_hint: float | None = None):
+    """Full wall-anchor pipeline: model_corridor_widths() (SXX triangle soup ->
+    candidate widths) then wall_scale_anchor() (recon-side match). Always
+    preserves the model-side candidate log (info["top_candidates"]) even when
+    the recon-side match subsequently fails (e.g. anchor-core's straddle
+    enforcement rejects the pair) — callers need that log to judge whether the
+    SOURCE geometry is usable at all, independent of whether THIS PARTICULAR
+    walk matched it (a real gap found reviewing upload_1781521406685: the prior
+    wiring silently dropped the width-candidate log whenever a recon-side match
+    was attempted, even on failure).
+
+    LEG SPLIT: on a real corridor turn (see _split_trajectory_legs), retries
+    estimate_wall_scale per straight leg instead of the whole (possibly bent)
+    path — a single PCA axis over a bent path can put cam_t on the wrong side
+    of an otherwise-valid wall pair. If both legs succeed, the longer
+    (majority) leg wins (more of the corridor actually captured on that leg);
+    if only one succeeds, that one is used; if both fail, falls back exactly
+    like the pre-split single-call path (never crashes — same safety net).
+    A near-straight path skips splitting entirely (info["leg_used"]="whole").
+
+    corridor_width_hint (optional): a single, EXPLICITLY user-verified corridor
+    width in metres — bypasses model_corridor_widths()'s automatic multi-
+    candidate detection entirely. ceiling-gate review (cycles 5-7) found that
+    detection is a structurally underdetermined problem on this upload: one
+    detected recon gap against 5 similarly-plausible model-width candidates has
+    no principled automatic tie-break. A single hint makes the candidate list
+    len==1, so estimate_wall_scale's _choose_scale has no ambiguity to resolve.
+    This is a scalar hint the caller has separately verified against this
+    specific upload, NOT automatic repeated-object global registration — it
+    does not touch the CLAUDE.md invariant against auto-confirming alignment
+    on repeated geometry. None (default): unchanged automatic detection.
+    info["source"]="manual_hint" and info["corridor_width_hint"]=<value> mark
+    this path explicitly so it is never confused with an auto-detected result.
+
+    Returns (s_wall, info); s_wall is None on any failure, info always carries a
+    "fail" key in that case plus whatever diagnostics were available. info also
+    carries "leg_used" ("whole"/"A"/"B"/"none"), and when split was attempted,
+    "turn_fraction"/"turn_angle_deg"/"leg_margin_frac". margin=vext (one
+    ceiling-height, arclength units) is passed to _split_trajectory_legs so
+    each leg overlaps the corner rather than being hard-cut there."""
+    if corridor_width_hint is not None:
+        widths = [float(corridor_width_hint)]
+        widths_info = {"source": "manual_hint", "corridor_width_hint": float(corridor_width_hint)}
+    else:
+        if wall_points is None or not len(wall_points):
+            return None, {"fail": "wall_points not provided"}
+        widths, widths_info = model_corridor_widths(wall_points, is_triangle_soup=True)
+        if not widths:
+            return None, widths_info
+
+    legs = _split_trajectory_legs(cam_xz, margin=vext)
+    if legs is None:
+        s_wall, recon_info = wall_scale_anchor(Pg, cam_xz, widths, vext)
+        info = dict(widths_info)
+        info["recon_match"] = recon_info
+        info["leg_used"] = "whole"
+        if s_wall is None and "fail" not in info:
+            info["fail"] = recon_info.get("fail", "recon-side wall match failed")
+        return s_wall, info
+
+    (leg_a, frac_a), (leg_b, frac_b), tf, ang, margin_frac = legs
+    s_a, info_a = (wall_scale_anchor(Pg, leg_a, widths, vext) if leg_a is not None
+                   else (None, {"fail": "leg shorter than min_frac"}))
+    s_b, info_b = (wall_scale_anchor(Pg, leg_b, widths, vext) if leg_b is not None
+                   else (None, {"fail": "leg shorter than min_frac"}))
+
+    info = dict(widths_info)
+    info["turn_fraction"] = round(tf, 3)
+    info["turn_angle_deg"] = round(ang, 1)
+    info["leg_margin_frac"] = round(margin_frac, 4)
+    info["leg_a"] = {"arclength_frac": round(frac_a, 3), "match": info_a}
+    info["leg_b"] = {"arclength_frac": round(frac_b, 3), "match": info_b}
+
+    if s_a is not None and s_b is not None:
+        # both straddle a wall pair: prefer the majority (longer) leg
+        s_wall, chosen, leg_used = (s_a, info_a, "A") if frac_a >= frac_b else (s_b, info_b, "B")
+    elif s_a is not None:
+        s_wall, chosen, leg_used = s_a, info_a, "A"
+    elif s_b is not None:
+        s_wall, chosen, leg_used = s_b, info_b, "B"
+    else:
+        s_wall, chosen, leg_used = None, None, "none"
+
+    info["leg_used"] = leg_used
+    info["recon_match"] = chosen if chosen is not None else {"fail": "both legs failed"}
+    if s_wall is None and "fail" not in info:
+        info["fail"] = "both legs failed to find a straddling wall pair"
+    return s_wall, info
+
+
+def wall_scale_anchor(Pg: np.ndarray, cam_xz: np.ndarray, widths: list,
+                      vext: float):
+    """Corridor-width metric-scale anchor: hands off to
+    scan2bim.wall_anchor.estimate_wall_scale with trajectory_radius=vext (one
+    ceiling-height — the module now internalizes this proximity prefilter and
+    straddle-enforces the wall pair; this function used to do the radius
+    filtering itself via an external cKDTree query, now removed to avoid
+    duplicating anchor-core's own implementation, per their finalized API)."""
+    from scan2bim.wall_anchor import estimate_wall_scale
+    if not widths:
+        return None, {"fail": "no model corridor widths"}
+    return estimate_wall_scale(Pg, widths, cam_xz=cam_xz, trajectory_radius=vext)
+
+
 def _icp_rigid(src, dst, tree, s, R, t, iters=30):
     """Rigid ICP at FIXED scale s — refine R,t only (Kabsch). Scale comes from the
     robust vertical/ceiling-height anchor, NOT horizontal ceiling matching which is
@@ -272,10 +565,24 @@ def place_gravity(poses, scan_pts, bbox, scale=1.0):
              "u": [round(float(x), 4) for x in U[i]]} for i in range(len(C))]
 
 
-def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
+def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, wall_points=None,
+                     corridor_width_hint=None, horizontal_scale_override=None):
     """Real registration: gravity-align scan, then register its CEILING band to
     the model ceiling (grid XY + yaw + scale + Umeyama-ICP). Returns placed
-    poses + fit metrics. (Footage looks up → ceiling-to-ceiling locks well.)"""
+    poses + fit metrics. (Footage looks up → ceiling-to-ceiling locks well.)
+    wall_points (optional): SXX (structure) triangle-soup vertices -> adds the
+    corridor-width anchor (wall_scale_anchor) to the metric-scale fusion, applied
+    AXIS-SPLIT (diag(s_h,s_v,s_h) via scan2bim.metric_scale.apply_axis_split_scale)
+    since monocular recon compresses the two horizontal axes more than the
+    vertical one (same finding/fix as place_pipe_auto — see its docstring). None
+    (default) keeps the prior isotropic 2-anchor (ceiling+camera) behavior
+    unchanged: s_h falls back to s_v, so apply_axis_split_scale(s_h=s_v,s_v=s_v)
+    degenerates to the old uniform scale exactly.
+    corridor_width_hint (optional): see compute_wall_anchor() — bypasses
+    automatic corridor-width detection with a single verified value.
+    horizontal_scale_override (optional): see _resolve_horizontal_scale() —
+    sets s_h directly, bypassing compute_wall_anchor() entirely (no detection,
+    no straddle gate). Takes priority over corridor_width_hint."""
     from scipy.spatial import cKDTree
     centers, fwd, up = [], [], []
     for p in poses:
@@ -289,26 +596,35 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
     # 복도가 일치. proper rotation만으론 거울차이를 못 메움(평행배관 천장은 대칭이라
     # inlier는 높아도 궤적 회전이 뒤집힘 → "영상 좌회전=모델 우회전"+벽 통과).
     Pg[:, 0] *= -1.0; Cg[:, 0] *= -1.0; Fg[:, 0] *= -1.0; Ug[:, 0] *= -1.0
-    Sc = Pg[Pg[:, 1] >= np.percentile(Pg[:, 1], 55)]
-    sc = Sc[np.linspace(0, len(Sc) - 1, min(2500, len(Sc))).astype(int)]; scan_c = sc.mean(0)
-    tree = cKDTree(model_ceiling)
     lo, hi = np.array(bbox[0]), np.array(bbox[1])
     yc = float(np.percentile(model_ceiling[:, 1], 50))
 
-    # METRIC scale from TWO independent anchors, fused: (1) VERTICAL ceiling-height
+    # METRIC scale from TWO independent VERTICAL anchors, fused: (1) ceiling-height
     # ratio — robust because looking up captures floor↔ceiling extent well, but
     # silently over/under-shoots if the scan doesn't capture the full span; (2)
     # assumed camera-carry height vs the recon's own camera-to-floor distance,
-    # unaffected by ceiling capture completeness. Horizontal ceiling matching is
-    # ambiguous on repeated geometry (it collapsed to 0.409 → 3.6 m phantom walk),
-    # so scale never comes from that.
-    from scan2bim.metric_scale import bbox_height_warning, camera_height_scale, estimate_floor_level, fuse_scale_estimates
+    # unaffected by ceiling capture completeness. Plus a HORIZONTAL corridor-width
+    # anchor (straddle-forced wall pair) for s_h — see apply_axis_split_scale.
+    from scan2bim.metric_scale import (
+        apply_axis_split_scale, bbox_height_warning, camera_height_scale, estimate_floor_level, fuse_scale_estimates,
+    )
     vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
     s_vert = float((hi[1] - lo[1]) / max(vext, 1e-6))
     floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
-    s_m, scale_info = fuse_scale_estimates([s_vert, s_cam])
+    s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])
+    s_h, fallback_reason, wall_info = _resolve_horizontal_scale(
+        Pg, Cg[:, [0, 2]], wall_points, vext, s_v,
+        corridor_width_hint=corridor_width_hint, horizontal_scale_override=horizontal_scale_override)
+    scale_info = {"s_v": round(s_v, 4), "s_h": round(s_h, 4), "s_v_anchors": s_v_info,
+                  "wall_anchor": wall_info, "fallback_reason": fallback_reason}
     bbox_warn = bbox_height_warning(float(hi[1] - lo[1]))
+
+    poses_s, Pg = apply_axis_split_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, s_h=s_h, s_v=s_v)
+    Cg, Fg, Ug = poses_s["c"], poses_s["f"], poses_s["u"]   # now metric — ICP band below is isotropic refinement only
+    Sc = Pg[Pg[:, 1] >= np.percentile(Pg[:, 1], 55)]
+    sc = Sc[np.linspace(0, len(Sc) - 1, min(2500, len(Sc))).astype(int)]; scan_c = sc.mean(0)
+    tree = cKDTree(model_ceiling)
 
     # camera WALK direction (gravity-aligned, horizontal) vs model PIPE direction
     # — pins yaw so the 3D path follows pipes (the video walks straight along them).
@@ -333,7 +649,7 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
         gz = np.linspace(lo[2] + 2, hi[2] - 2, 9)
 
     best = None
-    for s in (s_m * 0.92, s_m, s_m * 1.08):   # narrow band around fused metric anchor
+    for s in (0.92, 1.0, 1.08):   # Cg/Pg are already axis-split metric — narrow isotropic refinement only
         for yaw in range(0, 360, 15):
             R = Ry(yaw)
             align = abs(float(np.cos(np.deg2rad(a_s + yaw - a_p))))  # 1=traj∥pipes
@@ -355,8 +671,12 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None):
     pose_json = [{"c": [round(float(x), 3) for x in Ct[i]], "f": [round(float(x), 4) for x in Ft[i]],
                   "u": [round(float(x), 4) for x in Ut[i]]} for i in range(len(Ct))]
     info = {"inlier": round(float(inl2), 3), "rmse": round(float(rmse), 3),
+            # NOTE: "scale" is now the residual isotropic ICP refinement around 1.0
+            # (Cg/Pg were already axis-split scaled above) — it is NOT the total
+            # effective scale like it was pre-axis-split. Use s_v/s_h for that.
             "scale": round(float(s2), 3), "yaw": int(yaw),
             "cam_h": round(eye - float(bbox[0][1]), 2),
+            "s_v": round(s_v, 4), "s_h": round(s_h, 4), "fallback_reason": fallback_reason,
             "scale_anchors": scale_info}
     if bbox_warn:
         info["warning"] = bbox_warn
@@ -438,36 +758,60 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
                        "path_m": round(plen, 2), "cam_h": round(eye - float(bbox[0][1]), 2)}
 
 
-def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=None):
-    """완전 자동 배관추종 배치: lane(메인런) + METRIC 스케일(천장높이+카메라높이 두 앵커 융합,
-    robust) + 코너(B1 turn-fraction) + recon 형상. 수동 waypoint 없이 metric 길이로 배치.
-    핵심: 궤적-런 피팅(런 전체 가정)은 과신장 → 독립 metric 앵커로 실제 보행거리 산출.
-    단일 앵커(천장높이)는 스캔이 전체 층고를 못 담으면 과소/과대산출될 수 있어 카메라높이
-    앵커(가정 눈높이 vs 바닥까지 거리)로 교차검증 — 불일치시 info에 노출(자동 확정 아님).
+def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=None, wall_points=None,
+                    corridor_width_hint=None, horizontal_scale_override=None):
+    """완전 자동 배관추종 배치: lane(메인런) + AXIS-SPLIT METRIC 스케일 + 코너(B1 turn-fraction)
+    + recon 형상. 수동 waypoint 없이 metric 길이로 배치.
+    단안 재구성은 수평(X,Z) 두 축을 수직(Y)보다 추가로 더 압축한다(실측: upload_1781521406685
+    수직 s≈1.75 정확, 수평 필요 s≈3.64 — 단일 등방 스케일로는 회전점·종점이 엉뚱한 곳에 찍힘).
+    그래서 스케일을 축별로 분리한다: 수직 s_v=천장고+카메라높이 2앵커 융합(기존과 동일 로직),
+    수평 s_h=복도폭 벽앵커(straddle 강제, scan2bim.wall_anchor.estimate_wall_scale) — 벽앵커가
+    실패하면(s_wall None) s_h=s_v로 폴백해 기존(axis-split 이전) 동작과 완전히 동일해진다
+    (fallback_reason에 폴백 사유 노출, 자동 확정 아님). scan2bim.metric_scale.
+    apply_axis_split_scale로 diag(s_h,s_v,s_h)를 카메라 궤적/점군에 적용한 뒤(f/u 재정규화·
+    재직교화 완료 상태) 이후 코너 라우팅은 이미 metric인 궤적 위에서 계산한다.
     fit_run=True: 세그먼트 길이를 FXX 런 실측 기하에 스냅(metric 스케일이 단안 모호성으로
     과소산출될 때). 방향·분기선택은 recon 유지, 길이만 모델 기준 — 코리더 전 구간을 걸은 경우.
-    duration(초, 실제 영상 길이): 주어지면 산출 경로장/속도가 비현실적일 때 경고."""
+    duration(초, 실제 영상 길이): 주어지면 산출 경로장/속도가 비현실적일 때 경고.
+    wall_points(선택): SXX(구조) 삼각형 정점 -> 복도폭 벽앵커 재료. None(기본)이면 s_h=s_v
+    폴백만 발생 — 즉 axis-split 이전과 동일한 등방 스케일 동작(회귀 없음).
+    corridor_width_hint(선택): compute_wall_anchor() 참조 — 자동 복도폭 검출을
+    사용자가 검증한 단일값으로 우회(길이 1 후보라 모호성 자체가 없음).
+    horizontal_scale_override(선택): _resolve_horizontal_scale() 참조 — s_h를
+    직접 대입해 compute_wall_anchor() 자체를 생략(검출/straddle 게이트 미관여).
+    corridor_width_hint보다 우선."""
     from scan2bim.metric_scale import (
-        bbox_height_warning, camera_height_scale, estimate_floor_level, fuse_scale_estimates, speed_warning,
+        apply_axis_split_scale, bbox_height_warning, camera_height_scale, estimate_floor_level,
+        fuse_scale_estimates, speed_warning,
     )
     from scan2bim.pipe_path import main_pipe_run_L, trajectory_turn_fraction
-    vp = [viewer_pose(p) for p in poses]
-    cen = np.array([v[0] for v in vp]); up_v = np.array([v[2] for v in vp])
-    g = up_v.mean(0); g /= (np.linalg.norm(g) + 1e-9)
+    centers, fwd, up = [], [], []
+    for p in poses:
+        c, f, u = viewer_pose(p); centers.append(c); fwd.append(f); up.append(u)
+    centers = np.array(centers); fwd = np.array(fwd); up = np.array(up)
+    g = up.mean(0); g /= (np.linalg.norm(g) + 1e-9)
     Rg = _rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
-    Cg = cen @ Rg.T
+    Cg = centers @ Rg.T; Fg = fwd @ Rg.T; Ug = up @ Rg.T
     P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0; Pg = P @ Rg.T
     vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
     s_vert = float((bbox[1][1] - bbox[0][1]) / max(vext, 1e-6))     # 천장높이 metric 스케일
     bbox_warn = bbox_height_warning(float(bbox[1][1] - bbox[0][1]))
     floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
-    s_m, scale_info = fuse_scale_estimates([s_vert, s_cam])
-    traj = Cg[:, [0, 2]]
+    s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])           # 수직: 천장고+카메라높이 (기존 2앵커)
+    s_h, fallback_reason, wall_info = _resolve_horizontal_scale(     # 수평: straddle 강제 벽앵커 (또는 오버라이드)
+        Pg, Cg[:, [0, 2]], wall_points, vext, s_v,
+        corridor_width_hint=corridor_width_hint, horizontal_scale_override=horizontal_scale_override)
+    scale_info = {"s_v": round(s_v, 4), "s_h": round(s_h, 4), "s_v_anchors": s_v_info,
+                  "wall_anchor": wall_info, "fallback_reason": fallback_reason}
+
+    poses_s, Pg_s = apply_axis_split_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, s_h=s_h, s_v=s_v)
+    traj = poses_s["c"][:, [0, 2]]        # 이미 axis-split metric 스케일 적용된 궤적
     tf, tang = trajectory_turn_fraction(traj)
-    total = float(np.linalg.norm(np.diff(traj, axis=0), axis=1).sum())
-    L1, L2 = tf * total * s_m, (1 - tf) * total * s_m               # metric 세그먼트 길이
+    total = float(np.linalg.norm(np.diff(traj, axis=0), axis=1).sum())    # 이미 metric
+    L1, L2 = tf * total, (1 - tf) * total                                 # metric 세그먼트 길이
     # recon turn 손잡이 (chirality X-flip 후, 모델 프레임 기준) → 분기 좌/우 선택
+    # (등방 스케일이라 각/부호는 원본과 동일 — metric 궤적으로 통일해 일관성만 취함)
     ti = int(np.clip(tf * len(traj), 15, len(traj) - 16))
     d1 = traj[ti] - traj[ti - 15]; d2 = traj[ti + 15] - traj[ti]
     d1f, d2f = np.array([-d1[0], d1[1]]), np.array([-d2[0], d2[1]])   # X반전
@@ -483,11 +827,12 @@ def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=Non
         wps = [(corner + rd * L1).tolist(), corner.tolist(), (corner + bd * L2).tolist()]
     else:
         A, B = poly; d = B - A; d /= (np.linalg.norm(d) + 1e-9)
-        end_len = float(np.linalg.norm(B - A)) if fit_run else total * s_m
+        end_len = float(np.linalg.norm(B - A)) if fit_run else total
         wps = [A.tolist(), (A + d * end_len).tolist()]
     pose_json, info = place_gtpath(poses, scan_pts, bbox, wps, snap=True)
     info["mode"] = "auto-pipe-fitrun" if fit_run else "auto-pipe-metric"
-    info["s_metric"] = round(s_m, 2); info["turn_frac"] = round(tf, 2)
+    info["s_v"] = round(s_v, 4); info["s_h"] = round(s_h, 4); info["turn_frac"] = round(tf, 2)
+    info["fallback_reason"] = fallback_reason
     info["scale_anchors"] = scale_info
     warnings = [w for w in (bbox_warn, speed_warning(info["path_m"], duration)) if w]
     if warnings:
@@ -567,6 +912,14 @@ def main():
     ap.add_argument("--hfov", type=float, default=69.0, help="카메라 수평 FOV(도) — PnP 내부파라미터")
     ap.add_argument("--peer-url", default=None, help="전환 버튼이 열 상대 뷰어 파일명(예: coplay_autopipe.html)")
     ap.add_argument("--duration", type=float, default=35.3)
+    ap.add_argument("--corridor-width-hint", type=float, default=None,
+                    help="단일 사용자 검증 복도폭(m) — 자동 SXX 후보 검출을 완전히 우회해 "
+                         "[hint] 단일 후보로 estimate_wall_scale 호출(모호성 없음, straddle "
+                         "게이트는 여전히 거침). 없으면 기존 자동검출 그대로(회귀 없음)")
+    ap.add_argument("--horizontal-scale-override", type=float, default=None,
+                    help="s_h(수평 axis-split 스케일) 직접 대입 — compute_wall_anchor() 자체를 "
+                         "생략(검출·straddle 게이트 미관여). corridor-width-hint보다 우선하는 "
+                         "순수 검증용 플래그(자동/힌트 결과와 구분 표기됨)")
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
@@ -596,22 +949,37 @@ def main():
     bbox = (allc.min(0).tolist(), allc.max(0).tolist())
     ceil = allc[allc[:, 1] >= (bbox[1][1] - 1.5)]        # top 1.5 m = ceiling band
     ceil = ceil[np.linspace(0, len(ceil) - 1, min(60000, len(ceil))).astype(int)]
+    # SXX(구조) 삼각형 정점 -> 복도폭 앵커 재료(model_corridor_widths, is_triangle_soup=True).
+    # AXX(건축)는 가구위주라 실측 결과 수직스팬>1.5m 삼각형이 0개 — 실제 벽/유리 파티션은 SXX
+    # (Gasan_7F: 9009개). 없으면 None -> 기존 2앵커.
+    sxx_pts_list = [p.astype(np.float64) for p, c in zip(model_pts, model_pts_mdl) if c == "SXX"]
+    wall_points = np.concatenate(sxx_pts_list) if sxx_pts_list else None
 
     if args.demo_html:
         poses, scan_pts = load_demo_cloud(args.demo_html, args.demo_match)
     else:
         poses, scan_pts = fetch_scan(args.base_url, args.upload)
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
+    if args.horizontal_scale_override is not None:
+        print(f"  horizontal_scale_override: {args.horizontal_scale_override} "
+              "(manual_override_bypasses_detection) — compute_wall_anchor() skipped entirely")
+    elif args.corridor_width_hint is not None:
+        print(f"  corridor_width_hint: {args.corridor_width_hint} (manual, verified) "
+              "— bypassing automatic SXX corridor-width detection")
     if args.auto_pipe:
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
-        pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx, fit_run=args.fit_run, duration=args.duration)
+        pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx, fit_run=args.fit_run, duration=args.duration,
+                                             wall_points=wall_points, corridor_width_hint=args.corridor_width_hint,
+                                             horizontal_scale_override=args.horizontal_scale_override)
         print("  auto-pipe(metric):", reginfo)
     elif args.gt_path:
         wps = [[float(v) for v in seg.split(",")] for seg in args.gt_path.split()]
         pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps, snap=(args.gt_mode == "snap"))
         print("  gt-path fit:", reginfo, "waypoints:", wps)
     else:
-        pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox, anchor=anchor)
+        pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox, anchor=anchor, wall_points=wall_points,
+                                              corridor_width_hint=args.corridor_width_hint,
+                                              horizontal_scale_override=args.horizontal_scale_override)
         print("  registration:", reginfo, "anchor:", anchor)
     if args.auto_localize and args.frames_dir:
         pose_json, locinfo = place_autolocalize(pose_json, args.dtdx, args.frames_dir, hfov=args.hfov)
@@ -645,7 +1013,16 @@ def main():
             .replace("__MESHES__", json.dumps(meshes_json))
             .replace("__MODELS__", json.dumps(models_json))
             .replace("__POSES__", json.dumps(pose_json))
-            .replace("__META__", json.dumps({"duration": args.duration}))
+            .replace("__META__", json.dumps({
+                "duration": args.duration,
+                **({"horizontal_scale_override": args.horizontal_scale_override,
+                    "horizontal_scale_override_note": "manual_override_bypasses_detection — "
+                                                       "s_h set directly, no wall-anchor detection ran"}
+                   if args.horizontal_scale_override is not None else {}),
+                **({"corridor_width_hint": args.corridor_width_hint,
+                    "corridor_width_hint_note": "manual, verified — not auto-detected"}
+                   if args.corridor_width_hint is not None and args.horizontal_scale_override is None else {}),
+            }))
             .replace("__MODELNAME__", " + ".join(names))
             .replace("__TRIS__", f"{tris:,}")
             .replace("__NPOSES__", str(len(pose_json)))

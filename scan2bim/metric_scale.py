@@ -37,21 +37,80 @@ def camera_height_scale(cam_y: np.ndarray, floor_y: float, assumed_height: float
 
 def fuse_scale_estimates(estimates: list[float | None], *, disagreement_ratio: float = 1.15) -> tuple[float, dict]:
     """Combine scale estimates from independent anchors. The FIRST estimate is
-    the primary/validated anchor: when the others agree, average them in
-    (cross-validation, mild smoothing); when they disagree, keep the primary
-    unchanged rather than silently dragging it toward an unconfirmed anchor —
-    a lone secondary anchor can itself be wrong (e.g. floor rarely visible in
-    upward-looking footage), so disagreement should surface as a warning for
-    review, not quietly change the result. disagreement_ratio: max/min above
-    which anchors are flagged as disagreeing."""
+    the primary/validated anchor: when they all agree, average them in
+    (cross-validation, mild smoothing).
+
+    On disagreement the tie-break depends on how many anchors we have:
+    - With only two, there is no majority — keep the primary unchanged rather than
+      let a lone unconfirmed secondary drag it (e.g. floor rarely visible looking up).
+    - With three or more, trust a MAJORITY consensus over the primary: if a subset
+      that mutually agrees forms a majority, use its median. This is what the
+      independent corridor-width anchor buys — when the two robust anchors (wall +
+      camera) agree at ~3x but the fragile ceiling primary undershoots at ~1x, the
+      consensus should win instead of the primary silently keeping the wrong scale.
+    - If no such majority exists (all mutually disagree), stay conservative and keep
+      the primary rather than pick an arbitrary outlier.
+
+    disagreement_ratio: max/min above which anchors are flagged as disagreeing."""
     vals = [float(v) for v in estimates if v is not None and np.isfinite(v) and v > 0]
     if not vals:
         raise ValueError("no valid scale estimates")
-    spread = max(vals) / min(vals) if len(vals) > 1 else 1.0
+    n = len(vals)
+    spread = max(vals) / min(vals) if n > 1 else 1.0
     agree = spread <= disagreement_ratio
-    fused = float(np.median(vals)) if agree else vals[0]
-    return fused, {"n": len(vals), "values": [round(v, 4) for v in vals],
+    if agree:
+        fused = float(np.median(vals))
+    elif n <= 2:
+        fused = vals[0]
+    else:
+        s = sorted(vals)
+        lo = hi = 0                                  # widest mutually-agreeing window
+        for a in range(n):
+            b = a
+            while b + 1 < n and s[b + 1] / s[a] <= disagreement_ratio:
+                b += 1
+            if (b - a) > (hi - lo):
+                lo, hi = a, b
+        window = s[lo:hi + 1]
+        fused = float(np.median(window)) if len(window) > n / 2 else vals[0]
+    return fused, {"n": n, "values": [round(v, 4) for v in vals],
                    "spread": round(spread, 3), "agree": agree}
+
+
+def apply_axis_split_scale(poses_yup: dict, pts_yup: np.ndarray, s_h: float, s_v: float):
+    """Apply an anisotropic diag(s_h, s_v, s_h) scale in the gravity-aligned Y-up
+    frame to the camera poses and the scan cloud.
+
+    Monocular recon compresses the two HORIZONTAL axes noticeably more than the
+    vertical one, so a single isotropic scale cannot place the path metrically: the
+    horizontal scale (from the corridor-width anchor) and the vertical scale (from
+    the ceiling-height anchor) must be applied on their own axes.
+
+    A non-uniform scale does NOT preserve directions, so after scaling the forward
+    and up vectors they are re-normalised and re-orthogonalised. `up` is kept as the
+    anchor — it stays near-vertical, so the horizon stays level — and `forward` is
+    made perpendicular to it. Anchoring on up also preserves forward's horizontal
+    heading (its X and Z both scale by s_h, so its XZ azimuth is unchanged), so the
+    look direction still follows the horizontally-scaled path. If forward is
+    (near-)parallel to up (looking straight up/down) only re-normalisation is done.
+
+    poses_yup: dict {"c": (N,3), "f": (N,3), "u": (N,3)} of centres / forward / up
+        unit vectors in the gravity-aligned frame.
+    pts_yup: (M,3) scan cloud in the same frame.
+    Returns (poses_scaled, pts_scaled); poses_scaled has the same {"c","f","u"} keys
+    (same structure as the input) and pts_scaled is the scaled (M,3) cloud."""
+    d = np.array([s_h, s_v, s_h], dtype=np.float64)
+    c = np.asarray(poses_yup["c"], dtype=np.float64) * d
+    f = np.asarray(poses_yup["f"], dtype=np.float64) * d
+    u = np.asarray(poses_yup["u"], dtype=np.float64) * d
+    u = u / (np.linalg.norm(u, axis=1, keepdims=True) + 1e-12)
+    f_perp = f - np.sum(f * u, axis=1, keepdims=True) * u    # Gram-Schmidt against up
+    nrm = np.linalg.norm(f_perp, axis=1, keepdims=True)
+    f_out = np.where(nrm < 1e-9, f, f_perp)                  # parallel -> keep scaled f
+    f_out = f_out / (np.linalg.norm(f_out, axis=1, keepdims=True) + 1e-12)
+    poses_scaled = {"c": c, "f": f_out, "u": u}
+    pts_scaled = np.asarray(pts_yup, dtype=np.float64) * d
+    return poses_scaled, pts_scaled
 
 
 def bbox_height_warning(height_m: float, lo: float = 2.0) -> str | None:
@@ -67,9 +126,15 @@ def bbox_height_warning(height_m: float, lo: float = 2.0) -> str | None:
     return None
 
 
-def speed_warning(path_m: float, duration_s: float | None, lo: float = 0.15, hi: float = 2.0) -> str | None:
+def speed_warning(path_m: float, duration_s: float | None, lo: float = 0.5, hi: float = 2.0) -> str | None:
     """Flag an implausible average walking speed (path length / video duration) —
-    a cheap cross-check that catches gross scale errors in either direction."""
+    a cheap cross-check that catches gross scale errors in either direction.
+
+    lo assumes near-continuous walking (a survey walk-through, not a static
+    inspection): normal gait is ~0.9-1.4 m/s, so an average below ~0.5 m/s over
+    the whole clip signals the path was reconstructed too short — exactly the ~3x
+    monocular under-scale seen on real data (10.53 m / 35.3 s = 0.30 m/s warns,
+    while a metrically correct 32.8 m / 35.3 s = 0.93 m/s does not)."""
     if not duration_s or duration_s <= 0:
         return None
     speed = path_m / duration_s
