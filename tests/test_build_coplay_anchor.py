@@ -113,6 +113,138 @@ def _furniture_triangles(x0: float, z_range: tuple, y0: float = 0.4, span: float
     return np.array(tris, dtype=np.float64).reshape(-1, 3)
 
 
+def _l_shaped_recon(width_a: float, width_b: float, len_a: float, len_b: float, height: float,
+                    eye: float, n_a: int = 60, n_b: int = 20, seed: int = 0):
+    """Recon-side L-path: leg A straight along +Z at X=0 (walls at X=+-width_a/2,
+    Z in [0,len_a]), turns ~90deg at (0,len_a), leg B straight along +X at
+    Z=len_a (walls at Z=len_a+-width_b/2, X in [0,len_b]) — the same shape as
+    the real red-baseline upload (majority leg A, minority leg B), used to
+    reproduce the root cause: a single whole-path PCA axis mixes both legs'
+    wall orientations and can fail to straddle even though each leg alone has a
+    valid, findable pair. Returns (poses, scan_pts)."""
+    def _wall(fixed_axis, fixed_val, span, height, n, noise, seed):
+        r = np.random.RandomState(seed)
+        a = r.uniform(0, span, n); y = r.uniform(0, height, n); off = r.normal(0, noise, n)
+        if fixed_axis == "x":
+            return np.column_stack([fixed_val + off, y, a])
+        return np.column_stack([a, y, fixed_val + off])
+    n_wall = 3000
+    leg_a_walls = np.vstack([_wall("x", -width_a / 2, len_a, height, n_wall, 0.01, seed + 1),
+                             _wall("x", width_a / 2, len_a, height, n_wall, 0.01, seed + 2)])
+    leg_b_walls = np.vstack([_wall("z", len_a - width_b / 2, len_b, height, n_wall, 0.01, seed + 3),
+                             _wall("z", len_a + width_b / 2, len_b, height, n_wall, 0.01, seed + 4)])
+    cloud = np.vstack([leg_a_walls, leg_b_walls])
+    scan_pts = cloud.copy()
+    scan_pts[:, 1] *= -1.0
+    scan_pts[:, 2] *= -1.0
+    zs_a = np.linspace(1.0, len_a - 1.0, n_a)
+    pos_a = np.column_stack([np.zeros(n_a), np.full(n_a, eye), zs_a])
+    xs_b = np.linspace(1.0, len_b - 1.0, n_b)
+    pos_b = np.column_stack([xs_b, np.full(n_b, eye), np.full(n_b, len_a)])
+    centers = np.vstack([pos_a, pos_b])
+    fwd = np.vstack([np.tile([0.0, 0.0, 1.0], (n_a, 1)), np.tile([1.0, 0.0, 0.0], (n_b, 1))])
+    up = np.tile([0.0, 1.0, 0.0], (n_a + n_b, 1))
+    poses = np.array([_encode_pose(c, f, u) for c, f, u in zip(centers, fwd, up)])
+    return poses, scan_pts
+
+
+class TestLegSplitAxisSkew(unittest.TestCase):
+    """Root cause (confirmed against real data, PM-verified): _horizontal_axes
+    fixes ONE PCA axis over the WHOLE trajectory; on an L-shaped path the
+    minority leg's points project onto the wrong side of that axis, so cam_t
+    (a whole-trajectory median) can fall outside an otherwise-valid wall pair.
+    compute_wall_anchor() now splits at the main corner (scan2bim.pipe_path.
+    trajectory_turn_fraction) and retries per leg, preferring the majority leg."""
+
+    def test_l_shaped_path_leg_split_recovers_correct_scale(self):
+        GT = 2.0
+        width_a, width_b, len_a, len_b, height = 2.4, 3.6, 10.0, 3.0, 3.0
+        left = _wall_mesh_triangles(-width_a / 2, (0, len_a), height, seed=11)
+        right = _wall_mesh_triangles(width_a / 2, (0, len_a), height, seed=12)
+        far1 = _wall_mesh_triangles(-width_b / 2, (0, len_b), height, seed=13)
+        far2 = _wall_mesh_triangles(width_b / 2, (0, len_b), height, seed=14)
+        wall_points = np.concatenate([left, right, far1, far2], axis=0)
+        poses, scan_pts = _l_shaped_recon(width_a / GT, width_b / GT, len_a / GT, len_b / GT,
+                                          height / GT, 1.5 / GT)
+
+        vp = [bc.viewer_pose(p) for p in poses]
+        centers = np.array([v[0] for v in vp]); up_v = np.array([v[2] for v in vp])
+        g = up_v.mean(0); g /= np.linalg.norm(g) + 1e-9
+        Rg = bc._rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
+        Cg = centers @ Rg.T
+        P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0
+        Pg = P @ Rg.T
+        cam_xz = Cg[:, [0, 2]]
+        vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
+
+        # whole-path (no leg split) reproduces the failure mode: a single axis
+        # across both legs' orientations finds no usable wall density peaks.
+        widths, _ = bc.model_corridor_widths(wall_points, is_triangle_soup=True)
+        s_whole, info_whole = bc.wall_scale_anchor(Pg, cam_xz, widths, vext)
+        self.assertIsNone(s_whole, "test setup should reproduce the whole-path failure")
+
+        s_wall, info = bc.compute_wall_anchor(Pg, cam_xz, wall_points, vext)
+        self.assertIsNotNone(s_wall, info)
+        self.assertEqual(info["leg_used"], "A")   # majority leg (len_a > len_b)
+        self.assertAlmostEqual(s_wall, GT, delta=GT * 0.1)
+        self.assertIn("turn_fraction", info)
+        self.assertIn("turn_angle_deg", info)
+        self.assertIn("leg_a", info)
+        self.assertIn("leg_b", info)
+
+    def test_straight_path_skips_split_regression(self):
+        """A near-straight corridor must NOT be split — identical result to the
+        pre-leg-split single whole-path call (info["leg_used"]=="whole")."""
+        left = _wall_mesh_triangles(-MODEL_WIDTH / 2, (0, MODEL_LEN), MODEL_HEIGHT, seed=1)
+        right = _wall_mesh_triangles(MODEL_WIDTH / 2, (0, MODEL_LEN), MODEL_HEIGHT, seed=2)
+        wall_points = np.concatenate([left, right], axis=0)
+        recon_eye = 1.5 / GT_SCALE
+        poses, scan_pts = _synthetic_recon(MODEL_WIDTH / GT_SCALE, MODEL_HEIGHT / GT_SCALE,
+                                           MODEL_LEN / GT_SCALE, recon_eye)
+
+        vp = [bc.viewer_pose(p) for p in poses]
+        centers = np.array([v[0] for v in vp]); up_v = np.array([v[2] for v in vp])
+        g = up_v.mean(0); g /= np.linalg.norm(g) + 1e-9
+        Rg = bc._rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
+        Cg = centers @ Rg.T
+        P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0
+        Pg = P @ Rg.T
+        cam_xz = Cg[:, [0, 2]]
+        self.assertIsNone(bc._split_trajectory_legs(cam_xz), "a straight path must not split")
+        vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
+
+        s_split, info_split = bc.compute_wall_anchor(Pg, cam_xz, wall_points, vext)
+        s_direct, info_direct = bc.wall_scale_anchor(
+            Pg, cam_xz, bc.model_corridor_widths(wall_points, is_triangle_soup=True)[0], vext)
+        self.assertEqual(info_split["leg_used"], "whole")
+        self.assertEqual(s_split, s_direct)   # byte-identical to the pre-split single call
+
+    def test_both_legs_fail_falls_back_safely(self):
+        """Neither leg finds a usable wall pair (no walls at all in the model) —
+        must fall back exactly like the pre-split code (None, no crash)."""
+        width_a, width_b, len_a, len_b, height = 2.4, 3.6, 10.0, 3.0, 3.0
+        rng = np.random.RandomState(5)
+        open_space = np.column_stack([
+            rng.uniform(-3.0, 3.0, 3000), rng.uniform(0.0, height, 3000), rng.uniform(0.0, 12.0, 3000),
+        ])
+        GT = 2.0
+        poses, scan_pts = _l_shaped_recon(width_a / GT, width_b / GT, len_a / GT, len_b / GT,
+                                          height / GT, 1.5 / GT)
+        vp = [bc.viewer_pose(p) for p in poses]
+        centers = np.array([v[0] for v in vp]); up_v = np.array([v[2] for v in vp])
+        g = up_v.mean(0); g /= np.linalg.norm(g) + 1e-9
+        Rg = bc._rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
+        Cg = centers @ Rg.T
+        P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0
+        Pg = P @ Rg.T
+        cam_xz = Cg[:, [0, 2]]
+        vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
+
+        s_wall, info = bc.compute_wall_anchor(Pg, cam_xz, open_space, vext)
+        self.assertIsNone(s_wall)
+        self.assertIn("fail", info)
+
+
 class TestThreeAnchorFusionPath(unittest.TestCase):
     def test_synthetic_model_and_recon_agree_on_ground_truth_scale(self):
         left = _wall_mesh_triangles(-MODEL_WIDTH / 2, (0, MODEL_LEN), MODEL_HEIGHT, seed=1)

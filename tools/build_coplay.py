@@ -291,6 +291,54 @@ def model_corridor_widths(points: np.ndarray, *, is_triangle_soup: bool = False,
     return widths, info
 
 
+def _split_trajectory_legs(cam_xz: np.ndarray, min_angle_deg: float = 20.0, min_frac: float = 0.15):
+    """Split a 2D XZ trajectory into two straight legs at its main corner, IF the
+    corner is a real turn — root cause (verified directly against
+    scan2bim/wall_anchor.py on upload_1781521406685): _horizontal_axes(xz,
+    cam_xz) fixes ONE PCA axis/normal over the WHOLE trajectory. On an L-shaped
+    path (~90deg corridor turn, tf~0.77-0.78 here: leg A 77%, leg B 23%) that
+    axis is a compromise skewed toward the majority leg, so the minority leg's
+    points project onto the wrong side of the wall-normal — cam_t (the
+    trajectory-wide median) then lands outside the detected wall span even
+    though a real straddling pair exists on the majority leg alone (measured:
+    wall_positions=[-0.099,0.779] but cam_t=-0.231, same side as both — straddle
+    fails before _choose_scale's candidate-width mapping even runs).
+
+    scan2bim.wall_anchor.estimate_wall_scale's docstring already assumes a
+    single straight corridor (by design) — the fix belongs in the CALLER, which
+    knows about multi-leg paths (it already reuses trajectory_turn_fraction for
+    routing in place_pipe_auto). A near-straight path (turn angle < min_angle_deg)
+    returns None so the caller falls back to its original single whole-path call
+    unchanged (no effect on straight-corridor uploads).
+
+    Returns ((leg_a_xz | None, frac_a), (leg_b_xz | None, frac_b), tf, angle_deg)
+    or None if there's no usable turn to split on. A leg is None (excluded) if
+    it's shorter than min_frac of the total arclength or has too few points."""
+    from scan2bim.pipe_path import trajectory_turn_fraction
+    xz = np.asarray(cam_xz, dtype=np.float64)
+    if len(xz) < 10:
+        return None
+    tf, ang = trajectory_turn_fraction(xz, min_frac=min_frac)
+    if ang < min_angle_deg:
+        return None
+    arclen = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xz, axis=0), axis=1))])
+    total = float(arclen[-1])
+    if total < 1e-6:
+        return None
+    # trajectory_turn_fraction resamples internally (n_samp=60); tf is a FRACTION
+    # of arclength, so re-locate the corner on the ORIGINAL (unresampled) arclength
+    # rather than assuming index alignment with the resampled curve.
+    turn_idx = int(np.clip(np.searchsorted(arclen, tf * total), 1, len(xz) - 2))
+    leg_a, leg_b = xz[:turn_idx + 1], xz[turn_idx:]
+    frac_a = float(arclen[turn_idx] / total)
+    frac_b = 1.0 - frac_a
+    leg_a_out = leg_a if (frac_a >= min_frac and len(leg_a) >= 5) else None
+    leg_b_out = leg_b if (frac_b >= min_frac and len(leg_b) >= 5) else None
+    if leg_a_out is None and leg_b_out is None:
+        return None
+    return (leg_a_out, frac_a), (leg_b_out, frac_b), float(tf), float(ang)
+
+
 def compute_wall_anchor(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: float):
     """Full wall-anchor pipeline: model_corridor_widths() (SXX triangle soup ->
     candidate widths) then wall_scale_anchor() (recon-side match). Always
@@ -301,18 +349,62 @@ def compute_wall_anchor(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: f
     walk matched it (a real gap found reviewing upload_1781521406685: the prior
     wiring silently dropped the width-candidate log whenever a recon-side match
     was attempted, even on failure).
+
+    LEG SPLIT: on a real corridor turn (see _split_trajectory_legs), retries
+    estimate_wall_scale per straight leg instead of the whole (possibly bent)
+    path — a single PCA axis over a bent path can put cam_t on the wrong side
+    of an otherwise-valid wall pair. If both legs succeed, the longer
+    (majority) leg wins (more of the corridor actually captured on that leg);
+    if only one succeeds, that one is used; if both fail, falls back exactly
+    like the pre-split single-call path (never crashes — same safety net).
+    A near-straight path skips splitting entirely (info["leg_used"]="whole").
+
     Returns (s_wall, info); s_wall is None on any failure, info always carries a
-    "fail" key in that case plus whatever diagnostics were available."""
+    "fail" key in that case plus whatever diagnostics were available. info also
+    carries "leg_used" ("whole"/"A"/"B"/"none"), and when split was attempted,
+    "turn_fraction"/"turn_angle_deg"."""
     if wall_points is None or not len(wall_points):
         return None, {"fail": "wall_points not provided"}
     widths, widths_info = model_corridor_widths(wall_points, is_triangle_soup=True)
     if not widths:
         return None, widths_info
-    s_wall, recon_info = wall_scale_anchor(Pg, cam_xz, widths, vext)
+
+    legs = _split_trajectory_legs(cam_xz)
+    if legs is None:
+        s_wall, recon_info = wall_scale_anchor(Pg, cam_xz, widths, vext)
+        info = dict(widths_info)
+        info["recon_match"] = recon_info
+        info["leg_used"] = "whole"
+        if s_wall is None and "fail" not in info:
+            info["fail"] = recon_info.get("fail", "recon-side wall match failed")
+        return s_wall, info
+
+    (leg_a, frac_a), (leg_b, frac_b), tf, ang = legs
+    s_a, info_a = (wall_scale_anchor(Pg, leg_a, widths, vext) if leg_a is not None
+                   else (None, {"fail": "leg shorter than min_frac"}))
+    s_b, info_b = (wall_scale_anchor(Pg, leg_b, widths, vext) if leg_b is not None
+                   else (None, {"fail": "leg shorter than min_frac"}))
+
     info = dict(widths_info)
-    info["recon_match"] = recon_info
+    info["turn_fraction"] = round(tf, 3)
+    info["turn_angle_deg"] = round(ang, 1)
+    info["leg_a"] = {"arclength_frac": round(frac_a, 3), "match": info_a}
+    info["leg_b"] = {"arclength_frac": round(frac_b, 3), "match": info_b}
+
+    if s_a is not None and s_b is not None:
+        # both straddle a wall pair: prefer the majority (longer) leg
+        s_wall, chosen, leg_used = (s_a, info_a, "A") if frac_a >= frac_b else (s_b, info_b, "B")
+    elif s_a is not None:
+        s_wall, chosen, leg_used = s_a, info_a, "A"
+    elif s_b is not None:
+        s_wall, chosen, leg_used = s_b, info_b, "B"
+    else:
+        s_wall, chosen, leg_used = None, None, "none"
+
+    info["leg_used"] = leg_used
+    info["recon_match"] = chosen if chosen is not None else {"fail": "both legs failed"}
     if s_wall is None and "fail" not in info:
-        info["fail"] = recon_info.get("fail", "recon-side wall match failed")
+        info["fail"] = "both legs failed to find a straddling wall pair"
     return s_wall, info
 
 
