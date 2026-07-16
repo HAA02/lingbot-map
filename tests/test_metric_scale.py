@@ -86,6 +86,40 @@ class TestSpeedWarning(unittest.TestCase):
     def test_no_duration_skips_check(self):
         self.assertIsNone(speed_warning(path_m=999.0, duration_s=None))
 
+    def test_real_underscaled_walk_warns(self):
+        # upload_1781521406685: 10.53 m / 35.3 s = 0.298 m/s — the ~3x scale
+        # under-estimate we are trying to catch. Must surface a warning.
+        w = speed_warning(path_m=10.53, duration_s=35.3)
+        self.assertIsNotNone(w)
+
+    def test_normal_continuous_walk_no_warning(self):
+        # same duration but a metrically correct path (~0.93 m/s) stays silent.
+        self.assertIsNone(speed_warning(path_m=32.8, duration_s=35.3))
+
+
+class TestThreeAnchorFusion(unittest.TestCase):
+    def test_three_agreeing_anchors_average(self):
+        fused, info = fuse_scale_estimates([3.0, 2.9, 3.1])
+        self.assertTrue(info["agree"])
+        self.assertEqual(info["n"], 3)
+        self.assertAlmostEqual(fused, 3.0, delta=0.05)
+
+    def test_consensus_overrides_fragile_primary(self):
+        # primary = ceiling-height anchor undershoots (1.0); the robust wall and
+        # camera anchors agree at ~3.0 — the majority consensus must win, NOT the
+        # fragile primary. This is the whole reason the wall anchor exists.
+        fused, info = fuse_scale_estimates([1.0, 3.0, 2.9])
+        self.assertFalse(info["agree"])
+        self.assertAlmostEqual(fused, 2.95, delta=0.1)
+        self.assertNotAlmostEqual(fused, 1.0, delta=0.5)
+
+    def test_no_majority_keeps_primary(self):
+        # three mutually disagreeing anchors -> no consensus -> stay conservative
+        # and keep the primary rather than pick an arbitrary outlier.
+        fused, info = fuse_scale_estimates([1.0, 2.0, 4.0])
+        self.assertFalse(info["agree"])
+        self.assertAlmostEqual(fused, 1.0)
+
 
 class TestBboxHeightWarning(unittest.TestCase):
     def test_normal_room_height_no_warning(self):
