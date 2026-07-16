@@ -365,7 +365,8 @@ def _split_trajectory_legs(cam_xz: np.ndarray, margin: float = 0.0,
     return (leg_a_out, frac_a), (leg_b_out, frac_b), float(tf), float(ang), margin_frac
 
 
-def compute_wall_anchor(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: float):
+def compute_wall_anchor(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: float,
+                        corridor_width_hint: float | None = None):
     """Full wall-anchor pipeline: model_corridor_widths() (SXX triangle soup ->
     candidate widths) then wall_scale_anchor() (recon-side match). Always
     preserves the model-side candidate log (info["top_candidates"]) even when
@@ -385,17 +386,35 @@ def compute_wall_anchor(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: f
     like the pre-split single-call path (never crashes — same safety net).
     A near-straight path skips splitting entirely (info["leg_used"]="whole").
 
+    corridor_width_hint (optional): a single, EXPLICITLY user-verified corridor
+    width in metres — bypasses model_corridor_widths()'s automatic multi-
+    candidate detection entirely. ceiling-gate review (cycles 5-7) found that
+    detection is a structurally underdetermined problem on this upload: one
+    detected recon gap against 5 similarly-plausible model-width candidates has
+    no principled automatic tie-break. A single hint makes the candidate list
+    len==1, so estimate_wall_scale's _choose_scale has no ambiguity to resolve.
+    This is a scalar hint the caller has separately verified against this
+    specific upload, NOT automatic repeated-object global registration — it
+    does not touch the CLAUDE.md invariant against auto-confirming alignment
+    on repeated geometry. None (default): unchanged automatic detection.
+    info["source"]="manual_hint" and info["corridor_width_hint"]=<value> mark
+    this path explicitly so it is never confused with an auto-detected result.
+
     Returns (s_wall, info); s_wall is None on any failure, info always carries a
     "fail" key in that case plus whatever diagnostics were available. info also
     carries "leg_used" ("whole"/"A"/"B"/"none"), and when split was attempted,
     "turn_fraction"/"turn_angle_deg"/"leg_margin_frac". margin=vext (one
     ceiling-height, arclength units) is passed to _split_trajectory_legs so
     each leg overlaps the corner rather than being hard-cut there."""
-    if wall_points is None or not len(wall_points):
-        return None, {"fail": "wall_points not provided"}
-    widths, widths_info = model_corridor_widths(wall_points, is_triangle_soup=True)
-    if not widths:
-        return None, widths_info
+    if corridor_width_hint is not None:
+        widths = [float(corridor_width_hint)]
+        widths_info = {"source": "manual_hint", "corridor_width_hint": float(corridor_width_hint)}
+    else:
+        if wall_points is None or not len(wall_points):
+            return None, {"fail": "wall_points not provided"}
+        widths, widths_info = model_corridor_widths(wall_points, is_triangle_soup=True)
+        if not widths:
+            return None, widths_info
 
     legs = _split_trajectory_legs(cam_xz, margin=vext)
     if legs is None:
@@ -506,7 +525,8 @@ def place_gravity(poses, scan_pts, bbox, scale=1.0):
              "u": [round(float(x), 4) for x in U[i]]} for i in range(len(C))]
 
 
-def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, wall_points=None):
+def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, wall_points=None,
+                     corridor_width_hint=None):
     """Real registration: gravity-align scan, then register its CEILING band to
     the model ceiling (grid XY + yaw + scale + Umeyama-ICP). Returns placed
     poses + fit metrics. (Footage looks up → ceiling-to-ceiling locks well.)
@@ -517,7 +537,9 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, wall_poi
     vertical one (same finding/fix as place_pipe_auto — see its docstring). None
     (default) keeps the prior isotropic 2-anchor (ceiling+camera) behavior
     unchanged: s_h falls back to s_v, so apply_axis_split_scale(s_h=s_v,s_v=s_v)
-    degenerates to the old uniform scale exactly."""
+    degenerates to the old uniform scale exactly.
+    corridor_width_hint (optional): see compute_wall_anchor() — bypasses
+    automatic corridor-width detection with a single verified value."""
     from scipy.spatial import cKDTree
     centers, fwd, up = [], [], []
     for p in poses:
@@ -548,7 +570,8 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, wall_poi
     floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
     s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])
-    s_wall, wall_info = compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext)
+    s_wall, wall_info = compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext,
+                                            corridor_width_hint=corridor_width_hint)
     fallback_reason = None
     if s_wall is not None:
         s_h = s_wall
@@ -697,7 +720,8 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
                        "path_m": round(plen, 2), "cam_h": round(eye - float(bbox[0][1]), 2)}
 
 
-def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=None, wall_points=None):
+def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=None, wall_points=None,
+                    corridor_width_hint=None):
     """완전 자동 배관추종 배치: lane(메인런) + AXIS-SPLIT METRIC 스케일 + 코너(B1 turn-fraction)
     + recon 형상. 수동 waypoint 없이 metric 길이로 배치.
     단안 재구성은 수평(X,Z) 두 축을 수직(Y)보다 추가로 더 압축한다(실측: upload_1781521406685
@@ -712,7 +736,9 @@ def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=Non
     과소산출될 때). 방향·분기선택은 recon 유지, 길이만 모델 기준 — 코리더 전 구간을 걸은 경우.
     duration(초, 실제 영상 길이): 주어지면 산출 경로장/속도가 비현실적일 때 경고.
     wall_points(선택): SXX(구조) 삼각형 정점 -> 복도폭 벽앵커 재료. None(기본)이면 s_h=s_v
-    폴백만 발생 — 즉 axis-split 이전과 동일한 등방 스케일 동작(회귀 없음)."""
+    폴백만 발생 — 즉 axis-split 이전과 동일한 등방 스케일 동작(회귀 없음).
+    corridor_width_hint(선택): compute_wall_anchor() 참조 — 자동 복도폭 검출을
+    사용자가 검증한 단일값으로 우회(길이 1 후보라 모호성 자체가 없음)."""
     from scan2bim.metric_scale import (
         apply_axis_split_scale, bbox_height_warning, camera_height_scale, estimate_floor_level,
         fuse_scale_estimates, speed_warning,
@@ -732,7 +758,8 @@ def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=Non
     floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
     s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])           # 수직: 천장고+카메라높이 (기존 2앵커)
-    s_wall, wall_info = compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext)   # 수평: straddle 강제 벽앵커
+    s_wall, wall_info = compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext,
+                                            corridor_width_hint=corridor_width_hint)   # 수평: straddle 강제 벽앵커
     fallback_reason = None
     if s_wall is not None:
         s_h = s_wall
@@ -849,6 +876,10 @@ def main():
     ap.add_argument("--hfov", type=float, default=69.0, help="카메라 수평 FOV(도) — PnP 내부파라미터")
     ap.add_argument("--peer-url", default=None, help="전환 버튼이 열 상대 뷰어 파일명(예: coplay_autopipe.html)")
     ap.add_argument("--duration", type=float, default=35.3)
+    ap.add_argument("--corridor-width-hint", type=float, default=None,
+                    help="단일 사용자 검증 복도폭(m) — 자동 SXX 후보 검출을 완전히 우회해 "
+                         "[hint] 단일 후보로 estimate_wall_scale 호출(모호성 없음). "
+                         "없으면 기존 자동검출 그대로(회귀 없음)")
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
@@ -889,16 +920,21 @@ def main():
     else:
         poses, scan_pts = fetch_scan(args.base_url, args.upload)
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
+    if args.corridor_width_hint is not None:
+        print(f"  corridor_width_hint: {args.corridor_width_hint} (manual, verified) "
+              "— bypassing automatic SXX corridor-width detection")
     if args.auto_pipe:
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
-        pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx, fit_run=args.fit_run, duration=args.duration, wall_points=wall_points)
+        pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx, fit_run=args.fit_run, duration=args.duration,
+                                             wall_points=wall_points, corridor_width_hint=args.corridor_width_hint)
         print("  auto-pipe(metric):", reginfo)
     elif args.gt_path:
         wps = [[float(v) for v in seg.split(",")] for seg in args.gt_path.split()]
         pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps, snap=(args.gt_mode == "snap"))
         print("  gt-path fit:", reginfo, "waypoints:", wps)
     else:
-        pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox, anchor=anchor, wall_points=wall_points)
+        pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox, anchor=anchor, wall_points=wall_points,
+                                              corridor_width_hint=args.corridor_width_hint)
         print("  registration:", reginfo, "anchor:", anchor)
     if args.auto_localize and args.frames_dir:
         pose_json, locinfo = place_autolocalize(pose_json, args.dtdx, args.frames_dir, hfov=args.hfov)
@@ -932,7 +968,12 @@ def main():
             .replace("__MESHES__", json.dumps(meshes_json))
             .replace("__MODELS__", json.dumps(models_json))
             .replace("__POSES__", json.dumps(pose_json))
-            .replace("__META__", json.dumps({"duration": args.duration}))
+            .replace("__META__", json.dumps({
+                "duration": args.duration,
+                **({"corridor_width_hint": args.corridor_width_hint,
+                    "corridor_width_hint_note": "manual, verified — not auto-detected"}
+                   if args.corridor_width_hint is not None else {}),
+            }))
             .replace("__MODELNAME__", " + ".join(names))
             .replace("__TRIS__", f"{tris:,}")
             .replace("__NPOSES__", str(len(pose_json)))

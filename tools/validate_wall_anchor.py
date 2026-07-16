@@ -260,7 +260,8 @@ def _import_build_coplay():
 
 
 def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: float,
-                         wall_points: np.ndarray | None = None) -> dict:
+                         wall_points: np.ndarray | None = None,
+                         corridor_width_hint: float | None = None) -> dict:
     """AXIS-SPLIT metric scale (mirrors tools/build_coplay.py::place_pipe_auto()):
     s_v = fuse_scale_estimates([s_vert, s_cam]) (vertical: ceiling-height + camera-
     height, unchanged 2-anchor logic); s_h = the wall (corridor-width) anchor if
@@ -269,7 +270,9 @@ def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: f
     returned path_m is already metric (no separate scalar multiply needed).
     When wall_points=None, s_h==s_v always (isotropic), so path_m is
     mathematically identical to the pre-axis-split 2-anchor value — the
-    --no-wall-anchor reproduction path is unaffected."""
+    --no-wall-anchor reproduction path is unaffected.
+    corridor_width_hint: see tools.build_coplay.compute_wall_anchor() — bypasses
+    automatic corridor-width detection with a single user-verified value."""
     bc = _import_build_coplay()
     centers, fwd, up = [], [], []
     for p in poses:
@@ -292,7 +295,8 @@ def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: f
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
     s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])
 
-    s_wall, wall_info = bc.compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext)
+    s_wall, wall_info = bc.compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext,
+                                               corridor_width_hint=corridor_width_hint)
     fallback_reason = None
     if s_wall is not None:
         s_h = s_wall
@@ -324,6 +328,10 @@ def main() -> int:
     ap.add_argument("--dtdx", nargs="+", default=None,
                      help="dtdx path(s) or glob pattern(s), e.g. 'models/Gasan_7F/*.dtdx' "
                           "(multi-discipline: interior bbox height + SXX corridor widths)")
+    ap.add_argument("--corridor-width-hint", type=float, default=None,
+                     help="single user-verified corridor width (m) — bypasses automatic SXX "
+                          "candidate detection entirely (len==1 candidate list, no ambiguity). "
+                          "Not auto-detected; a scalar hint the caller has separately verified.")
     args = ap.parse_args()
 
     if not args.lbp2.exists():
@@ -366,7 +374,7 @@ def main() -> int:
             return 3
         bbox_h = dtdx_bbox_height(by_code)
         wall_points = by_code.get("SXX")
-        if wall_points is None:
+        if wall_points is None and args.corridor_width_hint is None:
             print("wall anchor not available: no SXX (structure) discipline in --dtdx "
                   "— corridor widths need real walls, not MEP-only geometry")
             return 3
@@ -380,8 +388,13 @@ def main() -> int:
             bbox_h = model_bbox_height(args.model)
         wall_points = None  # --no-wall-anchor: reproduce the 2-anchor baseline only
 
+    if args.corridor_width_hint is not None:
+        print(f"  corridor_width_hint: {args.corridor_width_hint} (manual, verified) "
+              "— bypassing automatic SXX corridor-width detection")
+
     bbox_warn = bbox_height_warning(bbox_h)
-    scale = compute_metric_scale(parsed["poses"], parsed["points"], bbox_h, wall_points=wall_points)
+    scale = compute_metric_scale(parsed["poses"], parsed["points"], bbox_h, wall_points=wall_points,
+                                 corridor_width_hint=args.corridor_width_hint)
     path_m = scale["path_m"]                      # already axis-split metric
     speed_ms = path_m / duration
     s_cam_str = f"{scale['s_cam']:.4f}" if scale["s_cam"] is not None else "n/a"

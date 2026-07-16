@@ -114,19 +114,29 @@ def _select_pair(pos: np.ndarray, cam_t: float | None):
     return None
 
 
-def _choose_scale(recon_w: float, gaps: list[float], widths: list[float]) -> tuple[float, float]:
+def _choose_scale(recon_w: float, gaps: list[float], widths: list[float]) -> tuple[float | None, float | None]:
     """Map the selected recon gap to a model corridor width. With one model width
-    it is a direct ratio. With several, pick the width whose implied single global
-    scale most consistently maps *all* detected recon gaps onto model widths."""
+    it is a direct ratio (no ambiguity). With several, pick the width whose implied
+    single global scale most consistently maps *all* detected recon gaps onto model
+    widths.
+
+    Returns (None, None) to ABSTAIN when that choice is a tie: with effectively one
+    distinct recon gap, every model width fits equally well (cost -> 0 for all), so
+    picking one is an arbitrary, order-dependent guess (the caller passes widths in
+    some order, and the first would silently win). There is genuinely no information
+    to disambiguate a lone gap against several widths, so the caller surfaces it as
+    a failure instead of returning a wrong scale."""
     if len(widths) == 1:
         return widths[0] / recon_w, widths[0]
-    best = None
-    for w in widths:
-        s = w / recon_w
-        cost = sum(min(abs(g * s - wj) / wj for wj in widths) for g in gaps)
-        if best is None or cost < best[0] - 1e-12:
-            best = (cost, s, w)
-    return best[1], best[2]
+    scored = sorted(
+        (sum(min(abs(g * (w / recon_w) - wj) / wj for wj in widths) for g in gaps), w / recon_w, w)
+        for w in widths
+    )
+    best_cost = scored[0][0]
+    n_tied = sum(1 for c, _, _ in scored if c - best_cost <= 1e-9)
+    if n_tied >= 2:
+        return None, None
+    return scored[0][1], scored[0][2]
 
 
 def _confidence(prom: np.ndarray, i: int, j: int) -> float:
@@ -216,6 +226,10 @@ def estimate_wall_scale(pts_yup: np.ndarray, model_corridor_widths: list[float],
 
     gaps = list(np.diff(pos)) + [recon_w]
     scale, model_w = _choose_scale(recon_w, gaps, widths)
+    if scale is None:   # abstain: one recon gap vs several model widths -> ambiguous
+        info["recon_width"] = round(recon_w, 4)
+        info["fail"] = f"single-gap ambiguous — {len(widths)} model widths, cannot disambiguate"
+        return None, info
     conf = _confidence(prom, i, j)
 
     info.update({

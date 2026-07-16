@@ -11,7 +11,7 @@ import unittest
 
 import numpy as np
 
-from scan2bim.wall_anchor import estimate_wall_scale
+from scan2bim.wall_anchor import _choose_scale, estimate_wall_scale
 
 
 def _wall(x0, length, height, n, noise, rng, axis="z"):
@@ -175,6 +175,35 @@ class TestTrajectoryRadiusPrefilter(unittest.TestCase):
         a, _ = estimate_wall_scale(pts, [2.4], cam_xz=cam)
         b, _ = estimate_wall_scale(pts, [2.4], cam_xz=cam, trajectory_radius=None)
         self.assertEqual(a, b)
+
+
+class TestChooseScaleAmbiguity(unittest.TestCase):
+    def test_single_gap_multiple_widths_abstains_end_to_end(self):
+        # a plain corridor gives ONE recon gap; with 2+ candidate model widths there
+        # is no information to pick one, so the whole call abstains (no silent guess).
+        pts = make_corridor(width=2.4, seed=21)
+        scale, info = estimate_wall_scale(pts, [2.4, 3.6], cam_xz=_cam_along_z())
+        self.assertIsNone(scale)
+        self.assertIn("single-gap ambiguous", info.get("fail", ""))
+
+    def test_single_width_is_direct_ratio(self):
+        # widths == 1: unambiguous, unchanged direct ratio (regression guard).
+        s, w = _choose_scale(0.8, [0.8, 0.8], [2.4])
+        self.assertAlmostEqual(s, 3.0)
+        self.assertEqual(w, 2.4)
+
+    def test_single_gap_multiple_widths_returns_none(self):
+        # one distinct gap, every width ties at cost 0 -> abstain.
+        s, w = _choose_scale(1.0, [1.0, 1.0], [2.0, 4.0])
+        self.assertIsNone(s)
+        self.assertIsNone(w)
+
+    def test_genuine_multi_gap_selects_best(self):
+        # two DISTINCT recon gaps (1.0 and 2.0) pin a unique global scale: only
+        # width 2.0 maps both gaps onto model widths (cost 0); 4.0 does not.
+        s, w = _choose_scale(1.0, [1.0, 2.0], [2.0, 4.0])
+        self.assertAlmostEqual(s, 2.0)
+        self.assertEqual(w, 2.0)
 
 
 class TestInfoDiagnostics(unittest.TestCase):
