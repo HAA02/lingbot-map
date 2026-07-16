@@ -16,12 +16,15 @@ Default mode (wall anchor, requires --dtdx <multi-discipline model files/glob>):
     s_vert = dtdx_interior_bbox_height / scan_vertical_extent (mirrors
              tools/build_coplay.py::main()'s non-SXX interior union bbox),
     s_cam  = scan2bim.metric_scale.camera_height_scale(...),
-    s_wall = tools.build_coplay.wall_scale_anchor(...) — AXX architecture wall-pair
-             gaps (tools.build_coplay.model_corridor_widths) vs. the recon's own
-             corridor-width anchor (scan2bim.wall_anchor.estimate_wall_scale),
+    s_wall = tools.build_coplay.wall_scale_anchor(...) — SXX structure wall-pair
+             gaps (tools.build_coplay.model_corridor_widths, is_triangle_soup=True,
+             vertical-span>1.5m + [1.5,6]m width clamp — AXX/architecture was
+             tried first but is furniture-dominated, see model_corridor_widths()
+             docstring) vs. the recon's own corridor-width anchor
+             (scan2bim.wall_anchor.estimate_wall_scale),
     s_m, info = scan2bim.metric_scale.fuse_scale_estimates([s_vert, s_cam, s_wall])
 Exit codes (default mode): 3 if the wall anchor can't even be attempted (import
-failure, or no AXX/architecture discipline in --dtdx); else 0 if the resulting
+failure, or no SXX/structure discipline in --dtdx); else 0 if the resulting
 speed falls in the plausible SPEED_BAND, 1 otherwise (measured value + diagnostics
 printed either way — never silently adjusted to fit the band).
 
@@ -235,7 +238,7 @@ def _import_build_coplay():
 
 
 def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: float,
-                         axx_points: np.ndarray | None = None) -> dict:
+                         wall_points: np.ndarray | None = None) -> dict:
     bc = _import_build_coplay()
     vp = [bc.viewer_pose(p) for p in poses]
     centers = np.array([v[0] for v in vp])
@@ -255,19 +258,26 @@ def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: f
     floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
 
-    s_wall, wall_info = None, {"fail": "axx_points not provided"}
-    if axx_points is not None and len(axx_points):
-        widths, widths_info = bc.model_corridor_widths(axx_points)
-        s_wall, wall_info = (bc.wall_scale_anchor(Pg, Cg[:, [0, 2]], widths, vext)
-                             if widths else (None, widths_info))
+    s_wall, wall_info = bc.compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext)
 
     s_m, scale_info = fuse_scale_estimates([s_vert, s_cam, s_wall])
     scale_info["wall_anchor"] = wall_info
+    # axis-split prep (Phase 2 will make s_h drive the summary line + verdict;
+    # for now these are informational only — s_m/path_m/speed_ms below are still
+    # the current omni-fusion, unchanged). s_v = vertical-domain anchors only
+    # (ceiling-height + camera-height); s_h = the wall (corridor-width) anchor,
+    # which is inherently horizontal. fallback_reason explains why s_h isn't
+    # available yet when it isn't (matches the eventual Phase-2 s_h->s_v fallback).
+    s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])
+    s_h = s_wall
+    fallback_reason = None if s_h is not None else wall_info.get("fail", "wall anchor unavailable")
+    scale_info["axis_tags"] = {"s_vert": "vertical", "s_cam": "vertical", "s_wall": "horizontal"}
 
     traj = Cg[:, [0, 2]]
     total_raw = float(np.linalg.norm(np.diff(traj, axis=0), axis=1).sum())
     return {
         "s_vert": s_vert, "s_cam": s_cam, "s_wall": s_wall, "s_m": s_m,
+        "s_v": s_v, "s_v_info": s_v_info, "s_h": s_h, "fallback_reason": fallback_reason,
         "scale_info": scale_info, "vext": vext, "floor_y": floor_y, "total_raw": total_raw,
     }
 
@@ -282,7 +292,7 @@ def main() -> int:
                      help="GLB model bbox for --no-wall-anchor when --dtdx is not given")
     ap.add_argument("--dtdx", nargs="+", default=None,
                      help="dtdx path(s) or glob pattern(s), e.g. 'models/Gasan_7F/*.dtdx' "
-                          "(multi-discipline: interior bbox height + AXX corridor widths)")
+                          "(multi-discipline: interior bbox height + SXX corridor widths)")
     args = ap.parse_args()
 
     if not args.lbp2.exists():
@@ -309,10 +319,13 @@ def main() -> int:
 
     if not args.no_wall_anchor:
         # Default mode needs a real multi-discipline model: the interior bbox
-        # height for s_vert, and AXX architecture geometry for the wall anchor.
+        # height for s_vert, and SXX structure geometry for the wall anchor.
+        # (AXX/architecture was tried first but is furniture-dominated on real
+        # data — zero triangles with vertical span > 1.5m; SXX carries the real
+        # walls/glass partitions. See model_corridor_widths()'s docstring.)
         if not dtdx_paths:
             print("error: default (wall-anchor) mode needs --dtdx <multi-discipline model "
-                  "files/glob> — corridor widths come from the AXX architecture geometry",
+                  "files/glob> — corridor widths come from the SXX structure geometry",
                   file=sys.stderr)
             return 2
         try:
@@ -321,9 +334,9 @@ def main() -> int:
             print(f"wall anchor not available (import failed: {e})")
             return 3
         bbox_h = dtdx_bbox_height(by_code)
-        axx_points = by_code.get("AXX")
-        if axx_points is None:
-            print("wall anchor not available: no AXX (architecture) discipline in --dtdx "
+        wall_points = by_code.get("SXX")
+        if wall_points is None:
+            print("wall anchor not available: no SXX (structure) discipline in --dtdx "
                   "— corridor widths need real walls, not MEP-only geometry")
             return 3
     else:
@@ -334,10 +347,10 @@ def main() -> int:
                 print(f"error: model not found: {args.model}", file=sys.stderr)
                 return 2
             bbox_h = model_bbox_height(args.model)
-        axx_points = None  # --no-wall-anchor: reproduce the 2-anchor baseline only
+        wall_points = None  # --no-wall-anchor: reproduce the 2-anchor baseline only
 
     bbox_warn = bbox_height_warning(bbox_h)
-    scale = compute_metric_scale(parsed["poses"], parsed["points"], bbox_h, axx_points=axx_points)
+    scale = compute_metric_scale(parsed["poses"], parsed["points"], bbox_h, wall_points=wall_points)
     path_m = scale["total_raw"] * scale["s_m"]
     speed_ms = path_m / duration
     lo, hi = SPEED_BAND
@@ -354,6 +367,10 @@ def main() -> int:
     wa = scale["scale_info"].get("wall_anchor") or {}
     if wa:
         print(f"  wall_anchor: {wa}")
+    # axis-split prep (Phase 2 will switch the summary line to s_h; informational only here)
+    s_h_str = f"{scale['s_h']:.4f}" if scale["s_h"] is not None else "n/a"
+    print(f"  axis-split(prep): s_v={scale['s_v']:.4f} s_h={s_h_str} "
+          f"fallback_reason={scale['fallback_reason']!r}")
     if bbox_warn:
         print(f"  WARNING (bbox): {bbox_warn}")
     sw = speed_warning(path_m, duration)

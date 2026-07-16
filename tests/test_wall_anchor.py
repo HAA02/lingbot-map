@@ -122,6 +122,61 @@ class TestPairSelection(unittest.TestCase):
         self.assertAlmostEqual(info["recon_width"], 2.4, delta=0.2)
 
 
+class TestStraddleEnforcement(unittest.TestCase):
+    def test_non_straddling_pair_returns_none(self):
+        # both walls on the SAME side of the camera path (X=1.0 and X=2.0, camera
+        # at X=0) -> not the corridor actually walked, so no scale is returned.
+        rng = np.random.RandomState(12)
+        parts = [
+            _wall(1.0, 12.0, 2.7, 3000, 0.01, rng),
+            _wall(2.0, 12.0, 2.7, 3000, 0.01, rng),
+            _slab(0.0, 0.5, 2.5, 12.0, 3000, 0.01, rng),
+            _slab(2.7, 0.5, 2.5, 12.0, 3000, 0.01, rng),
+        ]
+        pts = np.vstack(parts)
+        scale, info = estimate_wall_scale(pts, [2.4], cam_xz=_cam_along_z())
+        self.assertIsNone(scale)
+        self.assertEqual(info.get("fail"), "no straddling pair")
+
+    def test_no_trajectory_cannot_verify_straddle_returns_none(self):
+        # without a camera trajectory there is nothing to straddle -> no result.
+        pts = make_corridor(width=2.4, seed=13)
+        scale, info = estimate_wall_scale(pts, [2.4], cam_xz=None)
+        self.assertIsNone(scale)
+
+
+class TestTrajectoryRadiusPrefilter(unittest.TestCase):
+    def test_prefilter_drops_far_points_and_detects_corridor(self):
+        # the corridor actually walked (near the path) plus a large mass of clutter
+        # far down-corridor, well beyond where the camera went. The proximity filter
+        # keeps only the near-path corridor and recovers it cleanly. (On real,
+        # ceiling-facing scans this is what turns a drowned scan into a clean spike.)
+        rng = np.random.RandomState(14)
+        corridor = make_corridor(width=2.4, length=12.0, seed=14)   # walls at X=+-1.2
+        far = np.column_stack([
+            rng.uniform(-8.0, 8.0, 50000),
+            rng.uniform(0.0, 2.7, 50000),
+            rng.uniform(30.0, 60.0, 50000),   # far beyond the walked Z range (~1..11)
+        ])
+        pts = np.vstack([corridor, far])
+        cam = _cam_along_z()
+        scale, info = estimate_wall_scale(pts, [2.4], cam_xz=cam, trajectory_radius=2.7)
+        self.assertIsNotNone(scale)
+        self.assertTrue(info["straddles_trajectory"])
+        self.assertAlmostEqual(info["recon_width"], 2.4, delta=0.2)
+        # the far clutter (majority of points) was excluded by the radius filter
+        self.assertIn("n_after_radius", info)
+        self.assertLessEqual(info["n_after_radius"], len(corridor))
+        self.assertLess(info["n_after_radius"], len(pts) * 0.5)
+
+    def test_radius_none_is_backward_compatible(self):
+        pts = make_corridor(width=2.4, seed=15)
+        cam = _cam_along_z()
+        a, _ = estimate_wall_scale(pts, [2.4], cam_xz=cam)
+        b, _ = estimate_wall_scale(pts, [2.4], cam_xz=cam, trajectory_radius=None)
+        self.assertEqual(a, b)
+
+
 class TestInfoDiagnostics(unittest.TestCase):
     def test_info_has_diagnostic_fields(self):
         pts = make_corridor(width=2.4, seed=9)

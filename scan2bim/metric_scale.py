@@ -77,6 +77,42 @@ def fuse_scale_estimates(estimates: list[float | None], *, disagreement_ratio: f
                    "spread": round(spread, 3), "agree": agree}
 
 
+def apply_axis_split_scale(poses_yup: dict, pts_yup: np.ndarray, s_h: float, s_v: float):
+    """Apply an anisotropic diag(s_h, s_v, s_h) scale in the gravity-aligned Y-up
+    frame to the camera poses and the scan cloud.
+
+    Monocular recon compresses the two HORIZONTAL axes noticeably more than the
+    vertical one, so a single isotropic scale cannot place the path metrically: the
+    horizontal scale (from the corridor-width anchor) and the vertical scale (from
+    the ceiling-height anchor) must be applied on their own axes.
+
+    A non-uniform scale does NOT preserve directions, so after scaling the forward
+    and up vectors they are re-normalised and re-orthogonalised. `up` is kept as the
+    anchor — it stays near-vertical, so the horizon stays level — and `forward` is
+    made perpendicular to it. Anchoring on up also preserves forward's horizontal
+    heading (its X and Z both scale by s_h, so its XZ azimuth is unchanged), so the
+    look direction still follows the horizontally-scaled path. If forward is
+    (near-)parallel to up (looking straight up/down) only re-normalisation is done.
+
+    poses_yup: dict {"c": (N,3), "f": (N,3), "u": (N,3)} of centres / forward / up
+        unit vectors in the gravity-aligned frame.
+    pts_yup: (M,3) scan cloud in the same frame.
+    Returns (poses_scaled, pts_scaled); poses_scaled has the same {"c","f","u"} keys
+    (same structure as the input) and pts_scaled is the scaled (M,3) cloud."""
+    d = np.array([s_h, s_v, s_h], dtype=np.float64)
+    c = np.asarray(poses_yup["c"], dtype=np.float64) * d
+    f = np.asarray(poses_yup["f"], dtype=np.float64) * d
+    u = np.asarray(poses_yup["u"], dtype=np.float64) * d
+    u = u / (np.linalg.norm(u, axis=1, keepdims=True) + 1e-12)
+    f_perp = f - np.sum(f * u, axis=1, keepdims=True) * u    # Gram-Schmidt against up
+    nrm = np.linalg.norm(f_perp, axis=1, keepdims=True)
+    f_out = np.where(nrm < 1e-9, f, f_perp)                  # parallel -> keep scaled f
+    f_out = f_out / (np.linalg.norm(f_out, axis=1, keepdims=True) + 1e-12)
+    poses_scaled = {"c": c, "f": f_out, "u": u}
+    pts_scaled = np.asarray(pts_yup, dtype=np.float64) * d
+    return poses_scaled, pts_scaled
+
+
 def bbox_height_warning(height_m: float, lo: float = 2.0) -> str | None:
     """Flag a model bbox height too thin to be a real floor-to-ceiling span —
     the telltale sign of passing a single thin-discipline dtdx (e.g. just the

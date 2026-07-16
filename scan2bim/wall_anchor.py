@@ -97,20 +97,21 @@ def _wall_peaks(t: np.ndarray):
     return pos[order], prom[order]
 
 
-def _select_pair(pos: np.ndarray, prom: np.ndarray, cam_t: float | None):
-    """Pick the facing wall pair. With a known trajectory, the corridor you are in
-    is bounded by the nearest wall on each side of the path, so prefer the peaks
-    immediately straddling cam_t. Otherwise fall back to the two strongest peaks."""
+def _select_pair(pos: np.ndarray, cam_t: float | None):
+    """Pick the facing wall pair that STRADDLES the trajectory: the nearest wall on
+    each side of the camera path (the corridor actually walked). A pair that does
+    not straddle the path is not that corridor, so it is rejected outright (returns
+    None) — never used as a lenient fallback. On real data a non-straddling 0.93 m
+    gap was mistakenly accepted and produced a wrong 1.06x scale; requiring straddle
+    removes that failure mode. Without a trajectory there is nothing to straddle."""
     n = len(pos)
-    if n < 2:
+    if n < 2 or cam_t is None:
         return None
-    if cam_t is not None:
-        below = np.where(pos < cam_t)[0]
-        above = np.where(pos > cam_t)[0]
-        if len(below) and len(above):
-            return (int(below[-1]), int(above[0])), True
-    top = np.argsort(prom)[-2:]
-    return (int(min(top)), int(max(top))), False
+    below = np.where(pos < cam_t)[0]
+    above = np.where(pos > cam_t)[0]
+    if len(below) and len(above):
+        return int(below[-1]), int(above[0])
+    return None
 
 
 def _choose_scale(recon_w: float, gaps: list[float], widths: list[float]) -> tuple[float, float]:
@@ -128,23 +129,28 @@ def _choose_scale(recon_w: float, gaps: list[float], widths: list[float]) -> tup
     return best[1], best[2]
 
 
-def _confidence(prom: np.ndarray, i: int, j: int, straddles: bool) -> float:
+def _confidence(prom: np.ndarray, i: int, j: int) -> float:
     q = float(min(prom[i], prom[j]) / (prom.max() + 1e-12))
-    base = 0.55 if straddles else 0.3
-    return float(np.clip(base + 0.35 * q, 0.0, 1.0))
+    return float(np.clip(0.55 + 0.35 * q, 0.0, 1.0))
 
 
 def estimate_wall_scale(pts_yup: np.ndarray, model_corridor_widths: list[float],
-                        cam_xz: np.ndarray | None = None) -> tuple[float | None, dict]:
+                        cam_xz: np.ndarray | None = None,
+                        trajectory_radius: float | None = None) -> tuple[float | None, dict]:
     """Estimate metric scale from the gap between facing vertical walls in a
     gravity-aligned Y-up point cloud, versus a known model corridor width.
 
     pts_yup: (N, 3) gravity-aligned cloud, columns [X, Y, Z], Y up.
     model_corridor_widths: known real corridor width(s) in metres.
-    cam_xz: (M, 2) camera trajectory in the [X, Z] plane, or None. When given, the
-        facing pair straddling the path is preferred (the corridor actually walked).
+    cam_xz: (M, 2) camera trajectory in the [X, Z] plane. REQUIRED for a result —
+        scale is only returned from a wall pair that straddles the path (the
+        corridor actually walked); without a trajectory nothing can straddle.
+    trajectory_radius: if set, first keep only points within this XZ distance of the
+        trajectory (typically one ceiling-height). The full, often ceiling-facing
+        scan rarely shows clean wall spikes; restricting to the corridor walked does.
+        None (default) applies no prefilter, so prior callers are unaffected.
 
-    Returns (scale, info) or (None, info) when no confident facing pair is found.
+    Returns (scale, info) or (None, info) when no straddling facing pair is found.
     """
     info: dict = {"n_walls": 0}
     pts = np.asarray(pts_yup, dtype=np.float64)
@@ -155,6 +161,21 @@ def estimate_wall_scale(pts_yup: np.ndarray, model_corridor_widths: list[float],
     if not widths:
         info["fail"] = "no model corridor widths"
         return None, info
+
+    cam = None
+    if cam_xz is not None:
+        cam = np.asarray(cam_xz, dtype=np.float64)
+        if cam.ndim != 2 or cam.shape[1] != 2 or len(cam) < 2:
+            cam = None
+
+    if trajectory_radius is not None and cam is not None and float(trajectory_radius) > 0:
+        from scipy.spatial import cKDTree
+        d, _ = cKDTree(cam).query(pts[:, [0, 2]], k=1, workers=-1)
+        pts = pts[d < float(trajectory_radius)]
+        info["n_after_radius"] = int(len(pts))
+        if len(pts) < _MIN_POINTS:
+            info["fail"] = "no points within trajectory radius"
+            return None, info
 
     y = pts[:, 1]
     ylo, yhi = float(y.min()), float(y.max())
@@ -169,11 +190,6 @@ def estimate_wall_scale(pts_yup: np.ndarray, model_corridor_widths: list[float],
         return None, info
     xz = wall_pts[:, [0, 2]]
 
-    cam = None
-    if cam_xz is not None:
-        cam = np.asarray(cam_xz, dtype=np.float64)
-        if cam.ndim != 2 or cam.shape[1] != 2 or len(cam) < 2:
-            cam = None
     axis, normal = _horizontal_axes(xz, cam)
     t = xz @ normal
 
@@ -188,11 +204,11 @@ def estimate_wall_scale(pts_yup: np.ndarray, model_corridor_widths: list[float],
         return None, info
 
     cam_t = float(np.median(cam @ normal)) if cam is not None else None
-    sel = _select_pair(pos, prom, cam_t)
+    sel = _select_pair(pos, cam_t)
     if sel is None:
-        info["fail"] = "no valid wall pair"
+        info["fail"] = "no straddling pair"
         return None, info
-    (i, j), straddles = sel
+    i, j = sel
     recon_w = float(abs(pos[j] - pos[i]))
     if recon_w <= 1e-6:
         info["fail"] = "degenerate wall gap"
@@ -200,14 +216,14 @@ def estimate_wall_scale(pts_yup: np.ndarray, model_corridor_widths: list[float],
 
     gaps = list(np.diff(pos)) + [recon_w]
     scale, model_w = _choose_scale(recon_w, gaps, widths)
-    conf = _confidence(prom, i, j, straddles)
+    conf = _confidence(prom, i, j)
 
     info.update({
         "recon_width": round(recon_w, 4),
         "model_width": round(float(model_w), 4),
         "scale": round(float(scale), 4),
         "n_pairs": int(len(pos) * (len(pos) - 1) // 2),
-        "straddles_trajectory": bool(straddles),
+        "straddles_trajectory": True,
         "axis": [round(float(axis[0]), 4), round(float(axis[1]), 4)],
         "normal": [round(float(normal[0]), 4), round(float(normal[1]), 4)],
         "wall_positions": [round(float(p), 4) for p in pos],

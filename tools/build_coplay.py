@@ -217,17 +217,46 @@ def _rot_a_to_b(a, b):
     return np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
 
 
-def model_corridor_widths(axx_points: np.ndarray) -> tuple[list, dict]:
-    """AXX (architecture) model vertices -> candidate corridor widths (metres),
-    reusing scan2bim.wall_anchor's wall-peak detector on the building's dominant
+def model_corridor_widths(points: np.ndarray, *, is_triangle_soup: bool = False,
+                          min_vertical_span: float = 1.5,
+                          width_range: tuple = (1.5, 6.0),
+                          top_n: int = 5) -> tuple[list, dict]:
+    """Wall-source model vertices -> candidate corridor widths (metres), reusing
+    scan2bim.wall_anchor's wall-peak detector on the building's dominant
     horizontal axis. Width magnitudes are invariant to the X-mirror chirality
     flip applied elsewhere in this file (mirroring preserves pairwise gaps), so
     either raw decode_geometry output or the mirrored model_pts works.
-    Returns ([], info) with a "fail" reason when no clean wall pair is found."""
+
+    Real-data finding: AXX (architecture) is furniture-dominated (zero triangles
+    with vertical span > 1.5m) — its "corridor width" candidates are actually
+    furniture gaps. SXX (structure) carries the real walls/glass partitions
+    (9009 triangles > 1.5m span on Gasan_7F). Use SXX with is_triangle_soup=True.
+
+    is_triangle_soup=True: `points` is a flat (3*T, 3) non-indexed triangle soup
+    (decode_geometry's output format) — triangles whose vertical (Y) span is
+    below min_vertical_span are dropped first (furniture/fixtures, not walls).
+    False (default) treats `points` as an already-filtered point cloud (prior/
+    synthetic-test behavior, unchanged).
+
+    width_range clamps candidate gaps to plausible corridor widths so a
+    building-perimeter wall-to-wall span (tens of metres) is never proposed.
+    info always carries up to `top_n` candidates ranked by peak-pair prominence
+    (min of the two flanking wall peaks' prominence), for manual risk review,
+    even when widths is non-empty. Returns ([], info) with a "fail" reason when
+    no clean in-range wall-pair gap is found."""
     from scan2bim.wall_anchor import _horizontal_axes, _wall_peaks
-    pts = np.asarray(axx_points, dtype=np.float64)
+    pts = np.asarray(points, dtype=np.float64)
     if pts.size == 0:
-        return [], {"fail": "no architecture points"}
+        return [], {"fail": "no wall-source points"}
+    if is_triangle_soup:
+        if len(pts) % 3 != 0:
+            return [], {"fail": f"triangle soup length {len(pts)} not divisible by 3"}
+        tris = pts.reshape(-1, 3, 3)
+        yspan = tris[:, :, 1].max(axis=1) - tris[:, :, 1].min(axis=1)
+        wall_tris = tris[yspan > min_vertical_span]
+        if len(wall_tris) == 0:
+            return [], {"fail": f"no triangles with vertical span > {min_vertical_span}m"}
+        pts = wall_tris.reshape(-1, 3)
     med = np.median(pts, axis=0)
     keep = (np.abs(pts - med) < 60).all(axis=1)
     allc = pts[keep] if keep.any() else pts
@@ -246,9 +275,45 @@ def model_corridor_widths(axx_points: np.ndarray) -> tuple[list, dict]:
     peaks = _wall_peaks(t)
     if peaks is None:
         return [], {"fail": "no wall density peaks in model"}
-    pos, _prom = peaks
-    gaps = sorted({round(float(g), 2) for g in np.diff(pos) if g > 0.3})
-    return gaps, {"n_wall_peaks": int(len(pos))}
+    pos, prom = peaks
+    lo, hi = width_range
+    candidates = []
+    for i in range(len(pos) - 1):
+        gap = float(pos[i + 1] - pos[i])
+        if lo <= gap <= hi:
+            candidates.append((round(gap, 2), float(min(prom[i], prom[i + 1]))))
+    candidates.sort(key=lambda c: -c[1])
+    info = {"n_wall_peaks": int(len(pos)), "top_candidates": candidates[:top_n]}
+    if not candidates:
+        info["fail"] = f"no wall-pair gap in width_range {width_range}"
+        return [], info
+    widths = sorted({g for g, _conf in candidates})
+    return widths, info
+
+
+def compute_wall_anchor(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: float):
+    """Full wall-anchor pipeline: model_corridor_widths() (SXX triangle soup ->
+    candidate widths) then wall_scale_anchor() (recon-side match). Always
+    preserves the model-side candidate log (info["top_candidates"]) even when
+    the recon-side match subsequently fails (e.g. anchor-core's straddle
+    enforcement rejects the pair) — callers need that log to judge whether the
+    SOURCE geometry is usable at all, independent of whether THIS PARTICULAR
+    walk matched it (a real gap found reviewing upload_1781521406685: the prior
+    wiring silently dropped the width-candidate log whenever a recon-side match
+    was attempted, even on failure).
+    Returns (s_wall, info); s_wall is None on any failure, info always carries a
+    "fail" key in that case plus whatever diagnostics were available."""
+    if wall_points is None or not len(wall_points):
+        return None, {"fail": "wall_points not provided"}
+    widths, widths_info = model_corridor_widths(wall_points, is_triangle_soup=True)
+    if not widths:
+        return None, widths_info
+    s_wall, recon_info = wall_scale_anchor(Pg, cam_xz, widths, vext)
+    info = dict(widths_info)
+    info["recon_match"] = recon_info
+    if s_wall is None and "fail" not in info:
+        info["fail"] = recon_info.get("fail", "recon-side wall match failed")
+    return s_wall, info
 
 
 def wall_scale_anchor(Pg: np.ndarray, cam_xz: np.ndarray, widths: list,
@@ -325,13 +390,13 @@ def place_gravity(poses, scan_pts, bbox, scale=1.0):
              "u": [round(float(x), 4) for x in U[i]]} for i in range(len(C))]
 
 
-def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, axx_points=None):
+def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, wall_points=None):
     """Real registration: gravity-align scan, then register its CEILING band to
     the model ceiling (grid XY + yaw + scale + Umeyama-ICP). Returns placed
     poses + fit metrics. (Footage looks up → ceiling-to-ceiling locks well.)
-    axx_points (optional): AXX architecture vertices -> adds the corridor-width
-    anchor (wall_scale_anchor) to the metric-scale fusion. None (default) keeps
-    the prior 2-anchor (ceiling+camera) behavior unchanged."""
+    wall_points (optional): SXX (structure) triangle-soup vertices -> adds the
+    corridor-width anchor (wall_scale_anchor) to the metric-scale fusion. None
+    (default) keeps the prior 2-anchor (ceiling+camera) behavior unchanged."""
     from scipy.spatial import cKDTree
     centers, fwd, up = [], [], []
     for p in poses:
@@ -363,11 +428,7 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, axx_poin
     s_vert = float((hi[1] - lo[1]) / max(vext, 1e-6))
     floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
-    s_wall, wall_info = None, {"fail": "axx_points not provided"}
-    if axx_points is not None and len(axx_points):
-        widths, widths_info = model_corridor_widths(axx_points)
-        s_wall, wall_info = (wall_scale_anchor(Pg, Cg[:, [0, 2]], widths, vext)
-                             if widths else (None, widths_info))
+    s_wall, wall_info = compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext)
     s_m, scale_info = fuse_scale_estimates([s_vert, s_cam, s_wall])
     scale_info["wall_anchor"] = wall_info
     bbox_warn = bbox_height_warning(float(hi[1] - lo[1]))
@@ -500,7 +561,7 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
                        "path_m": round(plen, 2), "cam_h": round(eye - float(bbox[0][1]), 2)}
 
 
-def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=None, axx_points=None):
+def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=None, wall_points=None):
     """완전 자동 배관추종 배치: lane(메인런) + METRIC 스케일(천장높이+카메라높이 두 앵커 융합,
     robust) + 코너(B1 turn-fraction) + recon 형상. 수동 waypoint 없이 metric 길이로 배치.
     핵심: 궤적-런 피팅(런 전체 가정)은 과신장 → 독립 metric 앵커로 실제 보행거리 산출.
@@ -509,8 +570,8 @@ def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=Non
     fit_run=True: 세그먼트 길이를 FXX 런 실측 기하에 스냅(metric 스케일이 단안 모호성으로
     과소산출될 때). 방향·분기선택은 recon 유지, 길이만 모델 기준 — 코리더 전 구간을 걸은 경우.
     duration(초, 실제 영상 길이): 주어지면 산출 경로장/속도가 비현실적일 때 경고.
-    axx_points(선택): AXX 건축 정점 -> 복도폭 앵커(wall_scale_anchor)를 3번째 앵커로 융합에
-    추가. None(기본)이면 기존 2앵커(천장+카메라) 동작 그대로(폴백, 동작 변화 0)."""
+    wall_points(선택): SXX(구조) 삼각형 정점 -> 복도폭 앵커(wall_scale_anchor)를 3번째 앵커로
+    융합에 추가. None(기본)이면 기존 2앵커(천장+카메라) 동작 그대로(폴백, 동작 변화 0)."""
     from scan2bim.metric_scale import (
         bbox_height_warning, camera_height_scale, estimate_floor_level, fuse_scale_estimates, speed_warning,
     )
@@ -526,11 +587,7 @@ def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=Non
     bbox_warn = bbox_height_warning(float(bbox[1][1] - bbox[0][1]))
     floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
-    s_wall, wall_info = None, {"fail": "axx_points not provided"}
-    if axx_points is not None and len(axx_points):
-        widths, widths_info = model_corridor_widths(axx_points)
-        s_wall, wall_info = (wall_scale_anchor(Pg, Cg[:, [0, 2]], widths, vext)
-                             if widths else (None, widths_info))
+    s_wall, wall_info = compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext)
     s_m, scale_info = fuse_scale_estimates([s_vert, s_cam, s_wall])
     scale_info["wall_anchor"] = wall_info
     traj = Cg[:, [0, 2]]
@@ -666,9 +723,11 @@ def main():
     bbox = (allc.min(0).tolist(), allc.max(0).tolist())
     ceil = allc[allc[:, 1] >= (bbox[1][1] - 1.5)]        # top 1.5 m = ceiling band
     ceil = ceil[np.linspace(0, len(ceil) - 1, min(60000, len(ceil))).astype(int)]
-    # AXX(건축) 정점 -> 복도폭 앵커 재료(model_corridor_widths). 없으면 None -> 기존 2앵커.
-    axx_pts_list = [p.astype(np.float64) for p, c in zip(model_pts, model_pts_mdl) if c == "AXX"]
-    axx_points = np.concatenate(axx_pts_list) if axx_pts_list else None
+    # SXX(구조) 삼각형 정점 -> 복도폭 앵커 재료(model_corridor_widths, is_triangle_soup=True).
+    # AXX(건축)는 가구위주라 실측 결과 수직스팬>1.5m 삼각형이 0개 — 실제 벽/유리 파티션은 SXX
+    # (Gasan_7F: 9009개). 없으면 None -> 기존 2앵커.
+    sxx_pts_list = [p.astype(np.float64) for p, c in zip(model_pts, model_pts_mdl) if c == "SXX"]
+    wall_points = np.concatenate(sxx_pts_list) if sxx_pts_list else None
 
     if args.demo_html:
         poses, scan_pts = load_demo_cloud(args.demo_html, args.demo_match)
@@ -677,14 +736,14 @@ def main():
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
     if args.auto_pipe:
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
-        pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx, fit_run=args.fit_run, duration=args.duration, axx_points=axx_points)
+        pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx, fit_run=args.fit_run, duration=args.duration, wall_points=wall_points)
         print("  auto-pipe(metric):", reginfo)
     elif args.gt_path:
         wps = [[float(v) for v in seg.split(",")] for seg in args.gt_path.split()]
         pose_json, reginfo = place_gtpath(poses, scan_pts, bbox, wps, snap=(args.gt_mode == "snap"))
         print("  gt-path fit:", reginfo, "waypoints:", wps)
     else:
-        pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox, anchor=anchor, axx_points=axx_points)
+        pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox, anchor=anchor, wall_points=wall_points)
         print("  registration:", reginfo, "anchor:", anchor)
     if args.auto_localize and args.frames_dir:
         pose_json, locinfo = place_autolocalize(pose_json, args.dtdx, args.frames_dir, hfov=args.hfov)

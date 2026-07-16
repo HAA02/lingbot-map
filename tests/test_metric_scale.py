@@ -4,8 +4,20 @@ import unittest
 import numpy as np
 
 from scan2bim.metric_scale import (
-    bbox_height_warning, camera_height_scale, estimate_floor_level, fuse_scale_estimates, speed_warning,
+    apply_axis_split_scale, bbox_height_warning, camera_height_scale, estimate_floor_level,
+    fuse_scale_estimates, speed_warning,
 )
+
+
+def _ortho_poses(n=8, seed=0):
+    """N poses with orthonormal (f, u) bases in a gravity-aligned Y-up frame:
+    up is vertical, forward is a horizontal heading that varies per pose."""
+    rng = np.random.RandomState(seed)
+    ang = rng.uniform(0, 2 * np.pi, n)
+    c = rng.uniform(-3, 3, (n, 3)).astype(np.float64)
+    f = np.column_stack([np.cos(ang), np.zeros(n), np.sin(ang)])   # horizontal look
+    u = np.tile([0.0, 1.0, 0.0], (n, 1))                            # vertical up
+    return {"c": c, "f": f, "u": u}
 
 
 class TestFloorLevel(unittest.TestCase):
@@ -130,6 +142,72 @@ class TestBboxHeightWarning(unittest.TestCase):
         # own vertical span, not the room's floor-to-ceiling height.
         w = bbox_height_warning(0.49)
         self.assertIsNotNone(w)
+
+
+class TestAxisSplitScale(unittest.TestCase):
+    def test_positions_scaled_by_diag(self):
+        poses = _ortho_poses(seed=1)
+        pts = np.random.RandomState(2).uniform(-2, 2, (500, 3))
+        s_h, s_v = 3.64, 1.75
+        out, pts_out = apply_axis_split_scale(poses, pts, s_h, s_v)
+        d = np.array([s_h, s_v, s_h])
+        np.testing.assert_allclose(out["c"], np.asarray(poses["c"]) * d, rtol=1e-9)
+        np.testing.assert_allclose(pts_out, pts * d, rtol=1e-9)
+
+    def test_direction_invariants_under_anisotropy(self):
+        poses = _ortho_poses(n=12, seed=3)
+        out, _ = apply_axis_split_scale(poses, np.zeros((1, 3)), s_h=3.64, s_v=1.75)
+        fn = np.linalg.norm(out["f"], axis=1)
+        un = np.linalg.norm(out["u"], axis=1)
+        np.testing.assert_allclose(fn, 1.0, atol=1e-9)          # |f| = 1
+        np.testing.assert_allclose(un, 1.0, atol=1e-9)          # |u| = 1
+        dot = np.sum(out["f"] * out["u"], axis=1)
+        np.testing.assert_allclose(dot, 0.0, atol=1e-9)         # f ⊥ u preserved
+
+    def test_isotropic_equivalence(self):
+        # s_h == s_v is a plain uniform scale: positions * s, orthonormal
+        # directions unchanged (matches the existing isotropic placement path).
+        poses = _ortho_poses(seed=4)
+        pts = np.random.RandomState(5).uniform(-1, 1, (300, 3))
+        s = 2.3
+        out, pts_out = apply_axis_split_scale(poses, pts, s_h=s, s_v=s)
+        np.testing.assert_allclose(out["c"], np.asarray(poses["c"]) * s, rtol=1e-9)
+        np.testing.assert_allclose(pts_out, pts * s, rtol=1e-9)
+        np.testing.assert_allclose(out["f"], poses["f"], atol=1e-9)   # unchanged
+        np.testing.assert_allclose(out["u"], poses["u"], atol=1e-9)
+
+    def test_preserves_forward_horizontal_heading(self):
+        # anchoring on up keeps forward's XZ azimuth (both X and Z scale by s_h),
+        # so the look direction still follows the horizontally-scaled path.
+        poses = _ortho_poses(n=10, seed=6)
+        f_in = np.asarray(poses["f"])
+        az_in = np.arctan2(f_in[:, 2], f_in[:, 0])
+        out, _ = apply_axis_split_scale(poses, np.zeros((1, 3)), s_h=3.64, s_v=1.75)
+        f_out = out["f"]
+        az_out = np.arctan2(f_out[:, 2], f_out[:, 0])
+        np.testing.assert_allclose(np.cos(az_out - az_in), 1.0, atol=1e-9)
+
+    def test_recovers_anisotropic_corridor_dimensions(self):
+        # recon corridor: horizontal compressed 1/s_h, vertical 1/s_v vs the model.
+        # diag(s_h, s_v, s_h) must restore both the corridor width and its height.
+        rng = np.random.RandomState(7)
+        s_h, s_v = 3.64, 1.75
+        model_w, model_h = 3.2, 3.5
+        hw = (model_w / s_h) / 2.0        # recon half-width
+
+        def wall(x0, n=2000):
+            return np.column_stack([x0 + rng.normal(0, 0.004, n),
+                                    rng.uniform(0, model_h / s_v, n),
+                                    rng.uniform(0, 3.0, n)])
+
+        recon = np.vstack([wall(-hw), wall(hw)])
+        poses = {"c": np.array([[0.0, 0.7, 0.0]]),
+                 "f": np.array([[0.0, 0.0, 1.0]]), "u": np.array([[0.0, 1.0, 0.0]])}
+        _, pts_scaled = apply_axis_split_scale(poses, recon, s_h, s_v)
+        xext = float(pts_scaled[:, 0].max() - pts_scaled[:, 0].min())
+        yext = float(pts_scaled[:, 1].max() - pts_scaled[:, 1].min())
+        self.assertAlmostEqual(xext, model_w, delta=model_w * 0.05)
+        self.assertAlmostEqual(yext, model_h, delta=model_h * 0.05)
 
 
 if __name__ == "__main__":
