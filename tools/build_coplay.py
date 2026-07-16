@@ -758,6 +758,135 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
                        "path_m": round(plen, 2), "cam_h": round(eye - float(bbox[0][1]), 2)}
 
 
+def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, duration=None,
+                wall_points=None, corridor_width_hint=None, horizontal_scale_override=None):
+    """RIGID placement: axis-split METRIC scale + ONE yaw rotation + ONE translation
+    — no ICP, no CAD-polyline snap, no per-pose warping. The recon trajectory keeps
+    its OWN shape; it is only rotated and shifted into the model frame.
+
+    Why not place_registered (ICP ceiling-grid search) or place_pipe_auto (CAD
+    corner snap): on this repeated-pipe building ICP converges to a mirrored/yaw-
+    flipped local minimum (rmse~0.61, yaw~150° off — ceiling-inlier score is
+    ambiguous on parallel pipes), and the CAD snap warps the walk onto the fire-
+    pipe polyline whose corner sits ~12 m from where the person actually turned
+    (FXX corner Z≈-9.5 vs the real turn Z≈3). A pure rigid transform avoids both:
+    after gravity-align + chirality-flip the direction is already ~right (verified:
+    recon trajectory PCA within ~15° of the model corridor axis), only the metric
+    SIZE and the global yaw/offset were wrong.
+
+    Determination (deterministic, no search over yaw/offset):
+      scale  — s_v = ceiling+camera vertical fusion; s_h = corridor-width wall
+               anchor (or --corridor-width-hint / --horizontal-scale-override, or
+               fallback to s_v). Applied AXIS-SPLIT via apply_axis_split_scale so
+               the horizontal path is metric even when the vertical anchor alone
+               under-scales it (same finding/fix as place_pipe_auto; on this upload
+               the wall anchor abstains — straddle fails — so s_h needs the explicit
+               --horizontal-scale-override, exactly as it was separately verified).
+      yaw    — align the recon trajectory's dominant horizontal PCA axis to the
+               model corridor axis (model_ceiling PCA), the SAME a_s/a_p pair
+               place_registered computes, but used DIRECTLY (one value) rather than
+               grid-searched with ICP. The 180° axis ambiguity is resolved by the
+               FXX run's directed start→corner axis (main_pipe_run_L): keep the sign
+               whose rotated net heading agrees with the direction the corridor is
+               walked. If FXX is unavailable, keep the smaller rotation (the recon
+               is already near-aligned).
+      offset — --anchor 'x,z' (model coords) pins the trajectory START there: the
+               explicit, invariant-respecting reference (the caller supplies one
+               point instead of auto-confirming a global fit on repeated geometry).
+               Without --anchor the correctly-scaled/oriented trajectory centroid is
+               dropped at the model interior centre — a best-effort auto default
+               (the same centring place_gravity uses), NOT a verified registration.
+    Height = eye level (model floor + 1.5 m), keeping the metric vertical bob.
+    Returns (pose_json, info). corridor_width_hint / horizontal_scale_override: see
+    _resolve_horizontal_scale (same semantics as place_registered/place_pipe_auto)."""
+    from scan2bim.metric_scale import (
+        apply_axis_split_scale, bbox_height_warning, camera_height_scale,
+        estimate_floor_level, fuse_scale_estimates, speed_warning,
+    )
+    from scan2bim.pipe_path import main_pipe_run_L, trajectory_turn_fraction
+    centers, fwd, up = [], [], []
+    for p in poses:
+        c, f, u = viewer_pose(p); centers.append(c); fwd.append(f); up.append(u)
+    centers = np.array(centers); fwd = np.array(fwd); up = np.array(up)
+    g = up.mean(0); g /= (np.linalg.norm(g) + 1e-9)
+    Rg = _rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
+    Cg = centers @ Rg.T; Fg = fwd @ Rg.T; Ug = up @ Rg.T
+    P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0; Pg = P @ Rg.T
+    Cg[:, 0] *= -1.0; Fg[:, 0] *= -1.0; Ug[:, 0] *= -1.0; Pg[:, 0] *= -1.0   # chirality (model is X-mirrored)
+
+    lo, hi = np.array(bbox[0]), np.array(bbox[1])
+    # --- axis-split METRIC scale (reused from metric_scale, unmodified) ---
+    vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
+    s_vert = float((hi[1] - lo[1]) / max(vext, 1e-6))
+    bbox_warn = bbox_height_warning(float(hi[1] - lo[1]))
+    floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
+    s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
+    s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])
+    s_h, fallback_reason, wall_info = _resolve_horizontal_scale(
+        Pg, Cg[:, [0, 2]], wall_points, vext, s_v,
+        corridor_width_hint=corridor_width_hint, horizontal_scale_override=horizontal_scale_override)
+    scale_info = {"s_v": round(s_v, 4), "s_h": round(s_h, 4), "s_v_anchors": s_v_info,
+                  "wall_anchor": wall_info, "fallback_reason": fallback_reason}
+    poses_s, _Pg = apply_axis_split_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, s_h=s_h, s_v=s_v)
+    Cm, Fm, Um = poses_s["c"], poses_s["f"], poses_s["u"]        # now metric (axis-split)
+
+    # --- yaw: recon trajectory PCA -> model corridor PCA (direct, no ICP search) ---
+    traj = Cm[:, [0, 2]]
+    Ch = traj - traj.mean(0)
+    t2d = np.linalg.eigh(Ch.T @ Ch)[1][:, -1]                    # recon walk dominant axis
+    a_s = float(np.degrees(np.arctan2(t2d[1], t2d[0])))
+    Mh = model_ceiling[:, [0, 2]] - model_ceiling[:, [0, 2]].mean(0)
+    p2d = np.linalg.eigh(Mh.T @ Mh)[1][:, -1]                    # model corridor dominant axis
+    a_p = float(np.degrees(np.arctan2(p2d[1], p2d[0])))
+    # directed corridor reference (FXX run start->corner) to resolve the 180° flip
+    try:
+        run = main_pipe_run_L(fxx_file)
+        mdir = np.asarray(run[1] - run[0], dtype=np.float64)
+        mdir = mdir / (np.linalg.norm(mdir) + 1e-9)
+    except Exception:
+        mdir = None
+    net = traj[-1] - traj[0]
+
+    def _ry2(a):                                                # rotate XZ vectors by +a (deg)
+        r = np.deg2rad(a); return np.array([[np.cos(r), -np.sin(r)], [np.sin(r), np.cos(r)]])
+    cands = [a_p - a_s, a_p - a_s + 180.0]
+    if mdir is not None and float(np.linalg.norm(net)) > 1e-6:
+        yaw = max(cands, key=lambda a: float((net @ _ry2(a).T) @ mdir))
+    else:
+        yaw = min(cands, key=lambda a: abs(((a + 180.0) % 360.0) - 180.0))   # closest to identity
+    R2 = _ry2(yaw)                                               # apply the SAME convention used to pick yaw
+    Cr = np.column_stack([Cm[:, [0, 2]] @ R2.T, Cm[:, 1]])[:, [0, 2, 1]]
+    Fr = np.column_stack([Fm[:, [0, 2]] @ R2.T, Fm[:, 1]])[:, [0, 2, 1]]
+    Ur = np.column_stack([Um[:, [0, 2]] @ R2.T, Um[:, 1]])[:, [0, 2, 1]]
+
+    # --- translation: --anchor pins START, else centroid -> model interior centre ---
+    if anchor is not None:
+        off = np.array([float(anchor[0]) - Cr[0, 0], 0.0, float(anchor[1]) - Cr[0, 2]])
+        anchor_mode = "start@anchor"
+    else:
+        mc = (lo + hi) / 2.0; cen = Cr.mean(0)
+        off = np.array([mc[0] - cen[0], 0.0, mc[2] - cen[2]])
+        anchor_mode = "centroid@model-centre"
+    Ct = Cr + off
+    eye = float(lo[1]) + 1.5                                     # eye level; keep metric vertical bob
+    Ct[:, 1] += eye - float(np.median(Ct[:, 1]))
+
+    pose_json = [{"c": [round(float(x), 3) for x in Ct[i]],
+                  "f": [round(float(x), 4) for x in Fr[i]],
+                  "u": [round(float(x), 4) for x in Ur[i]]} for i in range(len(Ct))]
+    path_m = float(np.linalg.norm(np.diff(Ct[:, [0, 2]], axis=0), axis=1).sum())
+    tf, tang = trajectory_turn_fraction(Ct[:, [0, 2]])
+    info = {"mode": "rigid", "s_v": round(s_v, 4), "s_h": round(s_h, 4),
+            "yaw": round(float(yaw), 1), "turn_frac": round(float(tf), 2),
+            "turn_angle_deg": round(float(tang), 1), "path_m": round(path_m, 2),
+            "anchor": anchor_mode, "cam_h": round(eye - float(lo[1]), 2),
+            "fallback_reason": fallback_reason, "scale_anchors": scale_info}
+    warnings = [w for w in (bbox_warn, speed_warning(path_m, duration)) if w]
+    if warnings:
+        info["warning"] = "; ".join(warnings)
+    return pose_json, info
+
+
 def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=None, wall_points=None,
                     corridor_width_hint=None, horizontal_scale_override=None):
     """완전 자동 배관추종 배치: lane(메인런) + AXIS-SPLIT METRIC 스케일 + 코너(B1 turn-fraction)
@@ -905,6 +1034,7 @@ def main():
     ap.add_argument("--anchor", default=None, help="coarse 첫 위치 'x,z' (모델 좌표) → 그 근처 국소 정합")
     ap.add_argument("--gt-path", default=None, help="실제 촬영경로 waypoints 'x1,z1 x2,z2 ...' (모델 XZ) → 궤적을 이에 직접 피팅")
     ap.add_argument("--gt-mode", default="snap", choices=["snap", "umeyama"], help="snap=GT선에 스냅(직선 walk가 직선), umeyama=강체피팅(재구성 곡선 유지)")
+    ap.add_argument("--auto-rigid", action="store_true", help="강체정합: axis-split metric 스케일 + 회전(궤적 PCA→복도축) + 이동만(ICP·CAD스냅 없음). --anchor로 시작점 고정, 없으면 모델 중심에 드롭")
     ap.add_argument("--auto-pipe", action="store_true", help="메인 소화배관(FXX) 런 자동검출 → 그 아래로 경로 자동(수동 waypoint 불요)")
     ap.add_argument("--fit-run", action="store_true", help="auto-pipe 세그먼트 길이를 FXX 런 실측 기하에 스냅(천장높이 스케일 과소산출 보정·코리더 전구간 보행 시)")
     ap.add_argument("--auto-localize", action="store_true", help="prior 궤적을 프레임별 객체-앵커 PnP로 자동 정제(드리프트 제거)")
@@ -966,7 +1096,13 @@ def main():
     elif args.corridor_width_hint is not None:
         print(f"  corridor_width_hint: {args.corridor_width_hint} (manual, verified) "
               "— bypassing automatic SXX corridor-width detection")
-    if args.auto_pipe:
+    if args.auto_rigid:
+        fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
+        pose_json, reginfo = place_rigid(poses, scan_pts, ceil, bbox, fxx, anchor=anchor, duration=args.duration,
+                                         wall_points=wall_points, corridor_width_hint=args.corridor_width_hint,
+                                         horizontal_scale_override=args.horizontal_scale_override)
+        print("  rigid:", reginfo, "anchor:", anchor)
+    elif args.auto_pipe:
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
         pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx, fit_run=args.fit_run, duration=args.duration,
                                              wall_points=wall_points, corridor_width_hint=args.corridor_width_hint,
@@ -988,6 +1124,9 @@ def main():
     # 좌상단 배지: 자동(초록) vs 수동(주황) 구별
     if args.auto_localize and args.frames_dir:
         pmode, pcol = "🤖 자동 · 객체 PnP", "#31d27c"
+    elif args.auto_rigid:
+        pmode, pcol = (("📍 강체정합 · 앵커+회전", "#ffb347") if anchor is not None
+                       else ("🧭 강체정합 · 회전+이동", "#31d27c"))
     elif args.auto_pipe:
         pmode, pcol = "🤖 자동 · 배관런 검출", "#31d27c"
     elif args.gt_path:
