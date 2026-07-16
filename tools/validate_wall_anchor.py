@@ -1,30 +1,41 @@
 #!/usr/bin/env python3
-"""Validate metric-scale reproduction for coplay auto-placement (Phase 1b: wall-scale-x3).
+"""Validate metric-scale reproduction for coplay auto-placement (wall-scale-x3).
 
-Real data (upload_1781521406685: 144 poses / 35.3s) shows the CURRENT ceiling+camera
-2-anchor fusion produces an implausible walking speed (~0.298 m/s vs a real ~0.9 m/s) —
-the ~3x monocular scale under-estimate this project is fixing with a wall-width anchor
-(scan2bim/wall_anchor.py, Phase 2). This script reproduces that red baseline so the fix
-can be verified against a known-bad number, and gives an exit-3 stub for the (not yet
-wired) wall-anchor default path.
+Real data (upload_1781521406685: 144 poses / 35.3s) shows the ceiling+camera
+2-anchor fusion alone produces an implausible walking speed (~0.3 m/s vs a real
+~0.9 m/s) — the ~3x monocular scale under-estimate this project is fixing with a
+wall-width anchor (scan2bim/wall_anchor.py). This script reproduces that red
+baseline and validates the 3-anchor fusion (tools/build_coplay.py) against it.
 
 Usage:
     .venv/bin/python tools/validate_wall_anchor.py <lbp2 path> [--no-wall-anchor] \
-        [--duration <s>] [--model models/pipe_duct.glb]
+        [--duration <s>] [--model models/pipe_duct.glb] [--dtdx <path/glob>...]
 
---no-wall-anchor reproduces the CURRENT (pre-wall-anchor) 2-anchor fusion:
+Default mode (wall anchor, requires --dtdx <multi-discipline model files/glob>):
     gravity-align (build_coplay.viewer_pose + _rot_a_to_b, read-only reference) ->
-    s_vert = model_bbox_height / scan_vertical_extent,
+    s_vert = dtdx_interior_bbox_height / scan_vertical_extent (mirrors
+             tools/build_coplay.py::main()'s non-SXX interior union bbox),
     s_cam  = scan2bim.metric_scale.camera_height_scale(...),
-    s_m, info = scan2bim.metric_scale.fuse_scale_estimates([s_vert, s_cam])
-This mirrors tools/build_coplay.py::place_pipe_auto()'s scale procedure (not its
-pipe-run/waypoint routing, which needs an FXX dtdx file outside this phase's scope).
+    s_wall = tools.build_coplay.wall_scale_anchor(...) — AXX architecture wall-pair
+             gaps (tools.build_coplay.model_corridor_widths) vs. the recon's own
+             corridor-width anchor (scan2bim.wall_anchor.estimate_wall_scale),
+    s_m, info = scan2bim.metric_scale.fuse_scale_estimates([s_vert, s_cam, s_wall])
+Exit codes (default mode): 3 if the wall anchor can't even be attempted (import
+failure, or no AXX/architecture discipline in --dtdx); else 0 if the resulting
+speed falls in the plausible SPEED_BAND, 1 otherwise (measured value + diagnostics
+printed either way — never silently adjusted to fit the band).
 
-Default mode (wall anchor) is Phase 2 work and is not wired here; it always exits 3.
+--no-wall-anchor reproduces the PRIOR (pre-wall-anchor) 2-anchor fusion, unchanged:
+    same gravity-align + s_vert/s_cam fusion, s_wall never computed. If --dtdx is
+    given, s_vert uses the dtdx interior bbox height (real red-baseline
+    reproduction); otherwise falls back to --model (default models/pipe_duct.glb,
+    Phase-1 behavior, regression-free). Always exits 0 (baseline reproduction
+    "succeeding" is independent of whether the resulting speed is plausible).
 """
 from __future__ import annotations
 
 import argparse
+import glob
 import struct
 import subprocess
 import sys
@@ -146,10 +157,10 @@ def resolve_duration(lbp2_path: Path, parsed: dict, duration_arg: float | None) 
 
 
 # ---------------------------------------------------------------------------
-# model bbox height (vertical/up-axis extent) — pipe_duct.glb and other
-# glb_native models here are internally Y-up, metres, vertex-baked (identity
-# node transforms; see CLAUDE.md coordinate conventions), matching the Y-up
-# convention build_coplay.py uses for its DTDX-decoded bbox[1] index.
+# model bbox height (vertical/up-axis extent) — GLB path (Phase-1 fallback when
+# --dtdx is not given). glb_native models here are internally Y-up, metres,
+# vertex-baked (identity node transforms; see CLAUDE.md coordinate conventions),
+# matching the Y-up convention build_coplay.py uses for its DTDX-decoded bbox[1].
 # ---------------------------------------------------------------------------
 
 def model_bbox_height(model_path: Path) -> float:
@@ -162,7 +173,6 @@ def model_bbox_height(model_path: Path) -> float:
         allv = np.concatenate(verts, axis=0).astype(np.float64)
     else:
         allv = np.asarray(mesh.vertices, dtype=np.float64)
-    # drop extreme outliers only, same as tools/build_coplay.py's bbox computation
     med = np.median(allv, axis=0)
     keep = (np.abs(allv - med) < 60).all(axis=1)
     allc = allv[keep] if keep.any() else allv
@@ -170,7 +180,50 @@ def model_bbox_height(model_path: Path) -> float:
 
 
 # ---------------------------------------------------------------------------
-# metric scale: reproduces tools/build_coplay.py::place_pipe_auto()'s procedure.
+# dtdx model loading — mirrors tools/build_coplay.py::main()'s geometry loading
+# and interior (non-SXX union) bbox-height computation exactly.
+# ---------------------------------------------------------------------------
+
+def _expand_dtdx(patterns: list[str]) -> list[Path]:
+    paths: list[Path] = []
+    for pat in patterns:
+        matches = sorted(glob.glob(pat))
+        if matches:
+            paths.extend(Path(m) for m in matches)
+        elif Path(pat).exists():
+            paths.append(Path(pat))
+    return paths
+
+
+def load_dtdx_vertices_by_code(dtdx_paths: list[Path]) -> dict[str, np.ndarray]:
+    from scan2bim.dtdx_geometry import decode_geometry
+    out: dict[str, list[np.ndarray]] = {}
+    for p in dtdx_paths:
+        g = decode_geometry(str(p))
+        code = g["discipline_code"]
+        for m in g["meshes"]:
+            pos = np.asarray(m["positions"], dtype=np.float64)
+            if len(pos):
+                out.setdefault(code, []).append(pos)
+    return {code: np.concatenate(v, axis=0) for code, v in out.items()}
+
+
+def dtdx_bbox_height(by_code: dict[str, np.ndarray]) -> float:
+    """Interior (non-SXX) union bbox height, exactly mirroring
+    tools/build_coplay.py::main()'s `interior`/`bbox` computation."""
+    interior = [v for c, v in by_code.items() if c != "SXX"] or list(by_code.values())
+    if not interior:
+        raise ValueError("no dtdx geometry loaded")
+    allp = np.concatenate(interior, axis=0)
+    med = np.median(allp, axis=0)
+    keep = (np.abs(allp - med) < 60).all(axis=1)
+    allc = allp[keep] if keep.any() else allp
+    return float(allc[:, 1].max() - allc[:, 1].min())
+
+
+# ---------------------------------------------------------------------------
+# metric scale: reproduces tools/build_coplay.py::place_pipe_auto()'s procedure,
+# optionally extended with the corridor-width (wall) anchor.
 # ---------------------------------------------------------------------------
 
 def _import_build_coplay():
@@ -181,7 +234,8 @@ def _import_build_coplay():
     return bc
 
 
-def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: float) -> dict:
+def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: float,
+                         axx_points: np.ndarray | None = None) -> dict:
     bc = _import_build_coplay()
     vp = [bc.viewer_pose(p) for p in poses]
     centers = np.array([v[0] for v in vp])
@@ -200,13 +254,21 @@ def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: f
     s_vert = bbox_height_m / max(vext, 1e-6)
     floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
-    s_m, scale_info = fuse_scale_estimates([s_vert, s_cam])
+
+    s_wall, wall_info = None, {"fail": "axx_points not provided"}
+    if axx_points is not None and len(axx_points):
+        widths, widths_info = bc.model_corridor_widths(axx_points)
+        s_wall, wall_info = (bc.wall_scale_anchor(Pg, Cg[:, [0, 2]], widths, vext)
+                             if widths else (None, widths_info))
+
+    s_m, scale_info = fuse_scale_estimates([s_vert, s_cam, s_wall])
+    scale_info["wall_anchor"] = wall_info
 
     traj = Cg[:, [0, 2]]
     total_raw = float(np.linalg.norm(np.diff(traj, axis=0), axis=1).sum())
     return {
-        "s_vert": s_vert, "s_cam": s_cam, "s_m": s_m, "scale_info": scale_info,
-        "vext": vext, "floor_y": floor_y, "total_raw": total_raw,
+        "s_vert": s_vert, "s_cam": s_cam, "s_wall": s_wall, "s_m": s_m,
+        "scale_info": scale_info, "vext": vext, "floor_y": floor_y, "total_raw": total_raw,
     }
 
 
@@ -214,29 +276,17 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("lbp2", type=Path, help="path to a .lbp2/.lbp3/.lbp4 scan payload")
     ap.add_argument("--no-wall-anchor", action="store_true",
-                     help="reproduce the current (pre-wall-anchor) 2-anchor fusion baseline")
+                     help="reproduce the prior (pre-wall-anchor) 2-anchor fusion baseline")
     ap.add_argument("--duration", type=float, default=None, help="video duration in seconds")
-    ap.add_argument("--model", type=Path, default=Path("models/pipe_duct.glb"))
+    ap.add_argument("--model", type=Path, default=Path("models/pipe_duct.glb"),
+                     help="GLB model bbox for --no-wall-anchor when --dtdx is not given")
+    ap.add_argument("--dtdx", nargs="+", default=None,
+                     help="dtdx path(s) or glob pattern(s), e.g. 'models/Gasan_7F/*.dtdx' "
+                          "(multi-discipline: interior bbox height + AXX corridor widths)")
     args = ap.parse_args()
-
-    if not args.no_wall_anchor:
-        # Phase 2 work (connecting scan2bim.wall_anchor as the default anchor) is not
-        # part of this phase. Fail clearly rather than a silent placeholder success,
-        # whether or not the module happens to exist/import yet.
-        try:
-            import scan2bim.wall_anchor  # noqa: F401
-        except Exception as e:
-            print(f"wall anchor not available yet (import failed: {e})")
-            return 3
-        print("wall anchor not available yet (Phase 2 integration pending — "
-              "use --no-wall-anchor to reproduce the current baseline)")
-        return 3
 
     if not args.lbp2.exists():
         print(f"error: lbp2 not found: {args.lbp2}", file=sys.stderr)
-        return 2
-    if not args.model.exists():
-        print(f"error: model not found: {args.model}", file=sys.stderr)
         return 2
 
     parsed = parse_lbp2(args.lbp2)
@@ -249,10 +299,45 @@ def main() -> int:
         print("error: duration could not be determined — pass --duration explicitly", file=sys.stderr)
         return 2
 
-    bbox_h = model_bbox_height(args.model)
-    bbox_warn = bbox_height_warning(bbox_h)
+    dtdx_paths = _expand_dtdx(args.dtdx) if args.dtdx else []
+    if args.dtdx and not dtdx_paths:
+        print(f"error: no dtdx files matched: {args.dtdx}", file=sys.stderr)
+        return 2
+    by_code = load_dtdx_vertices_by_code(dtdx_paths) if dtdx_paths else {}
+    if dtdx_paths:
+        print(f"  dtdx: {len(dtdx_paths)} file(s), disciplines={sorted(by_code)}")
 
-    scale = compute_metric_scale(parsed["poses"], parsed["points"], bbox_h)
+    if not args.no_wall_anchor:
+        # Default mode needs a real multi-discipline model: the interior bbox
+        # height for s_vert, and AXX architecture geometry for the wall anchor.
+        if not dtdx_paths:
+            print("error: default (wall-anchor) mode needs --dtdx <multi-discipline model "
+                  "files/glob> — corridor widths come from the AXX architecture geometry",
+                  file=sys.stderr)
+            return 2
+        try:
+            import scan2bim.wall_anchor  # noqa: F401
+        except Exception as e:
+            print(f"wall anchor not available (import failed: {e})")
+            return 3
+        bbox_h = dtdx_bbox_height(by_code)
+        axx_points = by_code.get("AXX")
+        if axx_points is None:
+            print("wall anchor not available: no AXX (architecture) discipline in --dtdx "
+                  "— corridor widths need real walls, not MEP-only geometry")
+            return 3
+    else:
+        if dtdx_paths:
+            bbox_h = dtdx_bbox_height(by_code)
+        else:
+            if not args.model.exists():
+                print(f"error: model not found: {args.model}", file=sys.stderr)
+                return 2
+            bbox_h = model_bbox_height(args.model)
+        axx_points = None  # --no-wall-anchor: reproduce the 2-anchor baseline only
+
+    bbox_warn = bbox_height_warning(bbox_h)
+    scale = compute_metric_scale(parsed["poses"], parsed["points"], bbox_h, axx_points=axx_points)
     path_m = scale["total_raw"] * scale["s_m"]
     speed_ms = path_m / duration
     lo, hi = SPEED_BAND
@@ -261,18 +346,32 @@ def main() -> int:
     print(f"scale={scale['s_m']:.4f} path_m={path_m:.2f} duration_s={duration:.2f} "
           f"speed_ms={speed_ms:.3f} band=[{lo},{hi}] verdict={verdict}")
     s_cam_str = f"{scale['s_cam']:.4f}" if scale["s_cam"] is not None else "n/a"
+    s_wall_str = f"{scale['s_wall']:.4f}" if scale["s_wall"] is not None else "n/a"
     print(f"  model_bbox_height_m={bbox_h:.3f} scan_vertical_extent={scale['vext']:.3f}")
-    print(f"  s_vert={scale['s_vert']:.4f} s_cam={s_cam_str} "
-          f"agree={scale['scale_info']['agree']} spread={scale['scale_info']['spread']}")
+    print(f"  s_vert={scale['s_vert']:.4f} s_cam={s_cam_str} s_wall={s_wall_str} "
+          f"n_anchors={scale['scale_info']['n']} agree={scale['scale_info']['agree']} "
+          f"spread={scale['scale_info']['spread']}")
+    wa = scale["scale_info"].get("wall_anchor") or {}
+    if wa:
+        print(f"  wall_anchor: {wa}")
     if bbox_warn:
         print(f"  WARNING (bbox): {bbox_warn}")
     sw = speed_warning(path_m, duration)
     if sw:
         print(f"  WARNING (speed): {sw}")
+
+    if args.no_wall_anchor:
+        if verdict == "FAIL":
+            print(f"  NOTE: speed {speed_ms:.3f} m/s is outside the plausible band {SPEED_BAND} — "
+                  "this reproduces the KNOWN red baseline (monocular scale under-estimate), "
+                  "not a script bug. exit 0: reproduction succeeded.")
+        return 0
+
+    # Default (wall-anchor) mode: report the measured verdict as-is, never adjusted.
     if verdict == "FAIL":
         print(f"  NOTE: speed {speed_ms:.3f} m/s is outside the plausible band {SPEED_BAND} — "
-              "this reproduces the KNOWN red baseline (monocular scale under-estimate), "
-              "not a script bug. exit 0: reproduction succeeded.")
+              "reported as measured, not adjusted.")
+        return 1
     return 0
 
 
