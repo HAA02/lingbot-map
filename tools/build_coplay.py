@@ -365,6 +365,46 @@ def _split_trajectory_legs(cam_xz: np.ndarray, margin: float = 0.0,
     return (leg_a_out, frac_a), (leg_b_out, frac_b), float(tf), float(ang), margin_frac
 
 
+def _resolve_horizontal_scale(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: float, s_v: float,
+                              corridor_width_hint: float | None = None,
+                              horizontal_scale_override: float | None = None):
+    """Resolve s_h (the horizontal axis-split scale) for place_pipe_auto/
+    place_registered. Two independent escape hatches, in priority order:
+
+    horizontal_scale_override: sets s_h DIRECTLY — compute_wall_anchor() is
+    never called, so estimate_wall_scale/model_corridor_widths never run: no
+    peak-finding, no straddle gate, no _choose_scale. A pure verification
+    override for isolating whether a downstream stage (e.g. apply_axis_split_
+    scale's routing) is itself broken, independent of whether the wall anchor
+    can find a value at all. Distinct from corridor_width_hint, which still
+    runs full detection (peak-finding + straddle gate) with a single candidate
+    width — ceiling-gate review found this upload's blocker is the straddle
+    gate itself (_select_pair, upstream of where a width hint is consumed by
+    _choose_scale), so a hint alone cannot reach past it; the override can.
+    info["source"]="manual_override_bypasses_detection" marks this explicitly,
+    distinct from "manual_hint" (corridor_width_hint) and auto-detected results.
+
+    corridor_width_hint: passed through to compute_wall_anchor() unchanged
+    (see its docstring) — full detection pipeline still runs.
+
+    Neither given: normal compute_wall_anchor() automatic SXX detection.
+    In all cases, s_h falls back to s_v (with fallback_reason) if the wall
+    anchor (or override) doesn't produce a value — override always produces a
+    value by construction, so it never falls back.
+
+    Returns (s_h, fallback_reason, wall_info)."""
+    if horizontal_scale_override is not None:
+        s_h = float(horizontal_scale_override)
+        wall_info = {"source": "manual_override_bypasses_detection",
+                     "horizontal_scale_override": s_h}
+        return s_h, None, wall_info
+    s_wall, wall_info = compute_wall_anchor(Pg, cam_xz, wall_points, vext,
+                                            corridor_width_hint=corridor_width_hint)
+    if s_wall is not None:
+        return s_wall, None, wall_info
+    return s_v, wall_info.get("fail", "wall anchor unavailable"), wall_info
+
+
 def compute_wall_anchor(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: float,
                         corridor_width_hint: float | None = None):
     """Full wall-anchor pipeline: model_corridor_widths() (SXX triangle soup ->
@@ -526,7 +566,7 @@ def place_gravity(poses, scan_pts, bbox, scale=1.0):
 
 
 def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, wall_points=None,
-                     corridor_width_hint=None):
+                     corridor_width_hint=None, horizontal_scale_override=None):
     """Real registration: gravity-align scan, then register its CEILING band to
     the model ceiling (grid XY + yaw + scale + Umeyama-ICP). Returns placed
     poses + fit metrics. (Footage looks up → ceiling-to-ceiling locks well.)
@@ -539,7 +579,10 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, wall_poi
     unchanged: s_h falls back to s_v, so apply_axis_split_scale(s_h=s_v,s_v=s_v)
     degenerates to the old uniform scale exactly.
     corridor_width_hint (optional): see compute_wall_anchor() — bypasses
-    automatic corridor-width detection with a single verified value."""
+    automatic corridor-width detection with a single verified value.
+    horizontal_scale_override (optional): see _resolve_horizontal_scale() —
+    sets s_h directly, bypassing compute_wall_anchor() entirely (no detection,
+    no straddle gate). Takes priority over corridor_width_hint."""
     from scipy.spatial import cKDTree
     centers, fwd, up = [], [], []
     for p in poses:
@@ -570,14 +613,9 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, wall_poi
     floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
     s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])
-    s_wall, wall_info = compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext,
-                                            corridor_width_hint=corridor_width_hint)
-    fallback_reason = None
-    if s_wall is not None:
-        s_h = s_wall
-    else:
-        s_h = s_v
-        fallback_reason = wall_info.get("fail", "wall anchor unavailable")
+    s_h, fallback_reason, wall_info = _resolve_horizontal_scale(
+        Pg, Cg[:, [0, 2]], wall_points, vext, s_v,
+        corridor_width_hint=corridor_width_hint, horizontal_scale_override=horizontal_scale_override)
     scale_info = {"s_v": round(s_v, 4), "s_h": round(s_h, 4), "s_v_anchors": s_v_info,
                   "wall_anchor": wall_info, "fallback_reason": fallback_reason}
     bbox_warn = bbox_height_warning(float(hi[1] - lo[1]))
@@ -721,7 +759,7 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
 
 
 def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=None, wall_points=None,
-                    corridor_width_hint=None):
+                    corridor_width_hint=None, horizontal_scale_override=None):
     """완전 자동 배관추종 배치: lane(메인런) + AXIS-SPLIT METRIC 스케일 + 코너(B1 turn-fraction)
     + recon 형상. 수동 waypoint 없이 metric 길이로 배치.
     단안 재구성은 수평(X,Z) 두 축을 수직(Y)보다 추가로 더 압축한다(실측: upload_1781521406685
@@ -738,7 +776,10 @@ def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=Non
     wall_points(선택): SXX(구조) 삼각형 정점 -> 복도폭 벽앵커 재료. None(기본)이면 s_h=s_v
     폴백만 발생 — 즉 axis-split 이전과 동일한 등방 스케일 동작(회귀 없음).
     corridor_width_hint(선택): compute_wall_anchor() 참조 — 자동 복도폭 검출을
-    사용자가 검증한 단일값으로 우회(길이 1 후보라 모호성 자체가 없음)."""
+    사용자가 검증한 단일값으로 우회(길이 1 후보라 모호성 자체가 없음).
+    horizontal_scale_override(선택): _resolve_horizontal_scale() 참조 — s_h를
+    직접 대입해 compute_wall_anchor() 자체를 생략(검출/straddle 게이트 미관여).
+    corridor_width_hint보다 우선."""
     from scan2bim.metric_scale import (
         apply_axis_split_scale, bbox_height_warning, camera_height_scale, estimate_floor_level,
         fuse_scale_estimates, speed_warning,
@@ -758,14 +799,9 @@ def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=Non
     floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
     s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])           # 수직: 천장고+카메라높이 (기존 2앵커)
-    s_wall, wall_info = compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext,
-                                            corridor_width_hint=corridor_width_hint)   # 수평: straddle 강제 벽앵커
-    fallback_reason = None
-    if s_wall is not None:
-        s_h = s_wall
-    else:
-        s_h = s_v
-        fallback_reason = wall_info.get("fail", "wall anchor unavailable")
+    s_h, fallback_reason, wall_info = _resolve_horizontal_scale(     # 수평: straddle 강제 벽앵커 (또는 오버라이드)
+        Pg, Cg[:, [0, 2]], wall_points, vext, s_v,
+        corridor_width_hint=corridor_width_hint, horizontal_scale_override=horizontal_scale_override)
     scale_info = {"s_v": round(s_v, 4), "s_h": round(s_h, 4), "s_v_anchors": s_v_info,
                   "wall_anchor": wall_info, "fallback_reason": fallback_reason}
 
@@ -878,8 +914,12 @@ def main():
     ap.add_argument("--duration", type=float, default=35.3)
     ap.add_argument("--corridor-width-hint", type=float, default=None,
                     help="단일 사용자 검증 복도폭(m) — 자동 SXX 후보 검출을 완전히 우회해 "
-                         "[hint] 단일 후보로 estimate_wall_scale 호출(모호성 없음). "
-                         "없으면 기존 자동검출 그대로(회귀 없음)")
+                         "[hint] 단일 후보로 estimate_wall_scale 호출(모호성 없음, straddle "
+                         "게이트는 여전히 거침). 없으면 기존 자동검출 그대로(회귀 없음)")
+    ap.add_argument("--horizontal-scale-override", type=float, default=None,
+                    help="s_h(수평 axis-split 스케일) 직접 대입 — compute_wall_anchor() 자체를 "
+                         "생략(검출·straddle 게이트 미관여). corridor-width-hint보다 우선하는 "
+                         "순수 검증용 플래그(자동/힌트 결과와 구분 표기됨)")
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
@@ -920,13 +960,17 @@ def main():
     else:
         poses, scan_pts = fetch_scan(args.base_url, args.upload)
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
-    if args.corridor_width_hint is not None:
+    if args.horizontal_scale_override is not None:
+        print(f"  horizontal_scale_override: {args.horizontal_scale_override} "
+              "(manual_override_bypasses_detection) — compute_wall_anchor() skipped entirely")
+    elif args.corridor_width_hint is not None:
         print(f"  corridor_width_hint: {args.corridor_width_hint} (manual, verified) "
               "— bypassing automatic SXX corridor-width detection")
     if args.auto_pipe:
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
         pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx, fit_run=args.fit_run, duration=args.duration,
-                                             wall_points=wall_points, corridor_width_hint=args.corridor_width_hint)
+                                             wall_points=wall_points, corridor_width_hint=args.corridor_width_hint,
+                                             horizontal_scale_override=args.horizontal_scale_override)
         print("  auto-pipe(metric):", reginfo)
     elif args.gt_path:
         wps = [[float(v) for v in seg.split(",")] for seg in args.gt_path.split()]
@@ -934,7 +978,8 @@ def main():
         print("  gt-path fit:", reginfo, "waypoints:", wps)
     else:
         pose_json, reginfo = place_registered(poses, scan_pts, ceil, bbox, anchor=anchor, wall_points=wall_points,
-                                              corridor_width_hint=args.corridor_width_hint)
+                                              corridor_width_hint=args.corridor_width_hint,
+                                              horizontal_scale_override=args.horizontal_scale_override)
         print("  registration:", reginfo, "anchor:", anchor)
     if args.auto_localize and args.frames_dir:
         pose_json, locinfo = place_autolocalize(pose_json, args.dtdx, args.frames_dir, hfov=args.hfov)
@@ -970,9 +1015,13 @@ def main():
             .replace("__POSES__", json.dumps(pose_json))
             .replace("__META__", json.dumps({
                 "duration": args.duration,
+                **({"horizontal_scale_override": args.horizontal_scale_override,
+                    "horizontal_scale_override_note": "manual_override_bypasses_detection — "
+                                                       "s_h set directly, no wall-anchor detection ran"}
+                   if args.horizontal_scale_override is not None else {}),
                 **({"corridor_width_hint": args.corridor_width_hint,
                     "corridor_width_hint_note": "manual, verified — not auto-detected"}
-                   if args.corridor_width_hint is not None else {}),
+                   if args.corridor_width_hint is not None and args.horizontal_scale_override is None else {}),
             }))
             .replace("__MODELNAME__", " + ".join(names))
             .replace("__TRIS__", f"{tris:,}")

@@ -261,7 +261,8 @@ def _import_build_coplay():
 
 def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: float,
                          wall_points: np.ndarray | None = None,
-                         corridor_width_hint: float | None = None) -> dict:
+                         corridor_width_hint: float | None = None,
+                         horizontal_scale_override: float | None = None) -> dict:
     """AXIS-SPLIT metric scale (mirrors tools/build_coplay.py::place_pipe_auto()):
     s_v = fuse_scale_estimates([s_vert, s_cam]) (vertical: ceiling-height + camera-
     height, unchanged 2-anchor logic); s_h = the wall (corridor-width) anchor if
@@ -272,7 +273,11 @@ def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: f
     mathematically identical to the pre-axis-split 2-anchor value — the
     --no-wall-anchor reproduction path is unaffected.
     corridor_width_hint: see tools.build_coplay.compute_wall_anchor() — bypasses
-    automatic corridor-width detection with a single user-verified value."""
+    automatic corridor-width detection with a single user-verified value (full
+    detection incl. the straddle gate still runs against that one candidate).
+    horizontal_scale_override: see tools.build_coplay._resolve_horizontal_scale()
+    — sets s_h directly, skipping compute_wall_anchor() (and therefore the
+    straddle gate) entirely. Takes priority over corridor_width_hint."""
     bc = _import_build_coplay()
     centers, fwd, up = [], [], []
     for p in poses:
@@ -295,14 +300,14 @@ def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: f
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
     s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])
 
-    s_wall, wall_info = bc.compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext,
-                                               corridor_width_hint=corridor_width_hint)
-    fallback_reason = None
-    if s_wall is not None:
-        s_h = s_wall
-    else:
-        s_h = s_v
-        fallback_reason = wall_info.get("fail", "wall anchor unavailable")
+    s_h, fallback_reason, wall_info = bc._resolve_horizontal_scale(
+        Pg, Cg[:, [0, 2]], wall_points, vext, s_v,
+        corridor_width_hint=corridor_width_hint, horizontal_scale_override=horizontal_scale_override)
+    # s_wall: the wall-anchor's OWN detected value (None if bypassed via override,
+    # or if detection failed and s_h fell back to s_v) — distinct from s_h, which
+    # is what actually drives placement either way.
+    s_wall = None if wall_info.get("source") == "manual_override_bypasses_detection" else (
+        s_h if fallback_reason is None else None)
 
     poses_s, _Pg_s = apply_axis_split_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, s_h=s_h, s_v=s_v)
     traj = poses_s["c"][:, [0, 2]]                                    # already metric
@@ -331,7 +336,11 @@ def main() -> int:
     ap.add_argument("--corridor-width-hint", type=float, default=None,
                      help="single user-verified corridor width (m) — bypasses automatic SXX "
                           "candidate detection entirely (len==1 candidate list, no ambiguity). "
-                          "Not auto-detected; a scalar hint the caller has separately verified.")
+                          "Full detection (incl. the straddle gate) still runs against it.")
+    ap.add_argument("--horizontal-scale-override", type=float, default=None,
+                     help="sets s_h directly, skipping compute_wall_anchor() (and its straddle "
+                          "gate) entirely — a pure verification override, distinct from and "
+                          "taking priority over --corridor-width-hint.")
     args = ap.parse_args()
 
     if not args.lbp2.exists():
@@ -374,7 +383,7 @@ def main() -> int:
             return 3
         bbox_h = dtdx_bbox_height(by_code)
         wall_points = by_code.get("SXX")
-        if wall_points is None and args.corridor_width_hint is None:
+        if wall_points is None and args.corridor_width_hint is None and args.horizontal_scale_override is None:
             print("wall anchor not available: no SXX (structure) discipline in --dtdx "
                   "— corridor widths need real walls, not MEP-only geometry")
             return 3
@@ -388,13 +397,17 @@ def main() -> int:
             bbox_h = model_bbox_height(args.model)
         wall_points = None  # --no-wall-anchor: reproduce the 2-anchor baseline only
 
-    if args.corridor_width_hint is not None:
+    if args.horizontal_scale_override is not None:
+        print(f"  horizontal_scale_override: {args.horizontal_scale_override} "
+              "(manual_override_bypasses_detection) — compute_wall_anchor() skipped entirely")
+    elif args.corridor_width_hint is not None:
         print(f"  corridor_width_hint: {args.corridor_width_hint} (manual, verified) "
               "— bypassing automatic SXX corridor-width detection")
 
     bbox_warn = bbox_height_warning(bbox_h)
     scale = compute_metric_scale(parsed["poses"], parsed["points"], bbox_h, wall_points=wall_points,
-                                 corridor_width_hint=args.corridor_width_hint)
+                                 corridor_width_hint=args.corridor_width_hint,
+                                 horizontal_scale_override=args.horizontal_scale_override)
     path_m = scale["path_m"]                      # already axis-split metric
     speed_ms = path_m / duration
     s_cam_str = f"{scale['s_cam']:.4f}" if scale["s_cam"] is not None else "n/a"
