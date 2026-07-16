@@ -11,29 +11,42 @@ Usage:
     .venv/bin/python tools/validate_wall_anchor.py <lbp2 path> [--no-wall-anchor] \
         [--duration <s>] [--model models/pipe_duct.glb] [--dtdx <path/glob>...]
 
-Default mode (wall anchor, requires --dtdx <multi-discipline model files/glob>):
+Default mode (AXIS-SPLIT, requires --dtdx <multi-discipline model files/glob>):
     gravity-align (build_coplay.viewer_pose + _rot_a_to_b, read-only reference) ->
-    s_vert = dtdx_interior_bbox_height / scan_vertical_extent (mirrors
-             tools/build_coplay.py::main()'s non-SXX interior union bbox),
-    s_cam  = scan2bim.metric_scale.camera_height_scale(...),
-    s_wall = tools.build_coplay.wall_scale_anchor(...) — SXX structure wall-pair
-             gaps (tools.build_coplay.model_corridor_widths, is_triangle_soup=True,
-             vertical-span>1.5m + [1.5,6]m width clamp — AXX/architecture was
-             tried first but is furniture-dominated, see model_corridor_widths()
-             docstring) vs. the recon's own corridor-width anchor
-             (scan2bim.wall_anchor.estimate_wall_scale),
-    s_m, info = scan2bim.metric_scale.fuse_scale_estimates([s_vert, s_cam, s_wall])
-Exit codes (default mode): 3 if the wall anchor can't even be attempted (import
-failure, or no SXX/structure discipline in --dtdx); else 0 if the resulting
-speed falls in the plausible SPEED_BAND, 1 otherwise (measured value + diagnostics
-printed either way — never silently adjusted to fit the band).
+    s_v (vertical) = fuse_scale_estimates([s_vert, s_cam]) — ceiling-height +
+        camera-height, unchanged 2-anchor logic,
+    s_h (horizontal) = tools.build_coplay.compute_wall_anchor(...) — SXX structure
+        wall-pair gap (tools.build_coplay.model_corridor_widths, is_triangle_soup=
+        True, vertical-span>1.5m + [1.5,6]m width clamp — AXX/architecture was
+        tried first but is furniture-dominated, see model_corridor_widths()
+        docstring) vs. the recon's own straddle-forced corridor-width anchor
+        (scan2bim.wall_anchor.estimate_wall_scale, trajectory_radius=vext). None
+        -> s_h falls back to s_v (fallback_reason explains why).
+    diag(s_h, s_v, s_h) applied via scan2bim.metric_scale.apply_axis_split_scale
+    (monocular recon compresses the two horizontal axes more than the vertical
+    one — a single isotropic scale places the path wrong even when "on average"
+    close; see tools/build_coplay.py::place_pipe_auto()'s docstring for the
+    real-data numbers). Speed is judged on the s_h-scaled path.
+Exit codes (default mode):
+    3   the wall anchor can't even be attempted (import failure, or no SXX/
+        structure discipline in --dtdx).
+    2   s_v or s_h itself falls outside its expected physical-plausibility band
+        (S_V_BAND/S_H_BAND) — a more specific diagnosis than a bad speed alone;
+        checked before the speed verdict.
+    1   speed falls outside AXIS_SPEED_BAND.
+    0   speed is plausible and both anchors are in-band.
+    (diagnostics are always printed regardless of exit code — never silently
+    adjusted to fit any band.)
 
---no-wall-anchor reproduces the PRIOR (pre-wall-anchor) 2-anchor fusion, unchanged:
-    same gravity-align + s_vert/s_cam fusion, s_wall never computed. If --dtdx is
-    given, s_vert uses the dtdx interior bbox height (real red-baseline
-    reproduction); otherwise falls back to --model (default models/pipe_duct.glb,
-    Phase-1 behavior, regression-free). Always exits 0 (baseline reproduction
-    "succeeding" is independent of whether the resulting speed is plausible).
+--no-wall-anchor reproduces the PRIOR (pre-wall-anchor) 2-anchor fusion, UNCHANGED:
+    wall_points is always None here, so s_h falls back to s_v — mathematically
+    identical to the pre-axis-split isotropic 2-anchor value (apply_axis_split_
+    scale(s_h=s_v,s_v=s_v) degenerates to a uniform scale). If --dtdx is given,
+    s_vert uses the dtdx interior bbox height (real red-baseline reproduction);
+    otherwise falls back to --model (default models/pipe_duct.glb, Phase-1
+    behavior). Same SPEED_BAND/summary format as Phase 1, always exits 0
+    (baseline reproduction "succeeding" is independent of whether the resulting
+    speed is plausible).
 """
 from __future__ import annotations
 
@@ -53,14 +66,23 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from scan2bim.metric_scale import (
-    bbox_height_warning, camera_height_scale, estimate_floor_level,
+    apply_axis_split_scale, bbox_height_warning, camera_height_scale, estimate_floor_level,
     fuse_scale_estimates, speed_warning,
 )
 
-# Plausible continuous-walk speed band used for this script's PASS/FAIL verdict
+# --no-wall-anchor: plausible continuous-walk speed band for the PASS/FAIL verdict
 # (separate from scan2bim.metric_scale.speed_warning's own internal thresholds,
-# which are printed alongside as an additional diagnostic).
+# which are printed alongside as an additional diagnostic). Unchanged from Phase 1.
 SPEED_BAND = (0.6, 1.4)
+
+# Default (axis-split) mode: speed is judged on the s_h-scaled path (wider band —
+# a wall-anchor-driven horizontal scale is expected to land closer to the true
+# speed than the old omni-fused one). s_v/s_h sanity bands catch an anchor value
+# that is itself implausible (e.g. the wrong SXX width candidate matched) even
+# before it shows up as a bad speed — see main()'s exit-2 tagging.
+AXIS_SPEED_BAND = (0.4, 1.4)
+S_V_BAND = (1.6, 1.9)
+S_H_BAND = (3.2, 4.1)
 
 
 # ---------------------------------------------------------------------------
@@ -239,14 +261,25 @@ def _import_build_coplay():
 
 def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: float,
                          wall_points: np.ndarray | None = None) -> dict:
+    """AXIS-SPLIT metric scale (mirrors tools/build_coplay.py::place_pipe_auto()):
+    s_v = fuse_scale_estimates([s_vert, s_cam]) (vertical: ceiling-height + camera-
+    height, unchanged 2-anchor logic); s_h = the wall (corridor-width) anchor if
+    available, else falls back to s_v (fallback_reason explains why). diag(s_h,
+    s_v,s_h) is applied via scan2bim.metric_scale.apply_axis_split_scale, so the
+    returned path_m is already metric (no separate scalar multiply needed).
+    When wall_points=None, s_h==s_v always (isotropic), so path_m is
+    mathematically identical to the pre-axis-split 2-anchor value — the
+    --no-wall-anchor reproduction path is unaffected."""
     bc = _import_build_coplay()
-    vp = [bc.viewer_pose(p) for p in poses]
-    centers = np.array([v[0] for v in vp])
-    ups = np.array([v[2] for v in vp])
-    g = ups.mean(0)
+    centers, fwd, up = [], [], []
+    for p in poses:
+        c, f, u = bc.viewer_pose(p)
+        centers.append(c); fwd.append(f); up.append(u)
+    centers = np.array(centers); fwd = np.array(fwd); up = np.array(up)
+    g = up.mean(0)
     g /= (np.linalg.norm(g) + 1e-9)
     Rg = bc._rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
-    Cg = centers @ Rg.T
+    Cg = centers @ Rg.T; Fg = fwd @ Rg.T; Ug = up @ Rg.T
 
     P = points.copy()
     P[:, 1] *= -1.0
@@ -257,28 +290,26 @@ def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: f
     s_vert = bbox_height_m / max(vext, 1e-6)
     floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
+    s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])
 
     s_wall, wall_info = bc.compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext)
+    fallback_reason = None
+    if s_wall is not None:
+        s_h = s_wall
+    else:
+        s_h = s_v
+        fallback_reason = wall_info.get("fail", "wall anchor unavailable")
 
-    s_m, scale_info = fuse_scale_estimates([s_vert, s_cam, s_wall])
-    scale_info["wall_anchor"] = wall_info
-    # axis-split prep (Phase 2 will make s_h drive the summary line + verdict;
-    # for now these are informational only — s_m/path_m/speed_ms below are still
-    # the current omni-fusion, unchanged). s_v = vertical-domain anchors only
-    # (ceiling-height + camera-height); s_h = the wall (corridor-width) anchor,
-    # which is inherently horizontal. fallback_reason explains why s_h isn't
-    # available yet when it isn't (matches the eventual Phase-2 s_h->s_v fallback).
-    s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])
-    s_h = s_wall
-    fallback_reason = None if s_h is not None else wall_info.get("fail", "wall anchor unavailable")
-    scale_info["axis_tags"] = {"s_vert": "vertical", "s_cam": "vertical", "s_wall": "horizontal"}
+    poses_s, _Pg_s = apply_axis_split_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, s_h=s_h, s_v=s_v)
+    traj = poses_s["c"][:, [0, 2]]                                    # already metric
+    path_m = float(np.linalg.norm(np.diff(traj, axis=0), axis=1).sum())
 
-    traj = Cg[:, [0, 2]]
-    total_raw = float(np.linalg.norm(np.diff(traj, axis=0), axis=1).sum())
+    scale_info = {"s_v": round(s_v, 4), "s_h": round(s_h, 4), "s_v_anchors": s_v_info,
+                  "wall_anchor": wall_info, "fallback_reason": fallback_reason}
     return {
-        "s_vert": s_vert, "s_cam": s_cam, "s_wall": s_wall, "s_m": s_m,
+        "s_vert": s_vert, "s_cam": s_cam, "s_wall": s_wall,
         "s_v": s_v, "s_v_info": s_v_info, "s_h": s_h, "fallback_reason": fallback_reason,
-        "scale_info": scale_info, "vext": vext, "floor_y": floor_y, "total_raw": total_raw,
+        "scale_info": scale_info, "vext": vext, "floor_y": floor_y, "path_m": path_m,
     }
 
 
@@ -351,42 +382,68 @@ def main() -> int:
 
     bbox_warn = bbox_height_warning(bbox_h)
     scale = compute_metric_scale(parsed["poses"], parsed["points"], bbox_h, wall_points=wall_points)
-    path_m = scale["total_raw"] * scale["s_m"]
+    path_m = scale["path_m"]                      # already axis-split metric
     speed_ms = path_m / duration
-    lo, hi = SPEED_BAND
-    verdict = "PASS" if lo <= speed_ms <= hi else "FAIL"
-
-    print(f"scale={scale['s_m']:.4f} path_m={path_m:.2f} duration_s={duration:.2f} "
-          f"speed_ms={speed_ms:.3f} band=[{lo},{hi}] verdict={verdict}")
     s_cam_str = f"{scale['s_cam']:.4f}" if scale["s_cam"] is not None else "n/a"
     s_wall_str = f"{scale['s_wall']:.4f}" if scale["s_wall"] is not None else "n/a"
-    print(f"  model_bbox_height_m={bbox_h:.3f} scan_vertical_extent={scale['vext']:.3f}")
-    print(f"  s_vert={scale['s_vert']:.4f} s_cam={s_cam_str} s_wall={s_wall_str} "
-          f"n_anchors={scale['scale_info']['n']} agree={scale['scale_info']['agree']} "
-          f"spread={scale['scale_info']['spread']}")
-    wa = scale["scale_info"].get("wall_anchor") or {}
-    if wa:
-        print(f"  wall_anchor: {wa}")
-    # axis-split prep (Phase 2 will switch the summary line to s_h; informational only here)
-    s_h_str = f"{scale['s_h']:.4f}" if scale["s_h"] is not None else "n/a"
-    print(f"  axis-split(prep): s_v={scale['s_v']:.4f} s_h={s_h_str} "
-          f"fallback_reason={scale['fallback_reason']!r}")
-    if bbox_warn:
-        print(f"  WARNING (bbox): {bbox_warn}")
-    sw = speed_warning(path_m, duration)
-    if sw:
-        print(f"  WARNING (speed): {sw}")
 
     if args.no_wall_anchor:
+        # --no-wall-anchor: wall_points is always None here, so s_h==s_v always
+        # (isotropic) — mathematically identical to the pre-axis-split 2-anchor
+        # value. Same summary line / band / exit-0-always contract as Phase 1.
+        lo, hi = SPEED_BAND
+        verdict = "PASS" if lo <= speed_ms <= hi else "FAIL"
+        print(f"scale={scale['s_v']:.4f} path_m={path_m:.2f} duration_s={duration:.2f} "
+              f"speed_ms={speed_ms:.3f} band=[{lo},{hi}] verdict={verdict}")
+        print(f"  model_bbox_height_m={bbox_h:.3f} scan_vertical_extent={scale['vext']:.3f}")
+        print(f"  s_vert={scale['s_vert']:.4f} s_cam={s_cam_str} s_wall={s_wall_str} "
+              f"n_anchors={scale['s_v_info']['n']} agree={scale['s_v_info']['agree']} "
+              f"spread={scale['s_v_info']['spread']}")
+        wa = scale["scale_info"].get("wall_anchor") or {}
+        if wa:
+            print(f"  wall_anchor: {wa}")
+        if bbox_warn:
+            print(f"  WARNING (bbox): {bbox_warn}")
+        sw = speed_warning(path_m, duration)
+        if sw:
+            print(f"  WARNING (speed): {sw}")
         if verdict == "FAIL":
             print(f"  NOTE: speed {speed_ms:.3f} m/s is outside the plausible band {SPEED_BAND} — "
                   "this reproduces the KNOWN red baseline (monocular scale under-estimate), "
                   "not a script bug. exit 0: reproduction succeeded.")
         return 0
 
-    # Default (wall-anchor) mode: report the measured verdict as-is, never adjusted.
+    # Default (wall-anchor) mode: speed judged on the s_h-scaled path.
+    lo, hi = AXIS_SPEED_BAND
+    verdict = "PASS" if lo <= speed_ms <= hi else "FAIL"
+    s_v_ok = S_V_BAND[0] <= scale["s_v"] <= S_V_BAND[1]
+    s_h_ok = S_H_BAND[0] <= scale["s_h"] <= S_H_BAND[1]
+
+    print(f"scale={scale['s_h']:.4f} path_m={path_m:.2f} duration_s={duration:.2f} "
+          f"speed_ms={speed_ms:.3f} band=[{lo},{hi}] verdict={verdict}")
+    print(f"  model_bbox_height_m={bbox_h:.3f} scan_vertical_extent={scale['vext']:.3f}")
+    print(f"  s_vert={scale['s_vert']:.4f} s_cam={s_cam_str} s_wall={s_wall_str}")
+    print(f"  s_v={scale['s_v']:.4f} (band={S_V_BAND} ok={s_v_ok}) "
+          f"s_h={scale['s_h']:.4f} (band={S_H_BAND} ok={s_h_ok}) "
+          f"fallback_reason={scale['fallback_reason']!r}")
+    wa = scale["scale_info"].get("wall_anchor") or {}
+    if wa:
+        print(f"  wall_anchor: {wa}")
+    if bbox_warn:
+        print(f"  WARNING (bbox): {bbox_warn}")
+    sw = speed_warning(path_m, duration)
+    if sw:
+        print(f"  WARNING (speed): {sw}")
+
+    # Anchor-value sanity tagging takes precedence over the speed verdict: if the
+    # anchor itself looks implausible, that's the more specific diagnosis. Never
+    # adjusted to force a pass — reported exactly as measured either way.
+    if not (s_v_ok and s_h_ok):
+        print(f"  NOTE: anchor value outside its expected physical-plausibility band "
+              f"(s_v ok={s_v_ok}, s_h ok={s_h_ok}) — reported as measured, not adjusted. exit 2.")
+        return 2
     if verdict == "FAIL":
-        print(f"  NOTE: speed {speed_ms:.3f} m/s is outside the plausible band {SPEED_BAND} — "
+        print(f"  NOTE: speed {speed_ms:.3f} m/s is outside the plausible band {AXIS_SPEED_BAND} — "
               "reported as measured, not adjusted.")
         return 1
     return 0

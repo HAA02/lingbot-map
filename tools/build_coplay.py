@@ -318,21 +318,16 @@ def compute_wall_anchor(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: f
 
 def wall_scale_anchor(Pg: np.ndarray, cam_xz: np.ndarray, widths: list,
                       vext: float):
-    """Corridor-width metric-scale anchor: restrict the gravity-aligned scan to
-    points within one ceiling-height (vext, recon units — same statistic used
-    for the s_vert anchor) of the camera trajectory, then hand off to
-    scan2bim.wall_anchor.estimate_wall_scale. Without this proximity filter the
-    full (often ceiling-facing, noisy) scan rarely shows a clean wall density
-    spike; restricting to the corridor actually walked does (real-data check:
-    upload_1781521406685 finds 0 wall peaks unfiltered, 2 clean peaks filtered)."""
-    from scipy.spatial import cKDTree
+    """Corridor-width metric-scale anchor: hands off to
+    scan2bim.wall_anchor.estimate_wall_scale with trajectory_radius=vext (one
+    ceiling-height — the module now internalizes this proximity prefilter and
+    straddle-enforces the wall pair; this function used to do the radius
+    filtering itself via an external cKDTree query, now removed to avoid
+    duplicating anchor-core's own implementation, per their finalized API)."""
     from scan2bim.wall_anchor import estimate_wall_scale
     if not widths:
         return None, {"fail": "no model corridor widths"}
-    tree = cKDTree(cam_xz)
-    d, _ = tree.query(Pg[:, [0, 2]], k=1, workers=-1)
-    near = Pg[d < max(vext, 1e-6)]
-    return estimate_wall_scale(near, widths, cam_xz=cam_xz)
+    return estimate_wall_scale(Pg, widths, cam_xz=cam_xz, trajectory_radius=vext)
 
 
 def _icp_rigid(src, dst, tree, s, R, t, iters=30):
@@ -395,8 +390,13 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, wall_poi
     the model ceiling (grid XY + yaw + scale + Umeyama-ICP). Returns placed
     poses + fit metrics. (Footage looks up → ceiling-to-ceiling locks well.)
     wall_points (optional): SXX (structure) triangle-soup vertices -> adds the
-    corridor-width anchor (wall_scale_anchor) to the metric-scale fusion. None
-    (default) keeps the prior 2-anchor (ceiling+camera) behavior unchanged."""
+    corridor-width anchor (wall_scale_anchor) to the metric-scale fusion, applied
+    AXIS-SPLIT (diag(s_h,s_v,s_h) via scan2bim.metric_scale.apply_axis_split_scale)
+    since monocular recon compresses the two horizontal axes more than the
+    vertical one (same finding/fix as place_pipe_auto — see its docstring). None
+    (default) keeps the prior isotropic 2-anchor (ceiling+camera) behavior
+    unchanged: s_h falls back to s_v, so apply_axis_split_scale(s_h=s_v,s_v=s_v)
+    degenerates to the old uniform scale exactly."""
     from scipy.spatial import cKDTree
     centers, fwd, up = [], [], []
     for p in poses:
@@ -410,28 +410,39 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, wall_poi
     # 복도가 일치. proper rotation만으론 거울차이를 못 메움(평행배관 천장은 대칭이라
     # inlier는 높아도 궤적 회전이 뒤집힘 → "영상 좌회전=모델 우회전"+벽 통과).
     Pg[:, 0] *= -1.0; Cg[:, 0] *= -1.0; Fg[:, 0] *= -1.0; Ug[:, 0] *= -1.0
-    Sc = Pg[Pg[:, 1] >= np.percentile(Pg[:, 1], 55)]
-    sc = Sc[np.linspace(0, len(Sc) - 1, min(2500, len(Sc))).astype(int)]; scan_c = sc.mean(0)
-    tree = cKDTree(model_ceiling)
     lo, hi = np.array(bbox[0]), np.array(bbox[1])
     yc = float(np.percentile(model_ceiling[:, 1], 50))
 
-    # METRIC scale from TWO independent anchors, fused: (1) VERTICAL ceiling-height
+    # METRIC scale from TWO independent VERTICAL anchors, fused: (1) ceiling-height
     # ratio — robust because looking up captures floor↔ceiling extent well, but
     # silently over/under-shoots if the scan doesn't capture the full span; (2)
     # assumed camera-carry height vs the recon's own camera-to-floor distance,
-    # unaffected by ceiling capture completeness. Horizontal ceiling matching is
-    # ambiguous on repeated geometry (it collapsed to 0.409 → 3.6 m phantom walk),
-    # so scale never comes from that.
-    from scan2bim.metric_scale import bbox_height_warning, camera_height_scale, estimate_floor_level, fuse_scale_estimates
+    # unaffected by ceiling capture completeness. Plus a HORIZONTAL corridor-width
+    # anchor (straddle-forced wall pair) for s_h — see apply_axis_split_scale.
+    from scan2bim.metric_scale import (
+        apply_axis_split_scale, bbox_height_warning, camera_height_scale, estimate_floor_level, fuse_scale_estimates,
+    )
     vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
     s_vert = float((hi[1] - lo[1]) / max(vext, 1e-6))
     floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
+    s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])
     s_wall, wall_info = compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext)
-    s_m, scale_info = fuse_scale_estimates([s_vert, s_cam, s_wall])
-    scale_info["wall_anchor"] = wall_info
+    fallback_reason = None
+    if s_wall is not None:
+        s_h = s_wall
+    else:
+        s_h = s_v
+        fallback_reason = wall_info.get("fail", "wall anchor unavailable")
+    scale_info = {"s_v": round(s_v, 4), "s_h": round(s_h, 4), "s_v_anchors": s_v_info,
+                  "wall_anchor": wall_info, "fallback_reason": fallback_reason}
     bbox_warn = bbox_height_warning(float(hi[1] - lo[1]))
+
+    poses_s, Pg = apply_axis_split_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, s_h=s_h, s_v=s_v)
+    Cg, Fg, Ug = poses_s["c"], poses_s["f"], poses_s["u"]   # now metric — ICP band below is isotropic refinement only
+    Sc = Pg[Pg[:, 1] >= np.percentile(Pg[:, 1], 55)]
+    sc = Sc[np.linspace(0, len(Sc) - 1, min(2500, len(Sc))).astype(int)]; scan_c = sc.mean(0)
+    tree = cKDTree(model_ceiling)
 
     # camera WALK direction (gravity-aligned, horizontal) vs model PIPE direction
     # — pins yaw so the 3D path follows pipes (the video walks straight along them).
@@ -456,7 +467,7 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, wall_poi
         gz = np.linspace(lo[2] + 2, hi[2] - 2, 9)
 
     best = None
-    for s in (s_m * 0.92, s_m, s_m * 1.08):   # narrow band around fused metric anchor
+    for s in (0.92, 1.0, 1.08):   # Cg/Pg are already axis-split metric — narrow isotropic refinement only
         for yaw in range(0, 360, 15):
             R = Ry(yaw)
             align = abs(float(np.cos(np.deg2rad(a_s + yaw - a_p))))  # 1=traj∥pipes
@@ -478,8 +489,12 @@ def place_registered(poses, scan_pts, model_ceiling, bbox, anchor=None, wall_poi
     pose_json = [{"c": [round(float(x), 3) for x in Ct[i]], "f": [round(float(x), 4) for x in Ft[i]],
                   "u": [round(float(x), 4) for x in Ut[i]]} for i in range(len(Ct))]
     info = {"inlier": round(float(inl2), 3), "rmse": round(float(rmse), 3),
+            # NOTE: "scale" is now the residual isotropic ICP refinement around 1.0
+            # (Cg/Pg were already axis-split scaled above) — it is NOT the total
+            # effective scale like it was pre-axis-split. Use s_v/s_h for that.
             "scale": round(float(s2), 3), "yaw": int(yaw),
             "cam_h": round(eye - float(bbox[0][1]), 2),
+            "s_v": round(s_v, 4), "s_h": round(s_h, 4), "fallback_reason": fallback_reason,
             "scale_anchors": scale_info}
     if bbox_warn:
         info["warning"] = bbox_warn
@@ -562,39 +577,57 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
 
 
 def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=None, wall_points=None):
-    """완전 자동 배관추종 배치: lane(메인런) + METRIC 스케일(천장높이+카메라높이 두 앵커 융합,
-    robust) + 코너(B1 turn-fraction) + recon 형상. 수동 waypoint 없이 metric 길이로 배치.
-    핵심: 궤적-런 피팅(런 전체 가정)은 과신장 → 독립 metric 앵커로 실제 보행거리 산출.
-    단일 앵커(천장높이)는 스캔이 전체 층고를 못 담으면 과소/과대산출될 수 있어 카메라높이
-    앵커(가정 눈높이 vs 바닥까지 거리)로 교차검증 — 불일치시 info에 노출(자동 확정 아님).
+    """완전 자동 배관추종 배치: lane(메인런) + AXIS-SPLIT METRIC 스케일 + 코너(B1 turn-fraction)
+    + recon 형상. 수동 waypoint 없이 metric 길이로 배치.
+    단안 재구성은 수평(X,Z) 두 축을 수직(Y)보다 추가로 더 압축한다(실측: upload_1781521406685
+    수직 s≈1.75 정확, 수평 필요 s≈3.64 — 단일 등방 스케일로는 회전점·종점이 엉뚱한 곳에 찍힘).
+    그래서 스케일을 축별로 분리한다: 수직 s_v=천장고+카메라높이 2앵커 융합(기존과 동일 로직),
+    수평 s_h=복도폭 벽앵커(straddle 강제, scan2bim.wall_anchor.estimate_wall_scale) — 벽앵커가
+    실패하면(s_wall None) s_h=s_v로 폴백해 기존(axis-split 이전) 동작과 완전히 동일해진다
+    (fallback_reason에 폴백 사유 노출, 자동 확정 아님). scan2bim.metric_scale.
+    apply_axis_split_scale로 diag(s_h,s_v,s_h)를 카메라 궤적/점군에 적용한 뒤(f/u 재정규화·
+    재직교화 완료 상태) 이후 코너 라우팅은 이미 metric인 궤적 위에서 계산한다.
     fit_run=True: 세그먼트 길이를 FXX 런 실측 기하에 스냅(metric 스케일이 단안 모호성으로
     과소산출될 때). 방향·분기선택은 recon 유지, 길이만 모델 기준 — 코리더 전 구간을 걸은 경우.
     duration(초, 실제 영상 길이): 주어지면 산출 경로장/속도가 비현실적일 때 경고.
-    wall_points(선택): SXX(구조) 삼각형 정점 -> 복도폭 앵커(wall_scale_anchor)를 3번째 앵커로
-    융합에 추가. None(기본)이면 기존 2앵커(천장+카메라) 동작 그대로(폴백, 동작 변화 0)."""
+    wall_points(선택): SXX(구조) 삼각형 정점 -> 복도폭 벽앵커 재료. None(기본)이면 s_h=s_v
+    폴백만 발생 — 즉 axis-split 이전과 동일한 등방 스케일 동작(회귀 없음)."""
     from scan2bim.metric_scale import (
-        bbox_height_warning, camera_height_scale, estimate_floor_level, fuse_scale_estimates, speed_warning,
+        apply_axis_split_scale, bbox_height_warning, camera_height_scale, estimate_floor_level,
+        fuse_scale_estimates, speed_warning,
     )
     from scan2bim.pipe_path import main_pipe_run_L, trajectory_turn_fraction
-    vp = [viewer_pose(p) for p in poses]
-    cen = np.array([v[0] for v in vp]); up_v = np.array([v[2] for v in vp])
-    g = up_v.mean(0); g /= (np.linalg.norm(g) + 1e-9)
+    centers, fwd, up = [], [], []
+    for p in poses:
+        c, f, u = viewer_pose(p); centers.append(c); fwd.append(f); up.append(u)
+    centers = np.array(centers); fwd = np.array(fwd); up = np.array(up)
+    g = up.mean(0); g /= (np.linalg.norm(g) + 1e-9)
     Rg = _rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
-    Cg = cen @ Rg.T
+    Cg = centers @ Rg.T; Fg = fwd @ Rg.T; Ug = up @ Rg.T
     P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0; Pg = P @ Rg.T
     vext = float(np.percentile(Pg[:, 1], 97) - np.percentile(Pg[:, 1], 3))
     s_vert = float((bbox[1][1] - bbox[0][1]) / max(vext, 1e-6))     # 천장높이 metric 스케일
     bbox_warn = bbox_height_warning(float(bbox[1][1] - bbox[0][1]))
     floor_y = estimate_floor_level(Pg[:, 1], cam_y=float(np.median(Cg[:, 1])))
     s_cam = camera_height_scale(Cg[:, 1], floor_y) if floor_y is not None else None
-    s_wall, wall_info = compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext)
-    s_m, scale_info = fuse_scale_estimates([s_vert, s_cam, s_wall])
-    scale_info["wall_anchor"] = wall_info
-    traj = Cg[:, [0, 2]]
+    s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])           # 수직: 천장고+카메라높이 (기존 2앵커)
+    s_wall, wall_info = compute_wall_anchor(Pg, Cg[:, [0, 2]], wall_points, vext)   # 수평: straddle 강제 벽앵커
+    fallback_reason = None
+    if s_wall is not None:
+        s_h = s_wall
+    else:
+        s_h = s_v
+        fallback_reason = wall_info.get("fail", "wall anchor unavailable")
+    scale_info = {"s_v": round(s_v, 4), "s_h": round(s_h, 4), "s_v_anchors": s_v_info,
+                  "wall_anchor": wall_info, "fallback_reason": fallback_reason}
+
+    poses_s, Pg_s = apply_axis_split_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, s_h=s_h, s_v=s_v)
+    traj = poses_s["c"][:, [0, 2]]        # 이미 axis-split metric 스케일 적용된 궤적
     tf, tang = trajectory_turn_fraction(traj)
-    total = float(np.linalg.norm(np.diff(traj, axis=0), axis=1).sum())
-    L1, L2 = tf * total * s_m, (1 - tf) * total * s_m               # metric 세그먼트 길이
+    total = float(np.linalg.norm(np.diff(traj, axis=0), axis=1).sum())    # 이미 metric
+    L1, L2 = tf * total, (1 - tf) * total                                 # metric 세그먼트 길이
     # recon turn 손잡이 (chirality X-flip 후, 모델 프레임 기준) → 분기 좌/우 선택
+    # (등방 스케일이라 각/부호는 원본과 동일 — metric 궤적으로 통일해 일관성만 취함)
     ti = int(np.clip(tf * len(traj), 15, len(traj) - 16))
     d1 = traj[ti] - traj[ti - 15]; d2 = traj[ti + 15] - traj[ti]
     d1f, d2f = np.array([-d1[0], d1[1]]), np.array([-d2[0], d2[1]])   # X반전
@@ -610,11 +643,12 @@ def place_pipe_auto(poses, scan_pts, bbox, fxx_file, fit_run=False, duration=Non
         wps = [(corner + rd * L1).tolist(), corner.tolist(), (corner + bd * L2).tolist()]
     else:
         A, B = poly; d = B - A; d /= (np.linalg.norm(d) + 1e-9)
-        end_len = float(np.linalg.norm(B - A)) if fit_run else total * s_m
+        end_len = float(np.linalg.norm(B - A)) if fit_run else total
         wps = [A.tolist(), (A + d * end_len).tolist()]
     pose_json, info = place_gtpath(poses, scan_pts, bbox, wps, snap=True)
     info["mode"] = "auto-pipe-fitrun" if fit_run else "auto-pipe-metric"
-    info["s_metric"] = round(s_m, 2); info["turn_frac"] = round(tf, 2)
+    info["s_v"] = round(s_v, 4); info["s_h"] = round(s_h, 4); info["turn_frac"] = round(tf, 2)
+    info["fallback_reason"] = fallback_reason
     info["scale_anchors"] = scale_info
     warnings = [w for w in (bbox_warn, speed_warning(info["path_m"], duration)) if w]
     if warnings:

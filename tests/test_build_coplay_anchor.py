@@ -125,17 +125,18 @@ class TestThreeAnchorFusionPath(unittest.TestCase):
         scale = vwa.compute_metric_scale(poses, scan_pts, MODEL_HEIGHT, wall_points=wall_points)
 
         self.assertIsNotNone(scale["s_wall"])
-        self.assertEqual(scale["scale_info"]["n"], 3)
         for key in ("s_vert", "s_cam", "s_wall"):
             self.assertAlmostEqual(scale[key], GT_SCALE, delta=GT_SCALE * 0.1)
-        self.assertTrue(scale["scale_info"]["agree"])
-        self.assertAlmostEqual(scale["s_m"], GT_SCALE, delta=GT_SCALE * 0.1)
-        # axis-split prep fields (Phase 2): s_h mirrors s_wall, s_v is the
-        # ceiling+camera-only fusion, both already populated even though the
-        # summary line/verdict still use the omni-fusion s_m in this phase.
+        self.assertTrue(scale["s_v_info"]["agree"])
+        # axis-split: s_h comes from the wall anchor (not a 3-way fuse with s_v);
+        # s_v is the ceiling+camera-only fusion. Both land near ground truth here
+        # since all three raw anchors independently agree.
         self.assertEqual(scale["s_h"], scale["s_wall"])
+        self.assertAlmostEqual(scale["s_h"], GT_SCALE, delta=GT_SCALE * 0.1)
         self.assertAlmostEqual(scale["s_v"], GT_SCALE, delta=GT_SCALE * 0.1)
         self.assertIsNone(scale["fallback_reason"])
+        # path_m is already axis-split metric (no separate scalar multiply needed)
+        self.assertGreater(scale["path_m"], 0.0)
 
 
 class TestModelCorridorWidthsSxx(unittest.TestCase):
@@ -187,15 +188,18 @@ class TestWallFallback(unittest.TestCase):
         scale = vwa.compute_metric_scale(poses, scan_pts, MODEL_HEIGHT, wall_points=open_space)
 
         self.assertIsNone(scale["s_wall"])
-        self.assertEqual(scale["scale_info"]["n"], 2)  # None filtered out by fuse_scale_estimates
+        self.assertEqual(scale["s_v_info"]["n"], 2)
         self.assertIn("fail", scale["scale_info"]["wall_anchor"])
         self.assertIsNotNone(scale["fallback_reason"])
-        # the 2 surviving anchors still land near ground truth (fallback, not broken)
-        self.assertAlmostEqual(scale["s_m"], GT_SCALE, delta=GT_SCALE * 0.15)
+        # s_h falls back to s_v (fallback, not broken) — both land near ground truth
+        self.assertEqual(scale["s_h"], scale["s_v"])
+        self.assertAlmostEqual(scale["s_h"], GT_SCALE, delta=GT_SCALE * 0.15)
 
     def test_no_wall_points_provided_matches_prior_two_anchor_behavior(self):
         """wall_points=None (Phase-1 callers) must be bit-for-bit unaffected —
-        the wall anchor is never computed, not merely absent from the result."""
+        the wall anchor is never computed, not merely absent from the result.
+        s_h==s_v (isotropic axis-split) so path_m is numerically identical to
+        the pre-axis-split 2-anchor value."""
         recon_eye = 1.5 / GT_SCALE
         poses, scan_pts = _synthetic_recon(
             MODEL_HEIGHT / GT_SCALE, MODEL_HEIGHT / GT_SCALE, 6.0, recon_eye, n_poses=20,
@@ -203,8 +207,9 @@ class TestWallFallback(unittest.TestCase):
         with_none = vwa.compute_metric_scale(poses, scan_pts, MODEL_HEIGHT, wall_points=None)
         without_kw = vwa.compute_metric_scale(poses, scan_pts, MODEL_HEIGHT)
         self.assertIsNone(with_none["s_wall"])
-        self.assertEqual(with_none["s_m"], without_kw["s_m"])
-        self.assertEqual(with_none["scale_info"]["n"], 2)
+        self.assertEqual(with_none["s_h"], with_none["s_v"])
+        self.assertEqual(with_none["path_m"], without_kw["path_m"])
+        self.assertEqual(with_none["s_v_info"]["n"], 2)
 
 
 def _write_coplay_fixture(tmp_dir: Path, rawp: list, duration: float) -> Path:
@@ -298,10 +303,24 @@ class TestValidateCliExitContract(unittest.TestCase):
         self.assertIn("wall anchor not available", proc.stdout)
 
     @unittest.skipUnless(bool(__import__("glob").glob(_GASAN_GLOB)), "Gasan_7F fixture not present")
-    def test_default_mode_with_full_model_exits_0_or_1_never_crashes(self):
+    def test_default_mode_with_full_model_never_crashes(self):
         proc = self._run("--dtdx", _GASAN_GLOB)
-        self.assertIn(proc.returncode, (0, 1), proc.stdout + proc.stderr)
+        self.assertIn(proc.returncode, (0, 1, 2), proc.stdout + proc.stderr)
         self.assertIn("verdict=", proc.stdout)
+
+    @unittest.skipUnless(bool(__import__("glob").glob(_GASAN_GLOB)), "Gasan_7F fixture not present")
+    def test_default_mode_real_data_hits_risk1_anchor_band_tag(self):
+        """Documents the PM-anticipated 'risk 1' as a reproducible measured
+        result (not manipulated): for upload_1781521406685, the recon-side
+        corridor gap never straddles the camera trajectory at all (fails before
+        _choose_scale's candidate-width mapping even runs), so s_h falls back to
+        s_v (~1.75) — outside S_H_BAND[3.2,4.1] — while s_v itself is in-band.
+        exit 2. If anchor-core's straddle detection changes, this test should be
+        revisited rather than silently loosened."""
+        proc = self._run("--dtdx", _GASAN_GLOB)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("s_v ok=True", proc.stdout)
+        self.assertIn("s_h ok=False", proc.stdout)
         self.assertIn("wall_anchor:", proc.stdout)
 
 
