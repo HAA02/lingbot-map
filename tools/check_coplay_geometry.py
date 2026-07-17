@@ -99,6 +99,10 @@ def main() -> int:
     ap.add_argument("--turn-z-max", type=float, default=4.0)
     ap.add_argument("--end-x", type=str, default="-8,4", help="lo,hi (model X range)")
     ap.add_argument("--end-z-max", type=float, default=2.5)
+    ap.add_argument("--pre-turn-x-range", type=str, default=None,
+                     help="lo,hi — every pose up to and including the turn must have X in this band "
+                          "(the straight leg stays inside the corridor). Default off: not checked, so "
+                          "existing invocations behave exactly as before.")
     ap.add_argument("--smooth-window", type=int, default=1,
                      help="moving-average window before turn detection (default 1 = off; see turn_point() docstring)")
     ap.add_argument("--duration", type=float, default=None, help="override the HTML's META.duration")
@@ -122,12 +126,30 @@ def main() -> int:
     lo_x, hi_x = _parse_range(args.end_x)
     turn_ok = tp["z"] <= args.turn_z_max
     end_ok = (lo_x <= end_x <= hi_x) and (end_z <= args.end_z_max)
-    verdict = "PASS" if (turn_ok and end_ok) else "FAIL"
+
+    # pre-turn straight-leg X band (optional): every pose up to the turn must stay in
+    # the corridor. Catches the diagonal-drift failure the turn/end gates alone miss —
+    # a leg that drifts sideways can still end in a valid spot (cycle-1 defect).
+    pre_ok = True
+    pre_line = None
+    if args.pre_turn_x_range is not None:
+        plo, phi = _parse_range(args.pre_turn_x_range)
+        arclen = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xz, axis=0), axis=1))])
+        turn_arc = tp["fraction"] * arclen[-1]
+        pre_x = xz[arclen <= turn_arc + 1e-9, 0]
+        pmin, pmax = float(pre_x.min()), float(pre_x.max())
+        pre_ok = (pmin >= plo) and (pmax <= phi)
+        pre_line = (f"pre_turn_x min={pmin:.2f} max={pmax:.2f} drift={pmax - pmin:.2f} "
+                    f"band=[{plo},{phi}] (n={len(pre_x)}) -> {'OK' if pre_ok else 'FAIL'}")
+
+    verdict = "PASS" if (turn_ok and end_ok and pre_ok) else "FAIL"
 
     print(f"turn_point x={tp['x']:.2f} z={tp['z']:.2f} (fraction={tp['fraction']:.2f} "
           f"angle={tp['angle_deg']:.1f}deg) turn_z_max={args.turn_z_max} -> {'OK' if turn_ok else 'FAIL'}")
     print(f"endpoint x={end_x:.2f} z={end_z:.2f} end_x_range=[{lo_x},{hi_x}] "
           f"end_z_max={args.end_z_max} -> {'OK' if end_ok else 'FAIL'}")
+    if pre_line is not None:
+        print(pre_line)
     speed_str = f"{speed_ms:.3f}" if speed_ms is not None else "n/a (no duration)"
     print(f"path_m={path_m:.2f} duration_s={duration} avg_speed_ms={speed_str} (informational, no threshold here)")
     print(f"verdict={verdict}")

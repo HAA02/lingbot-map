@@ -769,10 +769,7 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     flipped local minimum (rmse~0.61, yaw~150° off — ceiling-inlier score is
     ambiguous on parallel pipes), and the CAD snap warps the walk onto the fire-
     pipe polyline whose corner sits ~12 m from where the person actually turned
-    (FXX corner Z≈-9.5 vs the real turn Z≈3). A pure rigid transform avoids both:
-    after gravity-align + chirality-flip the direction is already ~right (verified:
-    recon trajectory PCA within ~15° of the model corridor axis), only the metric
-    SIZE and the global yaw/offset were wrong.
+    (FXX corner Z≈-9.5 vs the real turn Z≈3). A pure rigid transform avoids both.
 
     Determination (deterministic, no search over yaw/offset):
       scale  — s_v = ceiling+camera vertical fusion; s_h = corridor-width wall
@@ -782,20 +779,29 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
                under-scales it (same finding/fix as place_pipe_auto; on this upload
                the wall anchor abstains — straddle fails — so s_h needs the explicit
                --horizontal-scale-override, exactly as it was separately verified).
-      yaw    — align the recon trajectory's dominant horizontal PCA axis to the
-               model corridor axis (model_ceiling PCA), the SAME a_s/a_p pair
-               place_registered computes, but used DIRECTLY (one value) rather than
-               grid-searched with ICP. The 180° axis ambiguity is resolved by the
-               FXX run's directed start→corner axis (main_pipe_run_L): keep the sign
-               whose rotated net heading agrees with the direction the corridor is
-               walked. If FXX is unavailable, keep the smaller rotation (the recon
-               is already near-aligned).
+      chirality — the model is X-mirrored (Babylon->Three), so the recon is
+               X-mirrored too; but the SIGN of that mirror is what decides which way
+               the L bends. Pick the flip whose resulting L-turn handedness equals
+               the model's FXX branch handedness (main_pipe_run_L). Cycle 1 hard-coded
+               the flip and produced a LEFT-turning walk against the corridor's
+               RIGHT-turning branch, so leg B ran past the walkable end. Falls back to
+               the -1 convention place_registered/place_pipe_auto use if FXX gives no
+               branch.
+      yaw    — align the MAJORITY (pre-turn) leg's line-fit direction to the FXX run
+               direction. NOT the whole-trajectory PCA: on an L-path that PCA is a
+               compromise between the two legs and tilts the straight leg ~15° off
+               the corridor — the cycle-1 "diagonal drift" defect. The pre-turn leg
+               is split off with trajectory_turn_fraction and line-fit with the same
+               _seg_dir place_pipe_auto uses. Both directions are DIRECTED, so there
+               is no 180° ambiguity. Falls back to the model_ceiling PCA axis
+               (smaller rotation) if FXX is unavailable.
       offset — --anchor 'x,z' (model coords) pins the trajectory START there: the
                explicit, invariant-respecting reference (the caller supplies one
                point instead of auto-confirming a global fit on repeated geometry).
-               Without --anchor the correctly-scaled/oriented trajectory centroid is
-               dropped at the model interior centre — a best-effort auto default
-               (the same centring place_gravity uses), NOT a verified registration.
+               Without --anchor the straight leg's X is pinned onto the corridor (the
+               FXX run X) and Z is dropped by centroid -> model interior centre. The
+               cycle-1 centroid-only drop pushed the straight walk out of the corridor
+               band; pinning leg-A's X keeps it inside. NOT a verified registration.
     Height = eye level (model floor + 1.5 m), keeping the metric vertical bob.
     Returns (pose_json, info). corridor_width_hint / horizontal_scale_override: see
     _resolve_horizontal_scale (same semantics as place_registered/place_pipe_auto)."""
@@ -803,7 +809,7 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
         apply_axis_split_scale, bbox_height_warning, camera_height_scale,
         estimate_floor_level, fuse_scale_estimates, speed_warning,
     )
-    from scan2bim.pipe_path import main_pipe_run_L, trajectory_turn_fraction
+    from scan2bim.pipe_path import _seg_dir, main_pipe_run_L, trajectory_turn_fraction
     centers, fwd, up = [], [], []
     for p in poses:
         c, f, u = viewer_pose(p); centers.append(c); fwd.append(f); up.append(u)
@@ -812,7 +818,34 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     Rg = _rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
     Cg = centers @ Rg.T; Fg = fwd @ Rg.T; Ug = up @ Rg.T
     P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0; Pg = P @ Rg.T
-    Cg[:, 0] *= -1.0; Fg[:, 0] *= -1.0; Ug[:, 0] *= -1.0; Pg[:, 0] *= -1.0   # chirality (model is X-mirrored)
+
+    def _turn_split(xz):
+        """(turn_index, pre-turn leg line-fit dir oriented start->corner, L handedness)."""
+        tf, _ = trajectory_turn_fraction(xz)
+        arclen = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xz, axis=0), axis=1))])
+        ci = int(np.clip(np.searchsorted(arclen, tf * arclen[-1]), 2, len(xz) - 2))
+        d = _seg_dir(xz[:ci + 1])                               # PCA line-fit of the pre-turn (majority) leg
+        if float(d @ (xz[ci] - xz[0])) < 0:
+            d = -d                                              # orient start -> corner
+        rA, rB = xz[ci] - xz[0], xz[-1] - xz[ci]
+        return ci, d, float(np.sign(rA[0] * rB[1] - rA[1] * rB[0]))
+
+    # --- model corridor reference: FXX main run direction + mean-X + L handedness ---
+    run_dir = run_meanX = model_hand = None
+    try:
+        run = main_pipe_run_L(fxx_file)
+        v = np.asarray(run[1] - run[0], dtype=np.float64); run_dir = v / (np.linalg.norm(v) + 1e-9)
+        run_meanX = float((run[0][0] + run[1][0]) / 2.0)
+        if len(run) == 3:
+            mA, mB = run[1] - run[0], run[2] - run[1]
+            model_hand = float(np.sign(mA[0] * mB[1] - mA[1] * mB[0]))
+    except Exception:
+        pass
+
+    # --- chirality: match the recon L-turn handedness to the model FXX branch ---
+    _, _, recon_hand0 = _turn_split(Cg[:, [0, 2]])              # handedness with NO flip
+    chi = (model_hand * recon_hand0) if (model_hand is not None and recon_hand0 != 0.0) else -1.0
+    Cg[:, 0] *= chi; Fg[:, 0] *= chi; Ug[:, 0] *= chi; Pg[:, 0] *= chi
 
     lo, hi = np.array(bbox[0]), np.array(bbox[1])
     # --- axis-split METRIC scale (reused from metric_scale, unmodified) ---
@@ -830,39 +863,32 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     poses_s, _Pg = apply_axis_split_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, s_h=s_h, s_v=s_v)
     Cm, Fm, Um = poses_s["c"], poses_s["f"], poses_s["u"]        # now metric (axis-split)
 
-    # --- yaw: recon trajectory PCA -> model corridor PCA (direct, no ICP search) ---
-    traj = Cm[:, [0, 2]]
-    Ch = traj - traj.mean(0)
-    t2d = np.linalg.eigh(Ch.T @ Ch)[1][:, -1]                    # recon walk dominant axis
-    a_s = float(np.degrees(np.arctan2(t2d[1], t2d[0])))
-    Mh = model_ceiling[:, [0, 2]] - model_ceiling[:, [0, 2]].mean(0)
-    p2d = np.linalg.eigh(Mh.T @ Mh)[1][:, -1]                    # model corridor dominant axis
-    a_p = float(np.degrees(np.arctan2(p2d[1], p2d[0])))
-    # directed corridor reference (FXX run start->corner) to resolve the 180° flip
-    try:
-        run = main_pipe_run_L(fxx_file)
-        mdir = np.asarray(run[1] - run[0], dtype=np.float64)
-        mdir = mdir / (np.linalg.norm(mdir) + 1e-9)
-    except Exception:
-        mdir = None
-    net = traj[-1] - traj[0]
+    # --- yaw: pre-turn (majority) leg line-fit -> FXX run direction (NOT whole PCA) ---
+    ci, legA_dir, _ = _turn_split(Cm[:, [0, 2]])
+    a_legA = float(np.degrees(np.arctan2(legA_dir[1], legA_dir[0])))
 
     def _ry2(a):                                                # rotate XZ vectors by +a (deg)
         r = np.deg2rad(a); return np.array([[np.cos(r), -np.sin(r)], [np.sin(r), np.cos(r)]])
-    cands = [a_p - a_s, a_p - a_s + 180.0]
-    if mdir is not None and float(np.linalg.norm(net)) > 1e-6:
-        yaw = max(cands, key=lambda a: float((net @ _ry2(a).T) @ mdir))
-    else:
-        yaw = min(cands, key=lambda a: abs(((a + 180.0) % 360.0) - 180.0))   # closest to identity
+    if run_dir is not None:
+        yaw = float(np.degrees(np.arctan2(run_dir[1], run_dir[0]))) - a_legA   # directed -> no 180° ambiguity
+    else:                                                       # no FXX: fall back to model_ceiling PCA axis
+        Mh = model_ceiling[:, [0, 2]] - model_ceiling[:, [0, 2]].mean(0)
+        p2d = np.linalg.eigh(Mh.T @ Mh)[1][:, -1]
+        a_p = float(np.degrees(np.arctan2(p2d[1], p2d[0])))
+        yaw = min([a_p - a_legA, a_p - a_legA + 180.0], key=lambda a: abs(((a + 180.0) % 360.0) - 180.0))
     R2 = _ry2(yaw)                                               # apply the SAME convention used to pick yaw
     Cr = np.column_stack([Cm[:, [0, 2]] @ R2.T, Cm[:, 1]])[:, [0, 2, 1]]
     Fr = np.column_stack([Fm[:, [0, 2]] @ R2.T, Fm[:, 1]])[:, [0, 2, 1]]
     Ur = np.column_stack([Um[:, [0, 2]] @ R2.T, Um[:, 1]])[:, [0, 2, 1]]
 
-    # --- translation: --anchor pins START, else centroid -> model interior centre ---
+    # --- translation: --anchor pins START; else pin straight-leg X onto corridor, drop Z to centre ---
     if anchor is not None:
         off = np.array([float(anchor[0]) - Cr[0, 0], 0.0, float(anchor[1]) - Cr[0, 2]])
         anchor_mode = "start@anchor"
+    elif run_meanX is not None:
+        legA_x = float(Cr[:ci + 1, 0].mean())                   # straight (pre-turn) leg mean X
+        off = np.array([run_meanX - legA_x, 0.0, float((lo[2] + hi[2]) / 2.0 - Cr[:, 2].mean())])
+        anchor_mode = "legA-X@corridor"
     else:
         mc = (lo + hi) / 2.0; cen = Cr.mean(0)
         off = np.array([mc[0] - cen[0], 0.0, mc[2] - cen[2]])
@@ -877,7 +903,7 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     path_m = float(np.linalg.norm(np.diff(Ct[:, [0, 2]], axis=0), axis=1).sum())
     tf, tang = trajectory_turn_fraction(Ct[:, [0, 2]])
     info = {"mode": "rigid", "s_v": round(s_v, 4), "s_h": round(s_h, 4),
-            "yaw": round(float(yaw), 1), "turn_frac": round(float(tf), 2),
+            "yaw": round(float(yaw), 1), "chi": int(chi), "turn_frac": round(float(tf), 2),
             "turn_angle_deg": round(float(tang), 1), "path_m": round(path_m, 2),
             "anchor": anchor_mode, "cam_h": round(eye - float(lo[1]), 2),
             "fallback_reason": fallback_reason, "scale_anchors": scale_info}

@@ -12,6 +12,7 @@ what the served build produces.
 """
 import glob
 import struct
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -73,8 +74,10 @@ def _turn_end_path(pose_json):
     total = float(arclen[-1]); target = tf * total
     tz = float(np.interp(target, arclen, xz[:, 1]))
     tx = float(np.interp(target, arclen, xz[:, 0]))
+    pre_x = xz[arclen <= target + 1e-9, 0]                 # straight (pre-turn) leg X samples
     return {"turn_x": tx, "turn_z": tz, "end_x": float(xz[-1, 0]), "end_z": float(xz[-1, 1]),
-            "path_m": total}
+            "path_m": total, "pre_x_min": float(pre_x.min()), "pre_x_max": float(pre_x.max()),
+            "pre_x_drift": float(pre_x.max() - pre_x.min())}
 
 
 @unittest.skipUnless(_UPLOAD.exists() and glob.glob(_GASAN_GLOB),
@@ -90,19 +93,43 @@ class TestPlaceRigid(unittest.TestCase):
                               anchor=anchor, horizontal_scale_override=s_h_override)
 
     def test_real_walk_passes_geometry_gates(self):
-        """The exact acceptance gate: with the verified s_h, the metric walk lands
-        inside the walkable zone — turn Z<=4, end X in [-8,4], end Z<=2.5, path
-        ~20.5 m (avg speed ~0.58 m/s over 35.3 s). This is the same geometry
-        check_coplay_geometry.py enforces, asserted directly on place_rigid."""
+        """The full acceptance gate (cycle 2): with the verified s_h, the metric walk
+        lands inside the walkable zone AND the straight (pre-turn) leg stays inside
+        the corridor band — turn X in [2,5.5] & Z<=4, end X in [-8,4] & Z<=2.5,
+        pre-turn X in [2,5.5], path ~20.5 m. Same geometry check_coplay_geometry.py
+        enforces (incl. --pre-turn-x-range), asserted directly on place_rigid."""
         pose_json, info = self._place()
         self.assertEqual(info["mode"], "rigid")
         self.assertEqual(info["s_h"], _S_H_OVERRIDE)
         self.assertIsNone(info["fallback_reason"])
         m = _turn_end_path(pose_json)
+        self.assertTrue(2.0 <= m["turn_x"] <= 5.5, m)
         self.assertLessEqual(m["turn_z"], 4.0, m)
         self.assertTrue(-8.0 <= m["end_x"] <= 4.0, m)
         self.assertLessEqual(m["end_z"], 2.5, m)
+        # straight leg stays in the corridor (the cycle-2 fix: no diagonal drift)
+        self.assertGreaterEqual(m["pre_x_min"], 2.0, m)
+        self.assertLessEqual(m["pre_x_max"], 5.5, m)
         self.assertAlmostEqual(m["path_m"], 20.5, delta=2.0)
+
+    def test_pre_turn_leg_stays_in_corridor_not_diagonal(self):
+        """Regression for the cycle-1 diagonal-drift defect: the deployed build let
+        the straight leg drift 4.19 m sideways (X 0.16->4.35) because the yaw came
+        from the WHOLE-trajectory PCA (a compromise of both L-legs). The fix aligns
+        the pre-turn (majority) leg's line-fit to the FXX run, so the straight leg
+        holds a near-constant X well inside the corridor band."""
+        pose_json, _ = self._place()
+        m = _turn_end_path(pose_json)
+        self.assertLess(m["pre_x_drift"], 2.0, m)          # was 4.19 m before the fix
+        self.assertTrue(2.0 <= m["pre_x_min"] and m["pre_x_max"] <= 5.5, m)
+
+    def test_chirality_matches_model_branch_handedness(self):
+        """The L must bend the SAME way as the model FXX branch (right turn here);
+        cycle 1's hard-coded flip bent it the wrong way and leg B overshot past the
+        walkable end (X~8.5). The fixed placement lands the end inside [-8,4]."""
+        _, info = self._place()
+        self.assertIn(info["chi"], (-1, 1))
+        self.assertEqual(info["anchor"], "legA-X@corridor")   # corridor-X drop, not centroid
 
     def test_auto_s_h_falls_back_and_undershoots(self):
         """Documents the real constraint (not manipulated): the wall anchor
@@ -147,6 +174,65 @@ class TestPlaceRigid(unittest.TestCase):
         xz_full = np.array([[p["c"][0], p["c"][2]] for p in pj_full])
         xz_half = np.array([[p["c"][0], p["c"][2]] for p in pj_half])
         np.testing.assert_allclose(xz_full, xz_half, atol=1e-6)
+
+
+def _write_coplay_fixture(tmp_dir: Path, xz, duration: float = 20.0) -> Path:
+    """Minimal build_coplay.py-style HTML (just the `RAWP=[...], META={...};` the
+    checker parses) for a given XZ path at a constant eye height."""
+    import json
+    rawp = [{"c": [float(x), 1.5, float(z)], "f": [0.0, 0.0, 1.0], "u": [0.0, 1.0, 0.0]}
+            for x, z in xz]
+    html = ("<html><body><script>const MESHES=[], MODELS=[], RAWP="
+            + json.dumps(rawp) + ", META=" + json.dumps({"duration": duration}) + ";</script></body></html>")
+    p = tmp_dir / "fixture.coplay.html"; p.write_text(html, encoding="utf-8")
+    return p
+
+
+def _l_path(pre_turn_x, n=25):
+    """An L path whose STRAIGHT leg runs down -Z at X=pre_turn_x[0]->pre_turn_x[1]
+    (a constant X = no drift; a ramp = the diagonal-drift defect), then turns."""
+    x0, x1 = pre_turn_x
+    legA = np.column_stack([np.linspace(x0, x1, n), np.linspace(18.0, 3.0, n)])
+    legB = np.column_stack([np.linspace(x1, x1 - 3.5, n), np.linspace(3.0, 1.0, n)])
+    return np.vstack([legA, legB])
+
+
+class TestPreTurnXGate(unittest.TestCase):
+    """tools/check_coplay_geometry.py --pre-turn-x-range: catches a straight leg
+    that drifts sideways out of the corridor (the cycle-1 defect the turn/end gates
+    alone let through), while leaving all existing invocations unchanged."""
+
+    def _run(self, html_path, *extra):
+        return subprocess.run([sys.executable, "tools/check_coplay_geometry.py", str(html_path), *extra],
+                              cwd=_REPO, capture_output=True, text=True, timeout=60)
+
+    def test_straight_leg_in_band_passes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            html = _write_coplay_fixture(Path(td), _l_path((4.0, 4.0)))   # constant X=4
+            p = self._run(html, "--turn-z-max", "4", "--end-x", "-8,4", "--end-z-max", "2.5",
+                          "--pre-turn-x-range", "2.0,5.5")
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("pre_turn_x", p.stdout)
+
+    def test_diagonal_drift_fails_new_gate(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            html = _write_coplay_fixture(Path(td), _l_path((4.3, 0.6)))   # drifts 4.3 -> 0.6 (out of band)
+            p = self._run(html, "--turn-z-max", "4", "--end-x", "-8,4", "--end-z-max", "2.5",
+                          "--pre-turn-x-range", "2.0,5.5")
+            self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+            self.assertIn("verdict=FAIL", p.stdout)
+
+    def test_diagonal_drift_passes_without_the_option_backward_compat(self):
+        """The SAME drifted path clears the turn/end-only gate — proving the drift
+        was invisible before, and that omitting --pre-turn-x-range is unchanged."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            html = _write_coplay_fixture(Path(td), _l_path((4.3, 0.6)))
+            p = self._run(html, "--turn-z-max", "4", "--end-x", "-8,4", "--end-z-max", "2.5")
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertNotIn("pre_turn_x", p.stdout)          # line only prints when the option is given
 
 
 if __name__ == "__main__":
