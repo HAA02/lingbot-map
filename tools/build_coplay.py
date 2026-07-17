@@ -825,7 +825,7 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
 
 def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, duration=None,
                 wall_points=None, corridor_width_hint=None, horizontal_scale_override=None,
-                dxf_widths=None, s_h_band=(1.8, 2.8)):
+                dxf_widths=None, s_h_band=(1.8, 2.8), turn_time_s=None):
     """RIGID placement: axis-split METRIC scale + ONE yaw rotation + ONE translation
     — no ICP, no CAD-polyline snap, no per-pose warping. The recon trajectory keeps
     its OWN shape; it is only rotated and shifted into the model frame.
@@ -885,16 +885,49 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     Cg = centers @ Rg.T; Fg = fwd @ Rg.T; Ug = up @ Rg.T
     P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0; Pg = P @ Rg.T
 
-    def _turn_split(xz):
-        """(turn_index, pre-turn leg line-fit dir oriented start->corner, L handedness)."""
-        tf, _ = trajectory_turn_fraction(xz)
-        arclen = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xz, axis=0), axis=1))])
-        ci = int(np.clip(np.searchsorted(arclen, tf * arclen[-1]), 2, len(xz) - 2))
+    n = len(Cg)
+
+    def _turn_split(xz, fixed_ci=None):
+        """(turn_index, pre-turn leg line-fit dir oriented start->corner, L handedness).
+        fixed_ci overrides the arc-length corner with an explicit pose index."""
+        if fixed_ci is not None:
+            ci = int(np.clip(fixed_ci, 2, len(xz) - 2))
+        else:
+            tf, _ = trajectory_turn_fraction(xz)
+            arclen = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xz, axis=0), axis=1))])
+            ci = int(np.clip(np.searchsorted(arclen, tf * arclen[-1]), 2, len(xz) - 2))
         d = _seg_dir(xz[:ci + 1])                               # PCA line-fit of the pre-turn (majority) leg
         if float(d @ (xz[ci] - xz[0])) < 0:
             d = -d                                              # orient start -> corner
         rA, rB = xz[ci] - xz[0], xz[-1] - xz[ci]
         return ci, d, float(np.sign(rA[0] * rB[1] - rA[1] * rB[0]))
+
+    # --- corner by POSE INDEX (video timestamp), not arc-length, when turn_time_s is given ---
+    # The monocular compression is heading-relative, so on an L-path the raw arc-length
+    # bend (fraction ~0.77 here) lands far from the physical turn (t=13.5 s -> pose ~55,
+    # fraction ~0.385) — poses 55..97 stay collinear with leg A in raw coords even though
+    # the walker had already turned. A video-read turn time pins the split at the real
+    # corner; ±3 poses are refined to the local heading-change peak. None -> arc-length.
+    corner_ci = None
+    corner_meta = {"corner_source": "arc_length"}
+    if turn_time_s is not None and duration and float(duration) > 0 and n >= 8:
+        raw_idx = int(round(float(turn_time_s) / float(duration) * (n - 1)))
+        xz0 = Cg[:, [0, 2]]
+        ker = np.ones(5) / 5.0
+        sm = np.column_stack([np.convolve(xz0[:, 0], ker, "same"), np.convolve(xz0[:, 1], ker, "same")])
+        vel = np.diff(sm, axis=0)
+        head = np.arctan2(vel[:, 1], vel[:, 0])                 # per-step heading angle
+        w = 5
+
+        def _hc(i):
+            a, b = head[max(0, i - w)], head[min(len(head) - 1, i + w)]
+            return abs(float(np.degrees(np.arctan2(np.sin(b - a), np.cos(b - a)))))
+        window = range(max(3, raw_idx - 3), min(n - 3, raw_idx + 4))
+        corner_ci = max(window, key=_hc)
+        corner_meta = {"corner_source": f"time_based(t={float(turn_time_s)}s)",
+                       "turn_time_s": float(turn_time_s), "raw_pose_index": raw_idx,
+                       "refined_pose_index": int(corner_ci),
+                       "time_fraction": round(corner_ci / (n - 1), 3)}
 
     # --- model corridor reference: FXX main run direction + mean-X + L handedness ---
     run_dir = run_meanX = model_hand = None
@@ -909,7 +942,7 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
         pass
 
     # --- chirality: match the recon L-turn handedness to the model FXX branch ---
-    _, _, recon_hand0 = _turn_split(Cg[:, [0, 2]])              # handedness with NO flip
+    _, _, recon_hand0 = _turn_split(Cg[:, [0, 2]], fixed_ci=corner_ci)   # handedness with NO flip
     chi = (model_hand * recon_hand0) if (model_hand is not None and recon_hand0 != 0.0) else -1.0
     Cg[:, 0] *= chi; Fg[:, 0] *= chi; Ug[:, 0] *= chi; Pg[:, 0] *= chi
 
@@ -931,7 +964,7 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     Cm, Fm, Um = poses_s["c"], poses_s["f"], poses_s["u"]        # now metric (axis-split)
 
     # --- yaw: pre-turn (majority) leg line-fit -> FXX run direction (NOT whole PCA) ---
-    ci, legA_dir, _ = _turn_split(Cm[:, [0, 2]])
+    ci, legA_dir, _ = _turn_split(Cm[:, [0, 2]], fixed_ci=corner_ci)
     a_legA = float(np.degrees(np.arctan2(legA_dir[1], legA_dir[0])))
 
     def _ry2(a):                                                # rotate XZ vectors by +a (deg)
@@ -969,11 +1002,17 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
                   "u": [round(float(x), 4) for x in Ur[i]]} for i in range(len(Ct))]
     path_m = float(np.linalg.norm(np.diff(Ct[:, [0, 2]], axis=0), axis=1).sum())
     tf, tang = trajectory_turn_fraction(Ct[:, [0, 2]])
+    corner_xz = [round(float(Ct[ci, 0]), 2), round(float(Ct[ci, 2]), 2)]   # placed split-pose position
     info = {"mode": "rigid", "s_v": round(s_v, 4), "s_h": round(s_h, 4),
             "yaw": round(float(yaw), 1), "chi": int(chi), "turn_frac": round(float(tf), 2),
             "turn_angle_deg": round(float(tang), 1), "path_m": round(path_m, 2),
             "anchor": anchor_mode, "cam_h": round(eye - float(lo[1]), 2),
+            "corner_idx": int(ci), "corner_xz": corner_xz, **corner_meta,
+            "arclen_turn_frac": round(float(tf), 3),
             "fallback_reason": fallback_reason, "scale_anchors": scale_info}
+    if corner_ci is not None and abs(float(tf) - ci / (n - 1)) > 0.15:
+        info["note"] = ("arc-length turn fraction diverges from time-based ~2x — recon may have "
+                        "heading-relative anisotropy, per-leg scale not yet implemented")
     warnings = [w for w in (bbox_warn, speed_warning(path_m, duration)) if w]
     if warnings:
         info["warning"] = "; ".join(warnings)
@@ -1168,6 +1207,10 @@ def main():
     ap.add_argument("--dxf", default=None,
                     help="공식 Revit DXF 평면도 경로 — 주어지면 복도폭 출처를 SXX 메시 추정 대신 "
                          "도면(scan2bim.dxf_plan)으로. s_h=DXF폭/recon갭 자동산출(--auto-rigid). 없으면 기존 동작")
+    ap.add_argument("--turn-time-s", type=float, default=None,
+                    help="영상에서 실측한 물리적 회전 시각(초) — place_rigid의 레그 분할 코너를 "
+                         "arc-length 대신 포즈-인덱스(t/duration)로 지정(단안 heading 이방성으로 "
+                         "raw 호길이 코너가 실제 회전과 어긋날 때). 없으면 arc-length 그대로")
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
@@ -1225,7 +1268,7 @@ def main():
         pose_json, reginfo = place_rigid(poses, scan_pts, ceil, bbox, fxx, anchor=anchor, duration=args.duration,
                                          wall_points=wall_points, corridor_width_hint=args.corridor_width_hint,
                                          horizontal_scale_override=args.horizontal_scale_override,
-                                         dxf_widths=dxf_widths)
+                                         dxf_widths=dxf_widths, turn_time_s=args.turn_time_s)
         print("  rigid:", reginfo, "anchor:", anchor)
     elif args.auto_pipe:
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])

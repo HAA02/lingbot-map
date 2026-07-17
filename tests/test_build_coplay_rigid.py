@@ -131,6 +131,20 @@ class TestPlaceRigid(unittest.TestCase):
         self.assertIn(info["chi"], (-1, 1))
         self.assertEqual(info["anchor"], "legA-X@corridor")   # corridor-X drop, not centroid
 
+    def test_turn_time_switches_corner_to_pose_index(self):
+        """cycle 5: the physical turn (t=13.5 s, pose ~55) is far from the raw
+        arc-length bend (~pose 97) because the monocular compression is heading-
+        relative. --turn-time-s splits the legs at the pose index, not arc-length."""
+        _, info_arc = self._place()                            # no turn_time_s -> arc-length
+        self.assertEqual(info_arc["corner_source"], "arc_length")
+        _, info_t = bc.place_rigid(self.poses, self.scan, self.ceil, self.bbox, self.fxx,
+                                   horizontal_scale_override=_S_H_OVERRIDE, duration=35.3, turn_time_s=13.5)
+        self.assertTrue(info_t["corner_source"].startswith("time_based"), info_t)
+        self.assertLessEqual(abs(info_t["refined_pose_index"] - 55), 3)      # ~pose 55 (t=13.5 s)
+        self.assertLess(info_t["corner_idx"], info_arc["corner_idx"])        # earlier than the arc-length bend
+        self.assertLess(info_t["time_fraction"], info_t["arclen_turn_frac"])
+        self.assertIn("note", info_t)                                        # anisotropy flag recorded
+
     def test_auto_s_h_falls_back_and_undershoots(self):
         """Documents the real constraint (not manipulated): the wall anchor
         abstains on this upload (straddle fails), so without the override s_h
