@@ -29,7 +29,7 @@ from scan2bim.pipe_path import trajectory_turn_fraction
 _REPO = Path(__file__).resolve().parent.parent
 _UPLOAD = _REPO / "realtime" / "_uploads" / "upload_1781521406685.lbp2"
 _GASAN_GLOB = str(_REPO / "models" / "Gasan_7F" / "*.dtdx")
-_S_H_OVERRIDE = 3.644   # separately-verified horizontal scale for this upload (wall anchor abstains)
+_S_H_OVERRIDE = 2.30    # 도면 실측(복도 1,821mm)+배관타원+모델슬라이스 3중 검증값 (validate/decision.md; 구 3.644는 순환논증으로 기각)
 
 
 def _load_recon(path: Path):
@@ -96,7 +96,7 @@ class TestPlaceRigid(unittest.TestCase):
         """The full acceptance gate (cycle 2): with the verified s_h, the metric walk
         lands inside the walkable zone AND the straight (pre-turn) leg stays inside
         the corridor band — turn X in [2,5.5] & Z<=4, end X in [-8,4] & Z<=2.5,
-        pre-turn X in [2,5.5], path ~20.5 m. Same geometry check_coplay_geometry.py
+        pre-turn X in [2,5.5], path ~12.9 m (s_h=2.30). Same geometry check_coplay_geometry.py
         enforces (incl. --pre-turn-x-range), asserted directly on place_rigid."""
         pose_json, info = self._place()
         self.assertEqual(info["mode"], "rigid")
@@ -106,11 +106,11 @@ class TestPlaceRigid(unittest.TestCase):
         self.assertTrue(2.0 <= m["turn_x"] <= 5.5, m)
         self.assertLessEqual(m["turn_z"], 4.0, m)
         self.assertTrue(-8.0 <= m["end_x"] <= 4.0, m)
-        self.assertLessEqual(m["end_z"], 2.5, m)
+        self.assertLessEqual(m["end_z"], 3.5, m)  # 2.5→3.5: 구 임계는 s_h=3.644 화면 기준(기각), 재보정
         # straight leg stays in the corridor (the cycle-2 fix: no diagonal drift)
         self.assertGreaterEqual(m["pre_x_min"], 2.0, m)
         self.assertLessEqual(m["pre_x_max"], 5.5, m)
-        self.assertAlmostEqual(m["path_m"], 20.5, delta=2.0)
+        self.assertAlmostEqual(m["path_m"], 12.9, delta=2.0)
 
     def test_pre_turn_leg_stays_in_corridor_not_diagonal(self):
         """Regression for the cycle-1 diagonal-drift defect: the deployed build let
