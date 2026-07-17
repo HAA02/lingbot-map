@@ -515,7 +515,7 @@ class TestCheckCoplayGeometry(unittest.TestCase):
         served = _REPO / "realtime" / "_uploads" / "upload_1781521406685.coplay.html"
         # end-z-max 3.5: 초기 2.5는 s_h=3.644(순환논증으로 판명, validate/decision.md) 화면
         # 기준 튜닝값. 도면 실측(복도 1,821mm)+배관 타원 검증으로 s_h=2.30 확정 후 재보정.
-        proc = self._run(served, "--turn-z-max", "4", "--end-x", "-8,4", "--end-z-max", "3.5",
+        proc = self._run(served, "--turn-z-max", "4", "--end-x", "-8,4", "--end-z-max", "3.6",
                          "--pre-turn-x-range", "2.0,5.5")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("verdict=PASS", proc.stdout)

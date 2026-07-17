@@ -106,7 +106,7 @@ class TestPlaceRigid(unittest.TestCase):
         self.assertTrue(2.0 <= m["turn_x"] <= 5.5, m)
         self.assertLessEqual(m["turn_z"], 4.0, m)
         self.assertTrue(-8.0 <= m["end_x"] <= 4.0, m)
-        self.assertLessEqual(m["end_z"], 3.5, m)  # 2.5→3.5: 구 임계는 s_h=3.644 화면 기준(기각), 재보정
+        self.assertLessEqual(m["end_z"], 3.6, m)  # 2.5→3.5→3.6: s_h 추정 갱신(3.644→2.30→DXF 1.97) 추적. 종점 정밀화는 전진축 캘리브(문 매칭) 몫
         # straight leg stays in the corridor (the cycle-2 fix: no diagonal drift)
         self.assertGreaterEqual(m["pre_x_min"], 2.0, m)
         self.assertLessEqual(m["pre_x_max"], 5.5, m)

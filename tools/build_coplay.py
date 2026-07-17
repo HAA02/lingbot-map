@@ -365,11 +365,61 @@ def _split_trajectory_legs(cam_xz: np.ndarray, margin: float = 0.0,
     return (leg_a_out, frac_a), (leg_b_out, frac_b), float(tf), float(ang), margin_frac
 
 
+def _recon_corridor_gap(Pg: np.ndarray, cam_xz: np.ndarray, vext: float):
+    """The recon corridor's clear width in RECON units — the facing wall pair the
+    walker passed between, WITHOUT the straddle gate. estimate_wall_scale's straddle
+    check abstains when the walker hugs one wall (measured on upload_1781521406685:
+    the pair sits at [-0.11, 0.83] but the trajectory median is -0.23, just outside),
+    yet the gap itself is a clean, well-defined corridor. When an authoritative DXF
+    width is supplied the straddle safety is redundant, so this takes the facing peak
+    pair whose midpoint is nearest the trajectory (the corridor actually walked) and
+    returns its spacing. Reuses scan2bim.wall_anchor's own peak detector (read-only).
+    Returns (gap, info) or (None, info)."""
+    from scipy.spatial import cKDTree
+    from scan2bim.wall_anchor import _horizontal_axes, _wall_peaks
+    cam = np.asarray(cam_xz, dtype=np.float64)
+    d, _ = cKDTree(cam).query(Pg[:, [0, 2]], k=1, workers=-1)
+    near = Pg[d < float(vext)]
+    if len(near) < 50:
+        return None, {"fail": "too few points within trajectory radius"}
+    y = near[:, 1]
+    ylo, yhi = float(np.percentile(y, 3)), float(np.percentile(y, 97))
+    yr = yhi - ylo
+    band = (y > ylo + 0.15 * yr) & (y < yhi - 0.15 * yr)
+    wall = near[band][:, [0, 2]]
+    if len(wall) < 50:
+        return None, {"fail": "no mid-band wall points"}
+    _axis, normal = _horizontal_axes(wall, cam)
+    peaks = _wall_peaks(wall @ normal)
+    if peaks is None:
+        return None, {"fail": "no wall density peaks"}
+    pos, _prom = peaks
+    if len(pos) < 2:
+        return None, {"fail": "fewer than two walls"}
+    cam_t = float(np.median(cam @ normal))
+    # adjacent facing pair whose midpoint is closest to the trajectory (the walked corridor)
+    mids = (pos[:-1] + pos[1:]) / 2.0
+    k = int(np.argmin(np.abs(mids - cam_t)))
+    gap = float(pos[k + 1] - pos[k])
+    return gap, {"recon_gap": round(gap, 4), "wall_positions": [round(float(p), 3) for p in pos],
+                 "cam_t": round(cam_t, 3)}
+
+
 def _resolve_horizontal_scale(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: float, s_v: float,
                               corridor_width_hint: float | None = None,
-                              horizontal_scale_override: float | None = None):
+                              horizontal_scale_override: float | None = None,
+                              dxf_widths: list | None = None, s_h_band: tuple = (1.8, 2.8)):
     """Resolve s_h (the horizontal axis-split scale) for place_pipe_auto/
-    place_registered. Two independent escape hatches, in priority order:
+    place_registered/place_rigid. Escape hatches in priority order:
+
+    dxf_widths (place_rigid, --dxf): authoritative corridor clear widths read off
+    the official DXF plan (scan2bim.dxf_plan.corridor_widths_near) — the drawing is
+    the source of truth, so this REPLACES the furniture-noisy SXX triangle-gap
+    detection. s_h = DXF_width / recon_gap, where recon_gap is the recon corridor
+    width (_recon_corridor_gap, no straddle gate). Among the DXF candidate widths the
+    one whose implied s_h lands in s_h_band (physically plausible horizontal
+    compression given s_v) is selected; ties -> median. Only used when neither
+    override nor hint is given. info["source"]="dxf_corridor".
 
     horizontal_scale_override: sets s_h DIRECTLY — compute_wall_anchor() is
     never called, so estimate_wall_scale/model_corridor_widths never run: no
@@ -398,6 +448,21 @@ def _resolve_horizontal_scale(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, v
         wall_info = {"source": "manual_override_bypasses_detection",
                      "horizontal_scale_override": s_h}
         return s_h, None, wall_info
+    if dxf_widths and corridor_width_hint is None:
+        recon_gap, gap_info = _recon_corridor_gap(Pg, cam_xz, vext)
+        if recon_gap is None or recon_gap <= 1e-6:
+            return s_v, gap_info.get("fail", "recon gap unavailable"), {"source": "dxf_corridor", **gap_info}
+        lo, hi = s_h_band
+        cands = [(round(float(w), 3), round(float(w) / recon_gap, 4)) for w in dxf_widths]
+        in_band = sorted((w, s) for w, s in cands if lo <= s <= hi)
+        wall_info = {"source": "dxf_corridor", "recon_gap": round(recon_gap, 4),
+                     "candidates": cands, "s_h_band": [lo, hi], **{k: gap_info[k] for k in gap_info if k != "recon_gap"}}
+        if not in_band:
+            wall_info["fail"] = f"no DXF corridor width gives s_h in band {s_h_band}"
+            return s_v, wall_info["fail"], wall_info
+        w_sel, s_sel = in_band[len(in_band) // 2]                # median in-band candidate
+        wall_info["selected_width"] = w_sel
+        return float(s_sel), None, wall_info
     s_wall, wall_info = compute_wall_anchor(Pg, cam_xz, wall_points, vext,
                                             corridor_width_hint=corridor_width_hint)
     if s_wall is not None:
@@ -759,7 +824,8 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
 
 
 def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, duration=None,
-                wall_points=None, corridor_width_hint=None, horizontal_scale_override=None):
+                wall_points=None, corridor_width_hint=None, horizontal_scale_override=None,
+                dxf_widths=None, s_h_band=(1.8, 2.8)):
     """RIGID placement: axis-split METRIC scale + ONE yaw rotation + ONE translation
     — no ICP, no CAD-polyline snap, no per-pose warping. The recon trajectory keeps
     its OWN shape; it is only rotated and shifted into the model frame.
@@ -857,7 +923,8 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])
     s_h, fallback_reason, wall_info = _resolve_horizontal_scale(
         Pg, Cg[:, [0, 2]], wall_points, vext, s_v,
-        corridor_width_hint=corridor_width_hint, horizontal_scale_override=horizontal_scale_override)
+        corridor_width_hint=corridor_width_hint, horizontal_scale_override=horizontal_scale_override,
+        dxf_widths=dxf_widths, s_h_band=s_h_band)
     scale_info = {"s_v": round(s_v, 4), "s_h": round(s_h, 4), "s_v_anchors": s_v_info,
                   "wall_anchor": wall_info, "fallback_reason": fallback_reason}
     poses_s, _Pg = apply_axis_split_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, s_h=s_h, s_v=s_v)
@@ -1049,6 +1116,28 @@ def place_autolocalize(pose_json, dtdx_files, frames_dir, *, hfov=69.0, stride=3
     return out, info
 
 
+def _dxf_corridor_scale_inputs(dxf_path, fxx_file, sxx_dtdx_path=None, radius=2.5):
+    """Load the DXF plan and derive the corridor-width candidates for the walked
+    corridor (the FXX main-run leg, in the raw model frame that matches the DXF).
+    Returns (corridor_widths, info) with the plan-transform residual and door log
+    for reporting. corridor_widths feeds _resolve_horizontal_scale's DXF branch."""
+    from scan2bim import dxf_plan as dp
+    from scan2bim.pipe_path import main_pipe_run_L
+    segs = dp.load_wall_segments(dxf_path)
+    info = {"dxf": str(dxf_path), "n_wall_segments": int(len(segs))}
+    if sxx_dtdx_path is not None:
+        g = decode_geometry(sxx_dtdx_path)
+        V = np.concatenate([m["positions"] for m in g["meshes"] if len(m["positions"])]).astype(np.float64)
+        info["plan_transform"] = dp.estimate_plan_transform(segs, V[:, [0, 2]])
+    legA = main_pipe_run_L(fxx_file, flip_x=False)[:2]          # raw frame (no display X-flip) = DXF frame
+    widths, w_info = dp.corridor_widths_near(segs, legA, radius=radius)
+    info["corridor_widths"] = widths
+    info["corridor_detail"] = {k: w_info[k] for k in ("n_local_samples", "median_width", "fail") if k in w_info}
+    _doors, d_info = dp.door_positions_near(dxf_path, legA, radius=3.0)
+    info["doors_near"] = d_info                                  # stored for later forward-axis calibration
+    return widths, info
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8767")
@@ -1076,6 +1165,9 @@ def main():
                     help="s_h(수평 axis-split 스케일) 직접 대입 — compute_wall_anchor() 자체를 "
                          "생략(검출·straddle 게이트 미관여). corridor-width-hint보다 우선하는 "
                          "순수 검증용 플래그(자동/힌트 결과와 구분 표기됨)")
+    ap.add_argument("--dxf", default=None,
+                    help="공식 Revit DXF 평면도 경로 — 주어지면 복도폭 출처를 SXX 메시 추정 대신 "
+                         "도면(scan2bim.dxf_plan)으로. s_h=DXF폭/recon갭 자동산출(--auto-rigid). 없으면 기존 동작")
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
@@ -1116,6 +1208,12 @@ def main():
     else:
         poses, scan_pts = fetch_scan(args.base_url, args.upload)
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
+    dxf_widths = None
+    if args.dxf:
+        fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
+        sxx = next((f for f in args.dtdx if "SXX" in f), None)
+        dxf_widths, dxf_info = _dxf_corridor_scale_inputs(args.dxf, fxx, sxx)
+        print("  dxf corridor source:", dxf_info)
     if args.horizontal_scale_override is not None:
         print(f"  horizontal_scale_override: {args.horizontal_scale_override} "
               "(manual_override_bypasses_detection) — compute_wall_anchor() skipped entirely")
@@ -1126,7 +1224,8 @@ def main():
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
         pose_json, reginfo = place_rigid(poses, scan_pts, ceil, bbox, fxx, anchor=anchor, duration=args.duration,
                                          wall_points=wall_points, corridor_width_hint=args.corridor_width_hint,
-                                         horizontal_scale_override=args.horizontal_scale_override)
+                                         horizontal_scale_override=args.horizontal_scale_override,
+                                         dxf_widths=dxf_widths)
         print("  rigid:", reginfo, "anchor:", anchor)
     elif args.auto_pipe:
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
