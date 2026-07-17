@@ -82,7 +82,10 @@ SPEED_BAND = (0.6, 1.4)
 # before it shows up as a bad speed — see main()'s exit-2 tagging.
 AXIS_SPEED_BAND = (0.4, 1.4)
 S_V_BAND = (1.6, 1.9)
-S_H_BAND = (3.2, 4.1)
+# Recalibrated cycle 4: the old [3.2,4.1] was anchored to s_h=3.644, since rejected
+# as circular (validate/decision.md). The physical corridor width (Revit DXF 1.821 m /
+# recon gap) puts s_h at ~2.0-2.3, so the plausibility band is [1.8, 2.8].
+S_H_BAND = (1.8, 2.8)
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +265,8 @@ def _import_build_coplay():
 def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: float,
                          wall_points: np.ndarray | None = None,
                          corridor_width_hint: float | None = None,
-                         horizontal_scale_override: float | None = None) -> dict:
+                         horizontal_scale_override: float | None = None,
+                         dxf_widths: list | None = None) -> dict:
     """AXIS-SPLIT metric scale (mirrors tools/build_coplay.py::place_pipe_auto()):
     s_v = fuse_scale_estimates([s_vert, s_cam]) (vertical: ceiling-height + camera-
     height, unchanged 2-anchor logic); s_h = the wall (corridor-width) anchor if
@@ -302,7 +306,8 @@ def compute_metric_scale(poses: np.ndarray, points: np.ndarray, bbox_height_m: f
 
     s_h, fallback_reason, wall_info = bc._resolve_horizontal_scale(
         Pg, Cg[:, [0, 2]], wall_points, vext, s_v,
-        corridor_width_hint=corridor_width_hint, horizontal_scale_override=horizontal_scale_override)
+        corridor_width_hint=corridor_width_hint, horizontal_scale_override=horizontal_scale_override,
+        dxf_widths=dxf_widths, s_h_band=S_H_BAND)
     # s_wall: the wall-anchor's OWN detected value (None if bypassed via override,
     # or if detection failed and s_h fell back to s_v) — distinct from s_h, which
     # is what actually drives placement either way.
@@ -341,6 +346,10 @@ def main() -> int:
                      help="sets s_h directly, skipping compute_wall_anchor() (and its straddle "
                           "gate) entirely — a pure verification override, distinct from and "
                           "taking priority over --corridor-width-hint.")
+    ap.add_argument("--dxf", default=None,
+                     help="official Revit DXF plan path — corridor widths come from the drawing "
+                          "(scan2bim.dxf_plan) instead of SXX mesh; s_h=DXF width/recon gap. "
+                          "Needs FXX+SXX in --dtdx. Absent -> unchanged behaviour.")
     args = ap.parse_args()
 
     if not args.lbp2.exists():
@@ -404,10 +413,22 @@ def main() -> int:
         print(f"  corridor_width_hint: {args.corridor_width_hint} (manual, verified) "
               "— bypassing automatic SXX corridor-width detection")
 
+    dxf_widths = None
+    if args.dxf:
+        bc = _import_build_coplay()
+        fxx = next((str(p) for p in dtdx_paths if "FXX" in str(p)), None)
+        sxx = next((str(p) for p in dtdx_paths if "SXX" in str(p)), None)
+        if fxx is None:
+            print("error: --dxf needs an FXX discipline in --dtdx (corridor locus)", file=sys.stderr)
+            return 2
+        dxf_widths, dxf_info = bc._dxf_corridor_scale_inputs(args.dxf, fxx, sxx)
+        print(f"  dxf corridor source: {dxf_info}")
+
     bbox_warn = bbox_height_warning(bbox_h)
     scale = compute_metric_scale(parsed["poses"], parsed["points"], bbox_h, wall_points=wall_points,
                                  corridor_width_hint=args.corridor_width_hint,
-                                 horizontal_scale_override=args.horizontal_scale_override)
+                                 horizontal_scale_override=args.horizontal_scale_override,
+                                 dxf_widths=dxf_widths)
     path_m = scale["path_m"]                      # already axis-split metric
     speed_ms = path_m / duration
     s_cam_str = f"{scale['s_cam']:.4f}" if scale["s_cam"] is not None else "n/a"

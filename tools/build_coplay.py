@@ -365,11 +365,61 @@ def _split_trajectory_legs(cam_xz: np.ndarray, margin: float = 0.0,
     return (leg_a_out, frac_a), (leg_b_out, frac_b), float(tf), float(ang), margin_frac
 
 
+def _recon_corridor_gap(Pg: np.ndarray, cam_xz: np.ndarray, vext: float):
+    """The recon corridor's clear width in RECON units — the facing wall pair the
+    walker passed between, WITHOUT the straddle gate. estimate_wall_scale's straddle
+    check abstains when the walker hugs one wall (measured on upload_1781521406685:
+    the pair sits at [-0.11, 0.83] but the trajectory median is -0.23, just outside),
+    yet the gap itself is a clean, well-defined corridor. When an authoritative DXF
+    width is supplied the straddle safety is redundant, so this takes the facing peak
+    pair whose midpoint is nearest the trajectory (the corridor actually walked) and
+    returns its spacing. Reuses scan2bim.wall_anchor's own peak detector (read-only).
+    Returns (gap, info) or (None, info)."""
+    from scipy.spatial import cKDTree
+    from scan2bim.wall_anchor import _horizontal_axes, _wall_peaks
+    cam = np.asarray(cam_xz, dtype=np.float64)
+    d, _ = cKDTree(cam).query(Pg[:, [0, 2]], k=1, workers=-1)
+    near = Pg[d < float(vext)]
+    if len(near) < 50:
+        return None, {"fail": "too few points within trajectory radius"}
+    y = near[:, 1]
+    ylo, yhi = float(np.percentile(y, 3)), float(np.percentile(y, 97))
+    yr = yhi - ylo
+    band = (y > ylo + 0.15 * yr) & (y < yhi - 0.15 * yr)
+    wall = near[band][:, [0, 2]]
+    if len(wall) < 50:
+        return None, {"fail": "no mid-band wall points"}
+    _axis, normal = _horizontal_axes(wall, cam)
+    peaks = _wall_peaks(wall @ normal)
+    if peaks is None:
+        return None, {"fail": "no wall density peaks"}
+    pos, _prom = peaks
+    if len(pos) < 2:
+        return None, {"fail": "fewer than two walls"}
+    cam_t = float(np.median(cam @ normal))
+    # adjacent facing pair whose midpoint is closest to the trajectory (the walked corridor)
+    mids = (pos[:-1] + pos[1:]) / 2.0
+    k = int(np.argmin(np.abs(mids - cam_t)))
+    gap = float(pos[k + 1] - pos[k])
+    return gap, {"recon_gap": round(gap, 4), "wall_positions": [round(float(p), 3) for p in pos],
+                 "cam_t": round(cam_t, 3)}
+
+
 def _resolve_horizontal_scale(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, vext: float, s_v: float,
                               corridor_width_hint: float | None = None,
-                              horizontal_scale_override: float | None = None):
+                              horizontal_scale_override: float | None = None,
+                              dxf_widths: list | None = None, s_h_band: tuple = (1.8, 2.8)):
     """Resolve s_h (the horizontal axis-split scale) for place_pipe_auto/
-    place_registered. Two independent escape hatches, in priority order:
+    place_registered/place_rigid. Escape hatches in priority order:
+
+    dxf_widths (place_rigid, --dxf): authoritative corridor clear widths read off
+    the official DXF plan (scan2bim.dxf_plan.corridor_widths_near) — the drawing is
+    the source of truth, so this REPLACES the furniture-noisy SXX triangle-gap
+    detection. s_h = DXF_width / recon_gap, where recon_gap is the recon corridor
+    width (_recon_corridor_gap, no straddle gate). Among the DXF candidate widths the
+    one whose implied s_h lands in s_h_band (physically plausible horizontal
+    compression given s_v) is selected; ties -> median. Only used when neither
+    override nor hint is given. info["source"]="dxf_corridor".
 
     horizontal_scale_override: sets s_h DIRECTLY — compute_wall_anchor() is
     never called, so estimate_wall_scale/model_corridor_widths never run: no
@@ -398,6 +448,21 @@ def _resolve_horizontal_scale(Pg: np.ndarray, cam_xz: np.ndarray, wall_points, v
         wall_info = {"source": "manual_override_bypasses_detection",
                      "horizontal_scale_override": s_h}
         return s_h, None, wall_info
+    if dxf_widths and corridor_width_hint is None:
+        recon_gap, gap_info = _recon_corridor_gap(Pg, cam_xz, vext)
+        if recon_gap is None or recon_gap <= 1e-6:
+            return s_v, gap_info.get("fail", "recon gap unavailable"), {"source": "dxf_corridor", **gap_info}
+        lo, hi = s_h_band
+        cands = [(round(float(w), 3), round(float(w) / recon_gap, 4)) for w in dxf_widths]
+        in_band = sorted((w, s) for w, s in cands if lo <= s <= hi)
+        wall_info = {"source": "dxf_corridor", "recon_gap": round(recon_gap, 4),
+                     "candidates": cands, "s_h_band": [lo, hi], **{k: gap_info[k] for k in gap_info if k != "recon_gap"}}
+        if not in_band:
+            wall_info["fail"] = f"no DXF corridor width gives s_h in band {s_h_band}"
+            return s_v, wall_info["fail"], wall_info
+        w_sel, s_sel = in_band[len(in_band) // 2]                # median in-band candidate
+        wall_info["selected_width"] = w_sel
+        return float(s_sel), None, wall_info
     s_wall, wall_info = compute_wall_anchor(Pg, cam_xz, wall_points, vext,
                                             corridor_width_hint=corridor_width_hint)
     if s_wall is not None:
@@ -759,7 +824,8 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
 
 
 def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, duration=None,
-                wall_points=None, corridor_width_hint=None, horizontal_scale_override=None):
+                wall_points=None, corridor_width_hint=None, horizontal_scale_override=None,
+                dxf_widths=None, s_h_band=(1.8, 2.8), turn_time_s=None):
     """RIGID placement: axis-split METRIC scale + ONE yaw rotation + ONE translation
     — no ICP, no CAD-polyline snap, no per-pose warping. The recon trajectory keeps
     its OWN shape; it is only rotated and shifted into the model frame.
@@ -769,10 +835,7 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     flipped local minimum (rmse~0.61, yaw~150° off — ceiling-inlier score is
     ambiguous on parallel pipes), and the CAD snap warps the walk onto the fire-
     pipe polyline whose corner sits ~12 m from where the person actually turned
-    (FXX corner Z≈-9.5 vs the real turn Z≈3). A pure rigid transform avoids both:
-    after gravity-align + chirality-flip the direction is already ~right (verified:
-    recon trajectory PCA within ~15° of the model corridor axis), only the metric
-    SIZE and the global yaw/offset were wrong.
+    (FXX corner Z≈-9.5 vs the real turn Z≈3). A pure rigid transform avoids both.
 
     Determination (deterministic, no search over yaw/offset):
       scale  — s_v = ceiling+camera vertical fusion; s_h = corridor-width wall
@@ -782,20 +845,29 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
                under-scales it (same finding/fix as place_pipe_auto; on this upload
                the wall anchor abstains — straddle fails — so s_h needs the explicit
                --horizontal-scale-override, exactly as it was separately verified).
-      yaw    — align the recon trajectory's dominant horizontal PCA axis to the
-               model corridor axis (model_ceiling PCA), the SAME a_s/a_p pair
-               place_registered computes, but used DIRECTLY (one value) rather than
-               grid-searched with ICP. The 180° axis ambiguity is resolved by the
-               FXX run's directed start→corner axis (main_pipe_run_L): keep the sign
-               whose rotated net heading agrees with the direction the corridor is
-               walked. If FXX is unavailable, keep the smaller rotation (the recon
-               is already near-aligned).
+      chirality — the model is X-mirrored (Babylon->Three), so the recon is
+               X-mirrored too; but the SIGN of that mirror is what decides which way
+               the L bends. Pick the flip whose resulting L-turn handedness equals
+               the model's FXX branch handedness (main_pipe_run_L). Cycle 1 hard-coded
+               the flip and produced a LEFT-turning walk against the corridor's
+               RIGHT-turning branch, so leg B ran past the walkable end. Falls back to
+               the -1 convention place_registered/place_pipe_auto use if FXX gives no
+               branch.
+      yaw    — align the MAJORITY (pre-turn) leg's line-fit direction to the FXX run
+               direction. NOT the whole-trajectory PCA: on an L-path that PCA is a
+               compromise between the two legs and tilts the straight leg ~15° off
+               the corridor — the cycle-1 "diagonal drift" defect. The pre-turn leg
+               is split off with trajectory_turn_fraction and line-fit with the same
+               _seg_dir place_pipe_auto uses. Both directions are DIRECTED, so there
+               is no 180° ambiguity. Falls back to the model_ceiling PCA axis
+               (smaller rotation) if FXX is unavailable.
       offset — --anchor 'x,z' (model coords) pins the trajectory START there: the
                explicit, invariant-respecting reference (the caller supplies one
                point instead of auto-confirming a global fit on repeated geometry).
-               Without --anchor the correctly-scaled/oriented trajectory centroid is
-               dropped at the model interior centre — a best-effort auto default
-               (the same centring place_gravity uses), NOT a verified registration.
+               Without --anchor the straight leg's X is pinned onto the corridor (the
+               FXX run X) and Z is dropped by centroid -> model interior centre. The
+               cycle-1 centroid-only drop pushed the straight walk out of the corridor
+               band; pinning leg-A's X keeps it inside. NOT a verified registration.
     Height = eye level (model floor + 1.5 m), keeping the metric vertical bob.
     Returns (pose_json, info). corridor_width_hint / horizontal_scale_override: see
     _resolve_horizontal_scale (same semantics as place_registered/place_pipe_auto)."""
@@ -803,7 +875,7 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
         apply_axis_split_scale, bbox_height_warning, camera_height_scale,
         estimate_floor_level, fuse_scale_estimates, speed_warning,
     )
-    from scan2bim.pipe_path import main_pipe_run_L, trajectory_turn_fraction
+    from scan2bim.pipe_path import _seg_dir, main_pipe_run_L, trajectory_turn_fraction
     centers, fwd, up = [], [], []
     for p in poses:
         c, f, u = viewer_pose(p); centers.append(c); fwd.append(f); up.append(u)
@@ -812,7 +884,67 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     Rg = _rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
     Cg = centers @ Rg.T; Fg = fwd @ Rg.T; Ug = up @ Rg.T
     P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0; Pg = P @ Rg.T
-    Cg[:, 0] *= -1.0; Fg[:, 0] *= -1.0; Ug[:, 0] *= -1.0; Pg[:, 0] *= -1.0   # chirality (model is X-mirrored)
+
+    n = len(Cg)
+
+    def _turn_split(xz, fixed_ci=None):
+        """(turn_index, pre-turn leg line-fit dir oriented start->corner, L handedness).
+        fixed_ci overrides the arc-length corner with an explicit pose index."""
+        if fixed_ci is not None:
+            ci = int(np.clip(fixed_ci, 2, len(xz) - 2))
+        else:
+            tf, _ = trajectory_turn_fraction(xz)
+            arclen = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xz, axis=0), axis=1))])
+            ci = int(np.clip(np.searchsorted(arclen, tf * arclen[-1]), 2, len(xz) - 2))
+        d = _seg_dir(xz[:ci + 1])                               # PCA line-fit of the pre-turn (majority) leg
+        if float(d @ (xz[ci] - xz[0])) < 0:
+            d = -d                                              # orient start -> corner
+        rA, rB = xz[ci] - xz[0], xz[-1] - xz[ci]
+        return ci, d, float(np.sign(rA[0] * rB[1] - rA[1] * rB[0]))
+
+    # --- corner by POSE INDEX (video timestamp), not arc-length, when turn_time_s is given ---
+    # The monocular compression is heading-relative, so on an L-path the raw arc-length
+    # bend (fraction ~0.77 here) lands far from the physical turn (t=13.5 s -> pose ~55,
+    # fraction ~0.385) — poses 55..97 stay collinear with leg A in raw coords even though
+    # the walker had already turned. A video-read turn time pins the split at the real
+    # corner; ±3 poses are refined to the local heading-change peak. None -> arc-length.
+    corner_ci = None
+    corner_meta = {"corner_source": "arc_length"}
+    if turn_time_s is not None and duration and float(duration) > 0 and n >= 8:
+        raw_idx = int(round(float(turn_time_s) / float(duration) * (n - 1)))
+        xz0 = Cg[:, [0, 2]]
+        ker = np.ones(5) / 5.0
+        sm = np.column_stack([np.convolve(xz0[:, 0], ker, "same"), np.convolve(xz0[:, 1], ker, "same")])
+        vel = np.diff(sm, axis=0)
+        head = np.arctan2(vel[:, 1], vel[:, 0])                 # per-step heading angle
+        w = 5
+
+        def _hc(i):
+            a, b = head[max(0, i - w)], head[min(len(head) - 1, i + w)]
+            return abs(float(np.degrees(np.arctan2(np.sin(b - a), np.cos(b - a)))))
+        window = range(max(3, raw_idx - 3), min(n - 3, raw_idx + 4))
+        corner_ci = max(window, key=_hc)
+        corner_meta = {"corner_source": f"time_based(t={float(turn_time_s)}s)",
+                       "turn_time_s": float(turn_time_s), "raw_pose_index": raw_idx,
+                       "refined_pose_index": int(corner_ci),
+                       "time_fraction": round(corner_ci / (n - 1), 3)}
+
+    # --- model corridor reference: FXX main run direction + mean-X + L handedness ---
+    run_dir = run_meanX = model_hand = None
+    try:
+        run = main_pipe_run_L(fxx_file)
+        v = np.asarray(run[1] - run[0], dtype=np.float64); run_dir = v / (np.linalg.norm(v) + 1e-9)
+        run_meanX = float((run[0][0] + run[1][0]) / 2.0)
+        if len(run) == 3:
+            mA, mB = run[1] - run[0], run[2] - run[1]
+            model_hand = float(np.sign(mA[0] * mB[1] - mA[1] * mB[0]))
+    except Exception:
+        pass
+
+    # --- chirality: match the recon L-turn handedness to the model FXX branch ---
+    _, _, recon_hand0 = _turn_split(Cg[:, [0, 2]], fixed_ci=corner_ci)   # handedness with NO flip
+    chi = (model_hand * recon_hand0) if (model_hand is not None and recon_hand0 != 0.0) else -1.0
+    Cg[:, 0] *= chi; Fg[:, 0] *= chi; Ug[:, 0] *= chi; Pg[:, 0] *= chi
 
     lo, hi = np.array(bbox[0]), np.array(bbox[1])
     # --- axis-split METRIC scale (reused from metric_scale, unmodified) ---
@@ -824,45 +956,39 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     s_v, s_v_info = fuse_scale_estimates([s_vert, s_cam])
     s_h, fallback_reason, wall_info = _resolve_horizontal_scale(
         Pg, Cg[:, [0, 2]], wall_points, vext, s_v,
-        corridor_width_hint=corridor_width_hint, horizontal_scale_override=horizontal_scale_override)
+        corridor_width_hint=corridor_width_hint, horizontal_scale_override=horizontal_scale_override,
+        dxf_widths=dxf_widths, s_h_band=s_h_band)
     scale_info = {"s_v": round(s_v, 4), "s_h": round(s_h, 4), "s_v_anchors": s_v_info,
                   "wall_anchor": wall_info, "fallback_reason": fallback_reason}
     poses_s, _Pg = apply_axis_split_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, s_h=s_h, s_v=s_v)
     Cm, Fm, Um = poses_s["c"], poses_s["f"], poses_s["u"]        # now metric (axis-split)
 
-    # --- yaw: recon trajectory PCA -> model corridor PCA (direct, no ICP search) ---
-    traj = Cm[:, [0, 2]]
-    Ch = traj - traj.mean(0)
-    t2d = np.linalg.eigh(Ch.T @ Ch)[1][:, -1]                    # recon walk dominant axis
-    a_s = float(np.degrees(np.arctan2(t2d[1], t2d[0])))
-    Mh = model_ceiling[:, [0, 2]] - model_ceiling[:, [0, 2]].mean(0)
-    p2d = np.linalg.eigh(Mh.T @ Mh)[1][:, -1]                    # model corridor dominant axis
-    a_p = float(np.degrees(np.arctan2(p2d[1], p2d[0])))
-    # directed corridor reference (FXX run start->corner) to resolve the 180° flip
-    try:
-        run = main_pipe_run_L(fxx_file)
-        mdir = np.asarray(run[1] - run[0], dtype=np.float64)
-        mdir = mdir / (np.linalg.norm(mdir) + 1e-9)
-    except Exception:
-        mdir = None
-    net = traj[-1] - traj[0]
+    # --- yaw: pre-turn (majority) leg line-fit -> FXX run direction (NOT whole PCA) ---
+    ci, legA_dir, _ = _turn_split(Cm[:, [0, 2]], fixed_ci=corner_ci)
+    a_legA = float(np.degrees(np.arctan2(legA_dir[1], legA_dir[0])))
 
     def _ry2(a):                                                # rotate XZ vectors by +a (deg)
         r = np.deg2rad(a); return np.array([[np.cos(r), -np.sin(r)], [np.sin(r), np.cos(r)]])
-    cands = [a_p - a_s, a_p - a_s + 180.0]
-    if mdir is not None and float(np.linalg.norm(net)) > 1e-6:
-        yaw = max(cands, key=lambda a: float((net @ _ry2(a).T) @ mdir))
-    else:
-        yaw = min(cands, key=lambda a: abs(((a + 180.0) % 360.0) - 180.0))   # closest to identity
+    if run_dir is not None:
+        yaw = float(np.degrees(np.arctan2(run_dir[1], run_dir[0]))) - a_legA   # directed -> no 180° ambiguity
+    else:                                                       # no FXX: fall back to model_ceiling PCA axis
+        Mh = model_ceiling[:, [0, 2]] - model_ceiling[:, [0, 2]].mean(0)
+        p2d = np.linalg.eigh(Mh.T @ Mh)[1][:, -1]
+        a_p = float(np.degrees(np.arctan2(p2d[1], p2d[0])))
+        yaw = min([a_p - a_legA, a_p - a_legA + 180.0], key=lambda a: abs(((a + 180.0) % 360.0) - 180.0))
     R2 = _ry2(yaw)                                               # apply the SAME convention used to pick yaw
     Cr = np.column_stack([Cm[:, [0, 2]] @ R2.T, Cm[:, 1]])[:, [0, 2, 1]]
     Fr = np.column_stack([Fm[:, [0, 2]] @ R2.T, Fm[:, 1]])[:, [0, 2, 1]]
     Ur = np.column_stack([Um[:, [0, 2]] @ R2.T, Um[:, 1]])[:, [0, 2, 1]]
 
-    # --- translation: --anchor pins START, else centroid -> model interior centre ---
+    # --- translation: --anchor pins START; else pin straight-leg X onto corridor, drop Z to centre ---
     if anchor is not None:
         off = np.array([float(anchor[0]) - Cr[0, 0], 0.0, float(anchor[1]) - Cr[0, 2]])
         anchor_mode = "start@anchor"
+    elif run_meanX is not None:
+        legA_x = float(Cr[:ci + 1, 0].mean())                   # straight (pre-turn) leg mean X
+        off = np.array([run_meanX - legA_x, 0.0, float((lo[2] + hi[2]) / 2.0 - Cr[:, 2].mean())])
+        anchor_mode = "legA-X@corridor"
     else:
         mc = (lo + hi) / 2.0; cen = Cr.mean(0)
         off = np.array([mc[0] - cen[0], 0.0, mc[2] - cen[2]])
@@ -876,11 +1002,17 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
                   "u": [round(float(x), 4) for x in Ur[i]]} for i in range(len(Ct))]
     path_m = float(np.linalg.norm(np.diff(Ct[:, [0, 2]], axis=0), axis=1).sum())
     tf, tang = trajectory_turn_fraction(Ct[:, [0, 2]])
+    corner_xz = [round(float(Ct[ci, 0]), 2), round(float(Ct[ci, 2]), 2)]   # placed split-pose position
     info = {"mode": "rigid", "s_v": round(s_v, 4), "s_h": round(s_h, 4),
-            "yaw": round(float(yaw), 1), "turn_frac": round(float(tf), 2),
+            "yaw": round(float(yaw), 1), "chi": int(chi), "turn_frac": round(float(tf), 2),
             "turn_angle_deg": round(float(tang), 1), "path_m": round(path_m, 2),
             "anchor": anchor_mode, "cam_h": round(eye - float(lo[1]), 2),
+            "corner_idx": int(ci), "corner_xz": corner_xz, **corner_meta,
+            "arclen_turn_frac": round(float(tf), 3),
             "fallback_reason": fallback_reason, "scale_anchors": scale_info}
+    if corner_ci is not None and abs(float(tf) - ci / (n - 1)) > 0.15:
+        info["note"] = ("arc-length turn fraction diverges from time-based ~2x — recon may have "
+                        "heading-relative anisotropy, per-leg scale not yet implemented")
     warnings = [w for w in (bbox_warn, speed_warning(path_m, duration)) if w]
     if warnings:
         info["warning"] = "; ".join(warnings)
@@ -1023,6 +1155,28 @@ def place_autolocalize(pose_json, dtdx_files, frames_dir, *, hfov=69.0, stride=3
     return out, info
 
 
+def _dxf_corridor_scale_inputs(dxf_path, fxx_file, sxx_dtdx_path=None, radius=2.5):
+    """Load the DXF plan and derive the corridor-width candidates for the walked
+    corridor (the FXX main-run leg, in the raw model frame that matches the DXF).
+    Returns (corridor_widths, info) with the plan-transform residual and door log
+    for reporting. corridor_widths feeds _resolve_horizontal_scale's DXF branch."""
+    from scan2bim import dxf_plan as dp
+    from scan2bim.pipe_path import main_pipe_run_L
+    segs = dp.load_wall_segments(dxf_path)
+    info = {"dxf": str(dxf_path), "n_wall_segments": int(len(segs))}
+    if sxx_dtdx_path is not None:
+        g = decode_geometry(sxx_dtdx_path)
+        V = np.concatenate([m["positions"] for m in g["meshes"] if len(m["positions"])]).astype(np.float64)
+        info["plan_transform"] = dp.estimate_plan_transform(segs, V[:, [0, 2]])
+    legA = main_pipe_run_L(fxx_file, flip_x=False)[:2]          # raw frame (no display X-flip) = DXF frame
+    widths, w_info = dp.corridor_widths_near(segs, legA, radius=radius)
+    info["corridor_widths"] = widths
+    info["corridor_detail"] = {k: w_info[k] for k in ("n_local_samples", "median_width", "fail") if k in w_info}
+    _doors, d_info = dp.door_positions_near(dxf_path, legA, radius=3.0)
+    info["doors_near"] = d_info                                  # stored for later forward-axis calibration
+    return widths, info
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8767")
@@ -1050,6 +1204,13 @@ def main():
                     help="s_h(수평 axis-split 스케일) 직접 대입 — compute_wall_anchor() 자체를 "
                          "생략(검출·straddle 게이트 미관여). corridor-width-hint보다 우선하는 "
                          "순수 검증용 플래그(자동/힌트 결과와 구분 표기됨)")
+    ap.add_argument("--dxf", default=None,
+                    help="공식 Revit DXF 평면도 경로 — 주어지면 복도폭 출처를 SXX 메시 추정 대신 "
+                         "도면(scan2bim.dxf_plan)으로. s_h=DXF폭/recon갭 자동산출(--auto-rigid). 없으면 기존 동작")
+    ap.add_argument("--turn-time-s", type=float, default=None,
+                    help="영상에서 실측한 물리적 회전 시각(초) — place_rigid의 레그 분할 코너를 "
+                         "arc-length 대신 포즈-인덱스(t/duration)로 지정(단안 heading 이방성으로 "
+                         "raw 호길이 코너가 실제 회전과 어긋날 때). 없으면 arc-length 그대로")
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
@@ -1090,6 +1251,12 @@ def main():
     else:
         poses, scan_pts = fetch_scan(args.base_url, args.upload)
     anchor = [float(x) for x in args.anchor.split(",")] if args.anchor else None
+    dxf_widths = None
+    if args.dxf:
+        fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
+        sxx = next((f for f in args.dtdx if "SXX" in f), None)
+        dxf_widths, dxf_info = _dxf_corridor_scale_inputs(args.dxf, fxx, sxx)
+        print("  dxf corridor source:", dxf_info)
     if args.horizontal_scale_override is not None:
         print(f"  horizontal_scale_override: {args.horizontal_scale_override} "
               "(manual_override_bypasses_detection) — compute_wall_anchor() skipped entirely")
@@ -1100,7 +1267,8 @@ def main():
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
         pose_json, reginfo = place_rigid(poses, scan_pts, ceil, bbox, fxx, anchor=anchor, duration=args.duration,
                                          wall_points=wall_points, corridor_width_hint=args.corridor_width_hint,
-                                         horizontal_scale_override=args.horizontal_scale_override)
+                                         horizontal_scale_override=args.horizontal_scale_override,
+                                         dxf_widths=dxf_widths, turn_time_s=args.turn_time_s)
         print("  rigid:", reginfo, "anchor:", anchor)
     elif args.auto_pipe:
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])

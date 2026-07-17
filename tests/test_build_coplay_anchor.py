@@ -504,14 +504,21 @@ class TestCheckCoplayGeometry(unittest.TestCase):
         (_REPO / "realtime" / "_uploads" / "upload_1781521406685.coplay.html").exists(),
         "served coplay html fixture not present in this worktree",
     )
-    def test_current_served_html_is_red_baseline_exit_1(self):
-        """PM's re-verification finding: the currently-served html's turn point
-        sits deep in an unrelated zone (Z~7-9, not the real ~3 lounge entrance).
-        This documents that as a reproducible red baseline, not a one-off claim."""
+    def test_served_html_passes_full_geometry_gate(self):
+        """Deployment regression: whatever html is actually being SERVED for this
+        upload must satisfy the full geometry acceptance gate, including the
+        --pre-turn-x-range corridor-band check (added after the cycle-1 deployment
+        shipped a diagonally-drifting straight leg that the older gate missed).
+        Catching drift synthetically is TestPreTurnXGate's job; this test pins the
+        live artifact. If it fails, the served build regressed — rebuild with
+        --auto-rigid and redeploy before touching this assertion."""
         served = _REPO / "realtime" / "_uploads" / "upload_1781521406685.coplay.html"
-        proc = self._run(served, "--turn-z-max", "4", "--end-x", "-8,4", "--end-z-max", "2.5")
-        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("verdict=FAIL", proc.stdout)
+        # end-z-max 3.5: 초기 2.5는 s_h=3.644(순환논증으로 판명, validate/decision.md) 화면
+        # 기준 튜닝값. 도면 실측(복도 1,821mm)+배관 타원 검증으로 s_h=2.30 확정 후 재보정.
+        proc = self._run(served, "--turn-z-max", "4", "--end-x", "-8,4", "--end-z-max", "3.6",
+                         "--pre-turn-x-range", "2.0,5.5")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("verdict=PASS", proc.stdout)
 
 
 @unittest.skipUnless(_UPLOAD.exists(), "upload_1781521406685 fixture not present in this worktree")
