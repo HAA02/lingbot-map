@@ -97,6 +97,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("html", type=Path, help="path to a tools/build_coplay.py-generated HTML")
     ap.add_argument("--turn-z-max", type=float, default=4.0)
+    ap.add_argument("--turn-z-min", type=float, default=None,
+                     help="counterpart of --turn-z-max (lower bound) — the turn point Z must be >= this. "
+                          "Default off: not checked, so existing invocations behave exactly as before.")
+    ap.add_argument("--turn-fraction-range", type=str, default=None,
+                     help="lo,hi — the detected corner's trajectory_turn_fraction must land in this "
+                          "range (e.g. near the physical-turn-time fraction). Default off: not checked, "
+                          "so existing invocations behave exactly as before.")
     ap.add_argument("--end-x", type=str, default="-8,4", help="lo,hi (model X range)")
     ap.add_argument("--end-z-max", type=float, default=2.5)
     ap.add_argument("--pre-turn-x-range", type=str, default=None,
@@ -127,6 +134,24 @@ def main() -> int:
     turn_ok = tp["z"] <= args.turn_z_max
     end_ok = (lo_x <= end_x <= hi_x) and (end_z <= args.end_z_max)
 
+    # turn Z lower bound (optional): pairs with --turn-z-max to band the turn point's Z.
+    turn_z_min_ok = True
+    turn_z_min_line = None
+    if args.turn_z_min is not None:
+        turn_z_min_ok = tp["z"] >= args.turn_z_min
+        turn_z_min_line = (f"turn_z_min z={tp['z']:.2f} turn_z_min={args.turn_z_min} -> "
+                            f"{'OK' if turn_z_min_ok else 'FAIL'}")
+
+    # turn fraction band (optional): the corner's arc-length fraction must land near
+    # where the physical turn is expected (e.g. from --turn-time-s in place_rigid).
+    frac_ok = True
+    frac_line = None
+    if args.turn_fraction_range is not None:
+        flo, fhi = _parse_range(args.turn_fraction_range)
+        frac_ok = flo <= tp["fraction"] <= fhi
+        frac_line = (f"turn_fraction={tp['fraction']:.2f} range=[{flo},{fhi}] -> "
+                      f"{'OK' if frac_ok else 'FAIL'}")
+
     # pre-turn straight-leg X band (optional): every pose up to the turn must stay in
     # the corridor. Catches the diagonal-drift failure the turn/end gates alone miss —
     # a leg that drifts sideways can still end in a valid spot (cycle-1 defect).
@@ -142,10 +167,14 @@ def main() -> int:
         pre_line = (f"pre_turn_x min={pmin:.2f} max={pmax:.2f} drift={pmax - pmin:.2f} "
                     f"band=[{plo},{phi}] (n={len(pre_x)}) -> {'OK' if pre_ok else 'FAIL'}")
 
-    verdict = "PASS" if (turn_ok and end_ok and pre_ok) else "FAIL"
+    verdict = "PASS" if (turn_ok and turn_z_min_ok and end_ok and pre_ok and frac_ok) else "FAIL"
 
     print(f"turn_point x={tp['x']:.2f} z={tp['z']:.2f} (fraction={tp['fraction']:.2f} "
           f"angle={tp['angle_deg']:.1f}deg) turn_z_max={args.turn_z_max} -> {'OK' if turn_ok else 'FAIL'}")
+    if turn_z_min_line is not None:
+        print(turn_z_min_line)
+    if frac_line is not None:
+        print(frac_line)
     print(f"endpoint x={end_x:.2f} z={end_z:.2f} end_x_range=[{lo_x},{hi_x}] "
           f"end_z_max={args.end_z_max} -> {'OK' if end_ok else 'FAIL'}")
     if pre_line is not None:

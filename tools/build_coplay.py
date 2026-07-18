@@ -1211,6 +1211,13 @@ def main():
                     help="영상에서 실측한 물리적 회전 시각(초) — place_rigid의 레그 분할 코너를 "
                          "arc-length 대신 포즈-인덱스(t/duration)로 지정(단안 heading 이방성으로 "
                          "raw 호길이 코너가 실제 회전과 어긋날 때). 없으면 arc-length 그대로")
+    ap.add_argument("--desmear-turn", action="store_true",
+                    help="place_rigid 배치 후처리(--auto-rigid 전용): 단안 VO가 물리 회전 순간이 "
+                         "아니라 그 뒤로 흩뿌린(smear) 방향전환을, step 길이 보존한 채 헤딩만 "
+                         "재분배해 실제 회전 포즈(--turn-time-s 코너)로 재집중. 미지정 시 기존과 byte-동일")
+    ap.add_argument("--desmear-window-s", default=None,
+                    help="desmear 스미어 구간을 초 'start,end'로 명시(자동검출 불안정 시 폴백). "
+                         "예 '16.5,25' → 포즈인덱스로 환산해 사용. 없으면 자동검출")
     ap.add_argument("--out", default="reports/coplay/coplay.html")
     args = ap.parse_args()
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
@@ -1270,6 +1277,19 @@ def main():
                                          horizontal_scale_override=args.horizontal_scale_override,
                                          dxf_widths=dxf_widths, turn_time_s=args.turn_time_s)
         print("  rigid:", reginfo, "anchor:", anchor)
+        if args.desmear_turn:      # post-process only: place_rigid output is not touched above
+            from scan2bim.turn_desmear import desmear_turn
+            ws_i = we_i = None
+            if args.desmear_window_s:
+                s0, s1 = (float(v) for v in args.desmear_window_s.split(","))
+                dur = float(args.duration) if args.duration else 0.0
+                if dur > 0 and len(pose_json) >= 2:
+                    ws_i = int(round(s0 / dur * (len(pose_json) - 1)))
+                    we_i = int(round(s1 / dur * (len(pose_json) - 1)))
+            pose_json, dmeta = desmear_turn(pose_json, int(reginfo["corner_idx"]),
+                                            window_start_idx=ws_i, window_end_idx=we_i)
+            reginfo["desmear"] = dmeta
+            print("  desmear:", dmeta)
     elif args.auto_pipe:
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
         pose_json, reginfo = place_pipe_auto(poses, scan_pts, bbox, fxx, fit_run=args.fit_run, duration=args.duration,

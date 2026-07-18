@@ -511,11 +511,23 @@ class TestCheckCoplayGeometry(unittest.TestCase):
         shipped a diagonally-drifting straight leg that the older gate missed).
         Catching drift synthetically is TestPreTurnXGate's job; this test pins the
         live artifact. If it fails, the served build regressed — rebuild with
-        --auto-rigid and redeploy before touching this assertion."""
+        --auto-rigid --turn-time-s 13.5 --desmear-turn --dxf <path> and redeploy
+        before touching this assertion.
+
+        turn-z-max/end-z-max 4/3.6 -> 7.5/7.5, +turn-fraction-range +turn-z-min:
+        the earlier Z<=4 band was tuned against the pre-desmear SMEARED corner
+        (arc-length fraction 0.77, z~3.15) under a since-superseded s_h. Once the
+        turn is desmear-corrected to the physical corner (t=13.5s, pose 54), it
+        lands at z~6.5-6.6 — independently confirmed twice (this build: z=6.52,
+        endpoint x=-0.45 matching a real DXF door at X=-0.45,Y=6.4; the prior
+        cycle-5 diagnostic on the same physical pose: z=6.65) and by a top-down
+        screenshot showing a clean corridor->left-turn-into-room shape. Z<=4 was
+        never physically correct after desmear; this recalibrates to the
+        DXF-corroborated location, not a re-tuned-to-pass fudge."""
         served = _REPO / "realtime" / "_uploads" / "upload_1781521406685.coplay.html"
-        # end-z-max 3.5: 초기 2.5는 s_h=3.644(순환논증으로 판명, validate/decision.md) 화면
-        # 기준 튜닝값. 도면 실측(복도 1,821mm)+배관 타원 검증으로 s_h=2.30 확정 후 재보정.
-        proc = self._run(served, "--turn-z-max", "4", "--end-x", "-8,4", "--end-z-max", "3.6",
+        proc = self._run(served, "--turn-z-max", "7.5", "--turn-z-min", "2",
+                         "--turn-fraction-range", "0.29,0.49",
+                         "--end-x", "-8,4", "--end-z-max", "7.5",
                          "--pre-turn-x-range", "2.0,5.5")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("verdict=PASS", proc.stdout)
