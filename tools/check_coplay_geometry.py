@@ -113,6 +113,15 @@ def main() -> int:
     ap.add_argument("--smooth-window", type=int, default=1,
                      help="moving-average window before turn detection (default 1 = off; see turn_point() docstring)")
     ap.add_argument("--duration", type=float, default=None, help="override the HTML's META.duration")
+    ap.add_argument("--path-min", type=float, default=None,
+                     help="minimum total path length (path_m) required to pass. Default off: not "
+                          "checked, so existing invocations behave exactly as before.")
+    ap.add_argument("--post-turn-heading-span-min", type=float, default=None,
+                     help="minimum total-variation of heading (degrees, 360-wrap-safe) among poses AFTER "
+                          "the detected turn point (tp['fraction']) required to pass — guards against a "
+                          "naturally winding post-turn segment (e.g. a lounge look-around) being forced "
+                          "straight. Default off: not checked, so existing invocations behave exactly "
+                          "as before.")
     args = ap.parse_args()
 
     if not args.html.exists():
@@ -167,7 +176,38 @@ def main() -> int:
         pre_line = (f"pre_turn_x min={pmin:.2f} max={pmax:.2f} drift={pmax - pmin:.2f} "
                     f"band=[{plo},{phi}] (n={len(pre_x)}) -> {'OK' if pre_ok else 'FAIL'}")
 
-    verdict = "PASS" if (turn_ok and turn_z_min_ok and end_ok and pre_ok and frac_ok) else "FAIL"
+    # post-turn heading total-variation (optional): poses AFTER the turn point must still
+    # show enough heading change (360-wrap-safe) — catches a real look-around (e.g. a lounge
+    # entry) being force-straightened by a placement bug, distinct from a legitimate turn.
+    post_turn_ok = True
+    post_turn_line = None
+    if args.post_turn_heading_span_min is not None:
+        arclen_pt = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xz, axis=0), axis=1))])
+        turn_arc = tp["fraction"] * arclen_pt[-1]
+        post_xz = xz[arclen_pt >= turn_arc - 1e-9]
+        steps = np.diff(post_xz, axis=0)
+        step_len = np.linalg.norm(steps, axis=1)
+        valid = step_len >= 0.01  # skip near-zero steps: heading is noise, not signal
+        headings = np.degrees(np.arctan2(steps[valid, 1], steps[valid, 0]))
+        if len(headings) >= 2:
+            wrapped = (np.diff(headings) + 180.0) % 360.0 - 180.0
+            tv_deg = float(np.abs(wrapped).sum())
+        else:
+            tv_deg = 0.0
+        post_turn_ok = tv_deg >= args.post_turn_heading_span_min
+        post_turn_line = (f"post_turn_heading_span={tv_deg:.1f} deg min={args.post_turn_heading_span_min} -> "
+                           f"{'OK' if post_turn_ok else 'FAIL'}")
+
+    # total path length lower bound (optional): the walk's full path_m (already computed
+    # below as an informational cross-check) must reach at least this length.
+    path_min_ok = True
+    path_min_line = None
+    if args.path_min is not None:
+        path_min_ok = path_m >= args.path_min
+        path_min_line = f"path_m={path_m:.2f} path_min={args.path_min} -> {'OK' if path_min_ok else 'FAIL'}"
+
+    verdict = "PASS" if (turn_ok and turn_z_min_ok and end_ok and pre_ok and frac_ok
+                          and post_turn_ok and path_min_ok) else "FAIL"
 
     print(f"turn_point x={tp['x']:.2f} z={tp['z']:.2f} (fraction={tp['fraction']:.2f} "
           f"angle={tp['angle_deg']:.1f}deg) turn_z_max={args.turn_z_max} -> {'OK' if turn_ok else 'FAIL'}")
@@ -179,8 +219,12 @@ def main() -> int:
           f"end_z_max={args.end_z_max} -> {'OK' if end_ok else 'FAIL'}")
     if pre_line is not None:
         print(pre_line)
+    if post_turn_line is not None:
+        print(post_turn_line)
     speed_str = f"{speed_ms:.3f}" if speed_ms is not None else "n/a (no duration)"
     print(f"path_m={path_m:.2f} duration_s={duration} avg_speed_ms={speed_str} (informational, no threshold here)")
+    if path_min_line is not None:
+        print(path_min_line)
     print(f"verdict={verdict}")
 
     return 0 if verdict == "PASS" else 1
