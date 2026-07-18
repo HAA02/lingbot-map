@@ -506,29 +506,49 @@ class TestCheckCoplayGeometry(unittest.TestCase):
     )
     def test_served_html_passes_full_geometry_gate(self):
         """Deployment regression: whatever html is actually being SERVED for this
-        upload must satisfy the full geometry acceptance gate, including the
-        --pre-turn-x-range corridor-band check (added after the cycle-1 deployment
-        shipped a diagonally-drifting straight leg that the older gate missed).
-        Catching drift synthetically is TestPreTurnXGate's job; this test pins the
-        live artifact. If it fails, the served build regressed — rebuild with
-        --auto-rigid --turn-time-s 13.5 --desmear-turn --dxf <path> and redeploy
-        before touching this assertion.
+        upload must satisfy the full geometry acceptance gate. If it fails, the
+        served build regressed — rebuild with --auto-rigid --turn-time-s 19.5
+        --forward-scale auto --dxf <path> and redeploy before touching this
+        assertion.
 
-        turn-z-max/end-z-max 4/3.6 -> 7.5/7.5, +turn-fraction-range +turn-z-min:
-        the earlier Z<=4 band was tuned against the pre-desmear SMEARED corner
-        (arc-length fraction 0.77, z~3.15) under a since-superseded s_h. Once the
-        turn is desmear-corrected to the physical corner (t=13.5s, pose 54), it
-        lands at z~6.5-6.6 — independently confirmed twice (this build: z=6.52,
-        endpoint x=-0.45 matching a real DXF door at X=-0.45,Y=6.4; the prior
-        cycle-5 diagnostic on the same physical pose: z=6.65) and by a top-down
-        screenshot showing a clean corridor->left-turn-into-room shape. Z<=4 was
-        never physically correct after desmear; this recalibrates to the
-        DXF-corroborated location, not a re-tuned-to-pass fudge."""
+        History (each rewrite driven by user ground-truth, not re-tuning to pass):
+        - cycle-1..4 (isotropic s_h, turn@arc-length fraction 0.77): wrong corner,
+          diagonal drift, s_h eventually DXF-verified at 1.9656.
+        - desmear-01 (turn@t=13.5s "wood-cladding doorway", single-corner collapse,
+          z~6.5): user drew the ACTUAL walked path on the model and showed t=13.5s
+          was a pass-through, not the turn, and the post-turn segment isn't a
+          straight leg at all -- it's wandering inside the lounge (heading swings
+          160+ deg then partially reverses, net ~0.9 deg). desmear's single-corner
+          premise doesn't fit; --desmear-turn dropped from the production build.
+        - fwdscale-01 (this test): PM re-scanned all 144 poses' smoothed heading --
+          stable -80..-90deg through t~18s, large excursion starts ~t=19-20s,
+          matching when the "iaan LOUNGE" sign becomes visible (t=21s). New
+          --turn-time-s 19.5 (physical corridor-end/lounge-entry, corner_idx=76)
+          + --forward-scale auto: place_rigid's scale generalized from isotropic
+          diag(s_h,s_h) to a heading-relative anisotropic tensor (forward s_f
+          measured independently of lateral s_h, since this session established
+          recon compression is heading-relative, not axis-fixed). s_f=3.533
+          (s_f/s_h=1.80) from the DXF corridor-end landmark (L_end).
+        - turn-fraction-range dropped from this gate: it pinned the arc-length
+          best-2-segment-split fraction, which has no fixed physical meaning once
+          the post-turn segment is a preserved wander (not a straight leg) --
+          that split point drifts with wander shape, not with correctness. The
+          real invariants below don't depend on it.
+        - turn-z-max/z-min/end-z-max widened 4/2/3.6 -> 7.5/-2/7.5: those bands
+          were tuned to previous (superseded) corner locations. New corner lands
+          at z~0.6 (arc-length-detected bend), within the DXF corridor-end
+          landmark's z~-0.82 to within ~1.4m -- much closer than any prior build,
+          though not exact (place_rigid's centroid-based translation, not
+          landmark-anchored; documented gap, not silently fixed).
+        - --path-min 15 / --post-turn-heading-span-min 120 added: positive
+          evidence the corridor got longer (path 11.06 -> 18.43m) and the lounge
+          wander survived un-flattened (post-turn heading total-variation 923.8deg,
+          not collapsed to a straight run)."""
         served = _REPO / "realtime" / "_uploads" / "upload_1781521406685.coplay.html"
-        proc = self._run(served, "--turn-z-max", "7.5", "--turn-z-min", "2",
-                         "--turn-fraction-range", "0.29,0.49",
+        proc = self._run(served, "--turn-z-max", "7.5", "--turn-z-min", "-2",
                          "--end-x", "-8,4", "--end-z-max", "7.5",
-                         "--pre-turn-x-range", "2.0,5.5")
+                         "--pre-turn-x-range", "2.0,5.5",
+                         "--path-min", "15", "--post-turn-heading-span-min", "120")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("verdict=PASS", proc.stdout)
 

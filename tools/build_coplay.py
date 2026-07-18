@@ -823,9 +823,46 @@ def place_gtpath(poses, scan_pts, bbox, waypoints, snap=True):
                        "path_m": round(plen, 2), "cam_h": round(eye - float(bbox[0][1]), 2)}
 
 
+def _forward_scale_auto(dxf_path, fxx_file, Ct_iso, legA_arc_raw, run_dir, s_h):
+    """Auto forward scale s_f for place_rigid's --forward-scale auto (P0-Landmark).
+
+    L_end = the model point where the walked corridor's parallel walls END (opens to
+    the lounge), read straight off the DXF plan along the FXX main-run axis
+    (forward_scale.corridor_open_boundary). s_f = |start->L_end along run_dir| /
+    leg-A recon arclen, with start = the ISOTROPICALLY-placed leg-A start (Ct_iso
+    pose 0) — the one model reference available without an --anchor. Frames: the DXF
+    plan is the model-RAW frame (plan_transform ~ identity), the placed trajectory /
+    run_dir are the DISPLAY frame (model X mirrored), so L_end's X is flipped to
+    display before the projection. Falls back to s_f=s_h (isotropic) when the DXF /
+    FXX landmark is unavailable, reporting the reason. Returns (s_f, info)."""
+    from scan2bim import dxf_plan as dp
+    from scan2bim.pipe_path import main_pipe_run_L
+    from scan2bim.forward_scale import corridor_open_boundary, estimate_forward_scale
+    if dxf_path is None or run_dir is None:
+        return s_h, {"source": "auto", "fail": "dxf_path or FXX run unavailable", "fallback": "s_h"}
+    segs = dp.load_wall_segments(dxf_path)                       # model-raw frame
+    runL_raw = main_pipe_run_L(fxx_file, flip_x=False)           # raw frame (matches DXF)
+    o_raw, corner_raw = runL_raw[0], runL_raw[1]
+    ax = corner_raw - o_raw
+    ax = ax / (np.linalg.norm(ax) + 1e-9)
+    L_end_raw, cb_info = corridor_open_boundary(segs, o_raw, ax)
+    if L_end_raw is None:
+        return s_h, {"source": "auto", "fail": cb_info.get("fail"), "corridor_boundary": cb_info,
+                     "fallback": "s_h"}
+    L_end_disp = np.array([-L_end_raw[0], L_end_raw[1]])         # raw -> display: mirror X
+    start_disp = np.asarray(Ct_iso[0, [0, 2]], dtype=np.float64)
+    s_f, est = estimate_forward_scale(legA_arc_raw, start_disp, L_end_disp, run_dir,
+                                      s_h=s_h, band=(1.0, 3.0))   # physical: s_h < s_f <= 3*s_h
+    est["source"] = "auto"
+    est["L_end_display"] = [round(float(L_end_disp[0]), 3), round(float(L_end_disp[1]), 3)]
+    est["corridor_boundary"] = {k: cb_info[k] for k in ("s_end", "n_gap_samples", "last_gaps") if k in cb_info}
+    return s_f, est
+
+
 def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, duration=None,
                 wall_points=None, corridor_width_hint=None, horizontal_scale_override=None,
-                dxf_widths=None, s_h_band=(1.8, 2.8), turn_time_s=None):
+                dxf_widths=None, s_h_band=(1.8, 2.8), turn_time_s=None,
+                forward_scale=None, dxf_path=None):
     """RIGID placement: axis-split METRIC scale + ONE yaw rotation + ONE translation
     — no ICP, no CAD-polyline snap, no per-pose warping. The recon trajectory keeps
     its OWN shape; it is only rotated and shifted into the model frame.
@@ -923,10 +960,19 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
             a, b = head[max(0, i - w)], head[min(len(head) - 1, i + w)]
             return abs(float(np.degrees(np.arctan2(np.sin(b - a), np.cos(b - a)))))
         window = range(max(3, raw_idx - 3), min(n - 3, raw_idx + 4))
-        corner_ci = max(window, key=_hc)
+        ref_pick = max(window, key=_hc)
+        # GUARD: the ±3 heading-peak refine must not drift INTO the post-turn lounge
+        # wiggle. If it lands notably LATER than the video-read turn (toward the look-
+        # around) or past a lounge-fraction bound, keep the RAW pose index — the
+        # physical turn, not a lounge heading spike. Inactive when refine stays at/before
+        # the video turn (e.g. this upload: raw 79 -> refine 76, moves away from lounge).
+        raw_frac = raw_idx / (n - 1)
+        ref_frac = ref_pick / (n - 1)
+        refine_reverted = bool(ref_frac >= 0.6 or (ref_frac - raw_frac) > 0.08)
+        corner_ci = raw_idx if refine_reverted else ref_pick
         corner_meta = {"corner_source": f"time_based(t={float(turn_time_s)}s)",
                        "turn_time_s": float(turn_time_s), "raw_pose_index": raw_idx,
-                       "refined_pose_index": int(corner_ci),
+                       "refined_pose_index": int(ref_pick), "refine_reverted_to_raw": refine_reverted,
                        "time_fraction": round(corner_ci / (n - 1), 3)}
 
     # --- model corridor reference: FXX main run direction + mean-X + L handedness ---
@@ -960,42 +1006,73 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
         dxf_widths=dxf_widths, s_h_band=s_h_band)
     scale_info = {"s_v": round(s_v, 4), "s_h": round(s_h, 4), "s_v_anchors": s_v_info,
                   "wall_anchor": wall_info, "fallback_reason": fallback_reason}
-    poses_s, _Pg = apply_axis_split_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, s_h=s_h, s_v=s_v)
-    Cm, Fm, Um = poses_s["c"], poses_s["f"], poses_s["u"]        # now metric (axis-split)
-
-    # --- yaw: pre-turn (majority) leg line-fit -> FXX run direction (NOT whole PCA) ---
-    ci, legA_dir, _ = _turn_split(Cm[:, [0, 2]], fixed_ci=corner_ci)
-    a_legA = float(np.degrees(np.arctan2(legA_dir[1], legA_dir[0])))
+    eye = float(lo[1]) + 1.5                                     # eye level; keep metric vertical bob
 
     def _ry2(a):                                                # rotate XZ vectors by +a (deg)
         r = np.deg2rad(a); return np.array([[np.cos(r), -np.sin(r)], [np.sin(r), np.cos(r)]])
-    if run_dir is not None:
-        yaw = float(np.degrees(np.arctan2(run_dir[1], run_dir[0]))) - a_legA   # directed -> no 180° ambiguity
-    else:                                                       # no FXX: fall back to model_ceiling PCA axis
-        Mh = model_ceiling[:, [0, 2]] - model_ceiling[:, [0, 2]].mean(0)
-        p2d = np.linalg.eigh(Mh.T @ Mh)[1][:, -1]
-        a_p = float(np.degrees(np.arctan2(p2d[1], p2d[0])))
-        yaw = min([a_p - a_legA, a_p - a_legA + 180.0], key=lambda a: abs(((a + 180.0) % 360.0) - 180.0))
-    R2 = _ry2(yaw)                                               # apply the SAME convention used to pick yaw
-    Cr = np.column_stack([Cm[:, [0, 2]] @ R2.T, Cm[:, 1]])[:, [0, 2, 1]]
-    Fr = np.column_stack([Fm[:, [0, 2]] @ R2.T, Fm[:, 1]])[:, [0, 2, 1]]
-    Ur = np.column_stack([Um[:, [0, 2]] @ R2.T, Um[:, 1]])[:, [0, 2, 1]]
 
-    # --- translation: --anchor pins START; else pin straight-leg X onto corridor, drop Z to centre ---
-    if anchor is not None:
-        off = np.array([float(anchor[0]) - Cr[0, 0], 0.0, float(anchor[1]) - Cr[0, 2]])
-        anchor_mode = "start@anchor"
-    elif run_meanX is not None:
-        legA_x = float(Cr[:ci + 1, 0].mean())                   # straight (pre-turn) leg mean X
-        off = np.array([run_meanX - legA_x, 0.0, float((lo[2] + hi[2]) / 2.0 - Cr[:, 2].mean())])
-        anchor_mode = "legA-X@corridor"
-    else:
-        mc = (lo + hi) / 2.0; cen = Cr.mean(0)
-        off = np.array([mc[0] - cen[0], 0.0, mc[2] - cen[2]])
-        anchor_mode = "centroid@model-centre"
-    Ct = Cr + off
-    eye = float(lo[1]) + 1.5                                     # eye level; keep metric vertical bob
-    Ct[:, 1] += eye - float(np.median(Ct[:, 1]))
+    def _finalize(Cm, Fm, Um):
+        """yaw (pre-turn leg line-fit -> FXX run dir, NOT whole PCA) + translation
+        (--anchor pins START; else pin straight-leg X onto corridor, drop Z to centre)
+        + eye level. Returns (Ct, Fr, Ur, ci, yaw, anchor_mode). With the isotropic
+        scaled poses this reproduces the pre-forward-scale placement byte-for-byte."""
+        ci, legA_dir, _ = _turn_split(Cm[:, [0, 2]], fixed_ci=corner_ci)
+        a_legA = float(np.degrees(np.arctan2(legA_dir[1], legA_dir[0])))
+        if run_dir is not None:
+            yaw = float(np.degrees(np.arctan2(run_dir[1], run_dir[0]))) - a_legA   # directed -> no 180° ambiguity
+        else:                                                   # no FXX: fall back to model_ceiling PCA axis
+            Mh = model_ceiling[:, [0, 2]] - model_ceiling[:, [0, 2]].mean(0)
+            p2d = np.linalg.eigh(Mh.T @ Mh)[1][:, -1]
+            a_p = float(np.degrees(np.arctan2(p2d[1], p2d[0])))
+            yaw = min([a_p - a_legA, a_p - a_legA + 180.0], key=lambda a: abs(((a + 180.0) % 360.0) - 180.0))
+        R2 = _ry2(yaw)                                           # apply the SAME convention used to pick yaw
+        Cr = np.column_stack([Cm[:, [0, 2]] @ R2.T, Cm[:, 1]])[:, [0, 2, 1]]
+        Fr = np.column_stack([Fm[:, [0, 2]] @ R2.T, Fm[:, 1]])[:, [0, 2, 1]]
+        Ur = np.column_stack([Um[:, [0, 2]] @ R2.T, Um[:, 1]])[:, [0, 2, 1]]
+        if anchor is not None:
+            off = np.array([float(anchor[0]) - Cr[0, 0], 0.0, float(anchor[1]) - Cr[0, 2]])
+            anchor_mode = "start@anchor"
+        elif run_meanX is not None:
+            legA_x = float(Cr[:ci + 1, 0].mean())               # straight (pre-turn) leg mean X
+            off = np.array([run_meanX - legA_x, 0.0, float((lo[2] + hi[2]) / 2.0 - Cr[:, 2].mean())])
+            anchor_mode = "legA-X@corridor"
+        else:
+            mc = (lo + hi) / 2.0; cen = Cr.mean(0)
+            off = np.array([mc[0] - cen[0], 0.0, mc[2] - cen[2]])
+            anchor_mode = "centroid@model-centre"
+        Ct = Cr + off
+        Ct[:, 1] += eye - float(np.median(Ct[:, 1]))
+        return Ct, Fr, Ur, ci, yaw, anchor_mode
+
+    # --- isotropic axis-split placement (default; byte-identical when forward_scale is None) ---
+    poses_s, _Pg = apply_axis_split_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, s_h=s_h, s_v=s_v)
+    Cm, Fm, Um = poses_s["c"], poses_s["f"], poses_s["u"]        # now metric (axis-split)
+    Ct, Fr, Ur, ci, yaw, anchor_mode = _finalize(Cm, Fm, Um)
+
+    # --- forward (heading-relative) anisotropic scale: ONLY behind --forward-scale ---
+    # Monocular compression is heading-relative, so s_h (the corridor-WIDTH anchor)
+    # under-scales the walked LENGTH. Replace the isotropic XZ scale with an aligned
+    # tensor A=R(theta)diag(s_f,s_h)R(theta)^T on the leg-A heading theta; s_f>s_h
+    # stretches only the forward axis. Scale still precedes yaw/offset (order kept).
+    fscale_info = None
+    if forward_scale is not None:
+        from scan2bim.forward_scale import anisotropic_scale_tensor, apply_forward_scale
+        _, legA_dir0, _ = _turn_split(Cm[:, [0, 2]], fixed_ci=corner_ci)   # iso frame == raw heading
+        theta = float(np.arctan2(legA_dir0[1], legA_dir0[0]))
+        legA_arc_raw = float(np.linalg.norm(np.diff(Cg[:ci + 1, [0, 2]], axis=0), axis=1).sum())
+        if isinstance(forward_scale, str) and forward_scale == "auto":
+            s_f, fscale_info = _forward_scale_auto(dxf_path, fxx_file, Ct, legA_arc_raw,
+                                                   run_dir, s_h)
+        else:
+            s_f = float(forward_scale)
+            fscale_info = {"source": "manual", "legA_recon_arclen": round(legA_arc_raw, 4)}
+        A = anisotropic_scale_tensor(theta, s_f, s_h)
+        poses_a, _ = apply_forward_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, A, s_v)
+        Cm, Fm, Um = poses_a["c"], poses_a["f"], poses_a["u"]
+        Ct, Fr, Ur, ci, yaw, anchor_mode = _finalize(Cm, Fm, Um)
+        fscale_info["s_f"] = round(float(s_f), 4)
+        fscale_info["theta_deg"] = round(float(np.degrees(theta)), 2)
+        fscale_info["s_f_over_s_h"] = round(float(s_f) / s_h, 3)
 
     pose_json = [{"c": [round(float(x), 3) for x in Ct[i]],
                   "f": [round(float(x), 4) for x in Fr[i]],
@@ -1010,6 +1087,8 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
             "corner_idx": int(ci), "corner_xz": corner_xz, **corner_meta,
             "arclen_turn_frac": round(float(tf), 3),
             "fallback_reason": fallback_reason, "scale_anchors": scale_info}
+    if fscale_info is not None:
+        info["forward_scale"] = fscale_info
     if corner_ci is not None and abs(float(tf) - ci / (n - 1)) > 0.15:
         info["note"] = ("arc-length turn fraction diverges from time-based ~2x — recon may have "
                         "heading-relative anisotropy, per-leg scale not yet implemented")
@@ -1211,6 +1290,10 @@ def main():
                     help="영상에서 실측한 물리적 회전 시각(초) — place_rigid의 레그 분할 코너를 "
                          "arc-length 대신 포즈-인덱스(t/duration)로 지정(단안 heading 이방성으로 "
                          "raw 호길이 코너가 실제 회전과 어긋날 때). 없으면 arc-length 그대로")
+    ap.add_argument("--forward-scale", default=None,
+                    help="place_rigid 전용(--auto-rigid): 진행방향(heading) 이방성 스케일 s_f 적용. "
+                         "'auto'=DXF 복도끝(L_end)/leg-A recon arclen로 산출, 또는 직접 수치. 없으면 "
+                         "기존 등방 diag(s_h,s_v,s_h)와 완전 byte-동일(무회귀). s_h=복도폭(측방), s_f=진행방향")
     ap.add_argument("--desmear-turn", action="store_true",
                     help="place_rigid 배치 후처리(--auto-rigid 전용): 단안 VO가 물리 회전 순간이 "
                          "아니라 그 뒤로 흩뿌린(smear) 방향전환을, step 길이 보존한 채 헤딩만 "
@@ -1272,10 +1355,14 @@ def main():
               "— bypassing automatic SXX corridor-width detection")
     if args.auto_rigid:
         fxx = next((f for f in args.dtdx if "FXX" in f), args.dtdx[0])
+        fscale = None
+        if args.forward_scale is not None:
+            fscale = args.forward_scale if args.forward_scale == "auto" else float(args.forward_scale)
         pose_json, reginfo = place_rigid(poses, scan_pts, ceil, bbox, fxx, anchor=anchor, duration=args.duration,
                                          wall_points=wall_points, corridor_width_hint=args.corridor_width_hint,
                                          horizontal_scale_override=args.horizontal_scale_override,
-                                         dxf_widths=dxf_widths, turn_time_s=args.turn_time_s)
+                                         dxf_widths=dxf_widths, turn_time_s=args.turn_time_s,
+                                         forward_scale=fscale, dxf_path=args.dxf)
         print("  rigid:", reginfo, "anchor:", anchor)
         if args.desmear_turn:      # post-process only: place_rigid output is not touched above
             from scan2bim.turn_desmear import desmear_turn
