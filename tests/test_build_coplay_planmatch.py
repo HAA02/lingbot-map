@@ -17,6 +17,20 @@ Two contracts from docs/TEAM_coplay-planmatch-01.md are pinned here:
       (loudly, with the candidate JSON still on disk for inspection) when the match is
       a 'hold' or the id does not exist.
 
+  DOOR EVIDENCE WIRING (--door-times, this cycle). The matcher's ONLY measured way out
+      of repeated/symmetric geometry is a door-passing event; dev-core measured margin
+      0.22 with one door vs 0.0 -> HOLD with none, and measured that an independent
+      `s_h_prior` does NOT separate the two fits. Before this wiring place_rigid called
+      the matcher with door_s=None unconditionally, so the production path could only
+      ever HOLD on this building's repeated corridors. TestDoorEvidenceResolvesTheTie is
+      the A/B proof through place_rigid itself: same plan, same walk, the ONLY difference
+      is whether the door passing time is annotated. Everything the caller cannot see
+      otherwise is diagnosed in reginfo['plan_match']['doors'] — the CLAMP that
+      door_arclengths applies to out-of-span times, the count mismatch against the
+      drawing's own A-DOOR inserts, and (when no --door-times is given at all) why a HOLD
+      was likely. Door evidence still confirms NOTHING by itself: invariant (2) above
+      holds unchanged with the door resolved.
+
 GROUND TRUTH BY CONSTRUCTION, no fixtures needed: the plan is a synthetic corridor
 written to a temporary DXF, and the recon walk is that corridor's own centreline mapped
 into recon units with the INVERSE of a known transform — the harness from
@@ -30,19 +44,23 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import scan2bim.coarse_match as cmod  # noqa: E402  (spied on, to prove door_s DELIVERY)
 import tools.build_coplay as bc  # noqa: E402
 from scan2bim import plan_skeleton as ps  # noqa: E402
 from test_build_coplay_rigid import (  # noqa: E402  (reuse the same fixture loaders — no duplication)
     _GASAN_GLOB, _S_H_OVERRIDE, _UPLOAD, _load_model, _load_recon,
 )
 from test_coarse_match import _corridor_walls, _make_walk  # noqa: E402  (matcher harness)
-from test_plan_skeleton import CENTER_A, CENTER_B, _l_corridor_segments  # noqa: E402
+from test_plan_skeleton import (  # noqa: E402
+    CENTER_A, CENTER_B, W, _l_corridor_segments, _write_l_corridor,
+)
 
 try:
     import ezdxf
@@ -321,6 +339,297 @@ class TestHoldCannotBeAccepted(_PlanMatchFixture):
         self.assertIsNone(disk["accepted_candidate_id"])
         self.assertGreaterEqual(len(disk["candidates"]), 2)
         self.assertTrue(all(c["candidate_id"] for c in disk["candidates"]))
+
+
+class _DoorFixture(unittest.TestCase):
+    """The AMBIGUOUS L corridor with its A-DOOR insert actually drawn, walked past that
+    door. Same plan and same walk in every door test: the ONLY variable is whether the
+    door PASSING time is annotated, which makes the A/B below an evidence experiment and
+    not a comparison of two different fixtures.
+
+    duration is set to n-1 poses so the pose time axis t_i = duration*i/(n-1) becomes
+    t_i == i: a "second" here IS a pose index, which is exactly the timestamp convention
+    tests/test_coarse_match._make_walk uses for its own door arclengths. So the door_s
+    place_rigid computes from --door-times must equal _make_walk's `ds` EXACTLY, and the
+    conversion (seconds -> pose time axis -> arclength) is pinned end to end rather than
+    re-derived by the test."""
+
+    DOOR_XY = (W, 4.0)                      # A-DOOR insert on corridor A's wall face
+    WALK_DOOR_XY = (CENTER_A, 4.0)          # where the walk passes it (on the centreline)
+
+    @classmethod
+    def setUpClass(cls):
+        if not _HAS_EZDXF:
+            raise unittest.SkipTest("ezdxf not installed")
+        cls._td = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls._td.name)
+        # A-WALL lines + A-DOOR block inserts at (W,4.0) [corridor] and (30,30) [far away,
+        # not a corridor door] — the same document tests/test_plan_skeleton.py reads.
+        cls.dxf = _write_l_corridor(cls.tmp)
+        cls.tf, cls.traj, cls.plan_walk, cls.ds = _make_walk(L_WALK, [cls.WALK_DOOR_XY])
+        cls.poses = _poses_from_xz(cls.traj)
+        cls.scan = _scan_cloud(cls.traj)
+        cls.n = len(cls.traj)
+        cls.duration = float(cls.n - 1)
+        cls.door_t = float(np.argmin(np.linalg.norm(
+            cls.plan_walk - np.asarray(cls.WALK_DOOR_XY, dtype=np.float64), axis=1)))
+        rng = np.random.RandomState(1)
+        cls.ceil = np.column_stack([rng.uniform(0.0, 30.0, 400), np.full(400, 3.0),
+                                    rng.uniform(0.0, 15.0, 400)])
+        cls.bbox = (np.array([0.0, 0.0, 0.0]), np.array([30.0, 3.0, 15.0]))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    @classmethod
+    def _place(cls, **kw):
+        return bc.place_rigid(cls.poses, cls.scan, cls.ceil, cls.bbox, None,
+                              horizontal_scale_override=_S_H_OVERRIDE, dxf_path=cls.dxf,
+                              duration=cls.duration, **kw)
+
+    @classmethod
+    def _place_spying_on_the_matcher(cls, **kw):
+        """(pose_json, info, door_s coarse_match ACTUALLY received). Proves delivery
+        instead of trusting that the diagnostics block describes what was passed."""
+        real, seen = cmod.coarse_match, {}
+
+        def spy(skel, traj_xz, **mkw):
+            seen["door_s"] = mkw.get("door_s")
+            return real(skel, traj_xz, **mkw)
+
+        with mock.patch.object(cmod, "coarse_match", spy):
+            pj, info = cls._place(**kw)
+        return pj, info, seen.get("door_s")
+
+
+class TestDoorEvidenceResolvesTheTie(_DoorFixture):
+    """THE core evidence of this cycle. One annotated door-passing time turns the SAME
+    ambiguous walk on the SAME plan from 'hold' (margin 0.0) into 'ok' at the margin
+    dev-core measured (0.22) — through place_rigid, i.e. the production path."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.pj_off, cls.info_off = cls._place(plan_match="off")
+        cls.pj_no, cls.info_no, cls.door_s_no = cls._place_spying_on_the_matcher(plan_match="auto")
+        cls.pj_yes, cls.info_yes, cls.door_s_yes = cls._place_spying_on_the_matcher(
+            plan_match="auto", door_times=[cls.door_t])
+        cls.pm_no, cls.pm_yes = cls.info_no["plan_match"], cls.info_yes["plan_match"]
+
+    def test_the_fixture_is_the_ambiguous_L_with_a_door_in_the_drawing(self):
+        """Guards the experiment: the plan must be the 2-leg L AND must carry exactly one
+        corridor door event, or the A/B below would compare the wrong things."""
+        self.assertEqual(self.pm_yes["info"]["plan"]["n_legs"], 2, self.pm_yes["info"])
+        self.assertEqual(self.pm_yes["info"]["plan"]["n_corners"], 1, self.pm_yes["info"])
+        self.assertEqual(self.pm_yes["info"]["plan"]["n_doors"], 1, self.pm_yes["info"])
+        d = self.pm_yes["doors"]
+        self.assertEqual(d["plan_doors_near_dxf"], 1)        # dxf_plan.door_positions_near
+        self.assertEqual(d["plan_doors_total_dxf"], 2)       # ...(30,30) is not a corridor door
+        self.assertEqual(d["plan_doors_attached"], 1)
+
+    def test_without_door_times_the_same_walk_only_holds(self):
+        """The state of the world BEFORE this wiring, now reproducible on demand."""
+        self.assertEqual((self.pm_no["status"], self.pm_no["hold_reason"]),
+                         ("hold", "ambiguous_margin"), self.pm_no["info"])
+        self.assertEqual(self.pm_no["margin"], 0.0)
+        self.assertIsNone(self.pm_no["best"])
+        self.assertGreaterEqual(len(self.pm_no["candidates"]), 2)
+        self.assertIsNone(self.door_s_no)                    # matcher got NO door evidence
+        self.assertEqual(self.pm_no["info"]["recon"]["n_doors"], 0)
+        self.assertEqual(self.pj_no, self.pj_off)            # ...and nothing was placed
+
+    def test_one_door_time_turns_that_hold_into_ok(self):
+        """dev-core's measurement, re-measured here through the CLI-facing wiring:
+        margin 0.0 (hold) -> 0.22 (ok, above the 0.08 gate)."""
+        self.assertEqual(self.pm_yes["status"], "ok",
+                         (self.pm_yes["hold_reason"], self.pm_yes["info"]))
+        self.assertIsNone(self.pm_yes["hold_reason"])
+        self.assertGreaterEqual(self.pm_yes["margin"], self.pm_yes["gates"]["margin_min"])
+        self.assertGreater(self.pm_yes["margin"], self.pm_no["margin"])
+        self.assertAlmostEqual(self.pm_yes["margin"], 0.22, delta=0.05,
+                               msg=f"dev-core measured 0.22 for this fixture, got "
+                                   f"{self.pm_yes['margin']} (no-door margin "
+                                   f"{self.pm_no['margin']})")
+
+    def test_the_resolved_answer_is_the_true_placement(self):
+        """Resolved is not enough — it has to resolve to where the walk really belongs
+        (the walk was generated from this plan's centreline with a known transform)."""
+        got = self.pm_yes["best"]["transform"]
+        self.assertEqual(int(got["chi"]), int(self.tf["chi"]))
+        self.assertAlmostEqual(float(got["yaw_deg"]), float(self.tf["yaw_deg"]), delta=0.05)
+        for k in ("s_f", "s_h"):
+            self.assertLess(abs(float(got[k]) - float(self.tf[k])) / float(self.tf[k]), 2e-3, k)
+        self.assertLess(float(np.abs(np.asarray(got["translation"], dtype=np.float64)
+                                     - np.asarray(self.tf["translation"], dtype=np.float64)).max()),
+                        0.01, got["translation"])
+        self.assertEqual(self.pm_yes["best"]["residual"], 0.0)
+
+    def test_door_s_is_what_actually_reached_coarse_match(self):
+        """The wiring itself: --door-times seconds -> pose time axis -> door_arclengths ->
+        coarse_match(door_s=...). Compared against the arclengths the matcher harness
+        computes for the same door, so the conversion is pinned, not restated."""
+        self.assertIsNotNone(self.door_s_yes)
+        np.testing.assert_allclose(np.asarray(self.door_s_yes, dtype=np.float64),
+                                   np.asarray(self.ds, dtype=np.float64), rtol=0, atol=1e-9)
+        self.assertEqual(self.pm_yes["doors"]["door_s"],
+                         [round(float(v), 4) for v in self.ds])
+        self.assertEqual(self.pm_yes["doors"]["door_times_s"], [self.door_t])
+        self.assertEqual(self.pm_yes["doors"]["pose_time_span_s"], [0.0, self.duration])
+        # ...and the matcher REDUCED it to a door event (recon side), not just accepted it
+        self.assertEqual(self.pm_yes["info"]["recon"]["n_doors"], 1)
+        self.assertEqual(self.pm_yes["info"]["recon"]["n_events"],
+                         self.pm_no["info"]["recon"]["n_events"] + 1)
+
+    def test_door_evidence_alone_still_confirms_nothing(self):
+        """INVARIANT (2) under the new flag — the regression that would matter most: a
+        door-RESOLVED 'ok' match is the most tempting case of all, and --door-times must
+        not become a back door into auto-confirmation."""
+        self.assertEqual(self.pj_yes, self.pj_off)
+        self.assertEqual(self.info_yes["mode"], "rigid")
+        self.assertEqual(self.info_yes["anchor"], self.info_off["anchor"])
+        self.assertIs(self.pm_yes["applied"], False)
+        self.assertIsNone(self.pm_yes["accepted_candidate_id"])
+        self.assertEqual({k: v for k, v in self.info_yes.items() if k != "plan_match"},
+                         self.info_off)
+
+    def test_only_an_explicit_accept_applies_the_door_resolved_candidate(self):
+        """...and once accepted, the door-resolved candidate places the walk back on the
+        plan centreline it came from (ground truth, 1 cm)."""
+        out = self.tmp / "door_accepted.plan_match.json"
+        pj, info = self._place(plan_match="auto", door_times=[self.door_t],
+                               plan_match_out=out, accept_plan_match="0")
+        self.assertEqual(info["mode"], "rigid+plan_match")
+        self.assertEqual(info["anchor"], "plan_match_candidate:0")
+        got = np.array([p["c"] for p in pj], dtype=np.float64)[:, [0, 2]]
+        err = float(np.abs(got - self.plan_walk).max())
+        self.assertLessEqual(err, 0.01, f"accepted placement is {err:.3f} m off the plan walk")
+        disk = json.loads(out.read_text())
+        self.assertIs(disk["applied"], True)
+        self.assertEqual(disk["doors"]["door_s"], [round(float(v), 4) for v in self.ds])
+
+    def test_no_door_times_is_unchanged_from_the_previous_wiring(self):
+        """No-regression for the flag's absence (D4's spirit at this level): omitting
+        --door-times leaves the auto build exactly the 'off' build plus diagnostics."""
+        self.assertEqual(self.pj_no, self.pj_off)
+        self.assertEqual({k: v for k, v in self.info_no.items() if k != "plan_match"},
+                         self.info_off)
+        self.assertNotIn("plan_match", self.info_off)
+
+
+class TestDoorTimeDiagnosticsAreExposed(_DoorFixture):
+    """Everything the caller cannot otherwise see must be in reginfo — silently
+    swallowing a clamped or unannotated door is how a wrong placement gets believed."""
+
+    def test_out_of_span_times_are_reported_as_clamped(self):
+        """door_arclengths pins a time outside the pose span onto the walk ends (np.interp),
+        i.e. it INVENTS a door at the start/end. That must be visible."""
+        bad = [-5.0, self.door_t, self.duration + 12.0]
+        out = self.tmp / "clamped.plan_match.json"
+        pj, info = self._place(plan_match="auto", door_times=bad, plan_match_out=out)
+        d = info["plan_match"]["doors"]
+        self.assertEqual(d["n_clamped"], 2, d)
+        self.assertEqual([c["door_time_s"] for c in d["clamped"]], [-5.0, self.duration + 12.0])
+        self.assertEqual([c["side"] for c in d["clamped"]], ["before_start", "after_end"])
+        self.assertEqual(d["clamped"][0]["clamped_to_s"], 0.0)          # ...the walk start
+        self.assertEqual(d["clamped"][1]["clamped_to_s"], d["walk_arclen_total"])   # ...and end
+        w = " ".join(d["warnings"])
+        self.assertIn("CLAMPED", w)
+        self.assertIn("-5.0", w)
+        self.assertIn(f"{self.duration + 12.0}", w)
+        self.assertIn("[0.000, ", w)                                   # the span it fell out of
+        self.assertEqual(json.loads(out.read_text())["doors"]["n_clamped"], 2)
+
+    def test_a_clamp_is_a_warning_not_a_crash(self):
+        """The build must still produce a placement (the user decides), so the warning is
+        the whole protection — a swallowed clamp would be undetectable."""
+        pj, info = self._place(plan_match="auto", door_times=[self.duration + 99.0])
+        self.assertEqual(len(pj), self.n)
+        self.assertEqual(info["mode"], "rigid")
+        self.assertEqual(info["plan_match"]["doors"]["n_clamped"], 1)
+        self.assertTrue(info["plan_match"]["doors"]["warnings"])
+
+    def test_missing_door_times_leaves_a_hold_diagnostic(self):
+        """--door-times omitted still matches (no behaviour change), but the reason a HOLD
+        is likely has to be readable — 'why is it holding' is the actual user question."""
+        _, info = self._place(plan_match="auto")
+        d = info["plan_match"]["doors"]
+        self.assertIsNone(d["door_s"])
+        self.assertIsNone(d["door_times_s"])
+        self.assertEqual(d["n_door_times"], 0)
+        self.assertIn("door_s=None", d["diagnostic"])
+        self.assertIn("hold", d["diagnostic"])
+        self.assertIn("--door-times", d["diagnostic"])
+        self.assertTrue(any("UNUSED" in w for w in d["warnings"]), d["warnings"])
+        self.assertEqual(info["plan_match"]["status"], "hold")          # exactly as diagnosed
+
+    def test_count_mismatch_with_the_drawing_is_reported_but_not_an_error(self):
+        """A user may have annotated only some doors, so this is information, not a
+        refusal: 3 annotated times against the 1 A-DOOR insert on this corridor."""
+        _, info = self._place(plan_match="auto",
+                              door_times=[self.door_t, self.door_t + 5.0, self.door_t + 9.0])
+        d = info["plan_match"]["doors"]
+        self.assertEqual(d["n_door_times"], 3)
+        self.assertEqual(d["plan_doors_near_dxf"], 1)
+        w = " ".join(d["warnings"])
+        self.assertIn("count 3", w)
+        self.assertIn("A-DOOR", w)
+        self.assertIn("에러 아님", w)
+
+    def test_a_matching_count_reports_no_mismatch(self):
+        """The mismatch warning must not fire on the normal case, or it is noise."""
+        _, info = self._place(plan_match="auto", door_times=[self.door_t])
+        self.assertEqual(info["plan_match"]["doors"]["warnings"], [])
+
+    def test_the_doors_block_survives_the_wire_and_the_schema(self):
+        _, info = self._place(plan_match="auto", door_times=[self.door_t])
+        pm = info["plan_match"]
+        json.dumps(pm)                                       # reginfo goes into the HTML
+        ok, errs = ps.validate_match_result({k: v for k, v in pm.items()
+                                            if k not in ("applied", "accepted_candidate_id",
+                                                         "persisted_to", "skeleton_info",
+                                                         "doors")})
+        self.assertTrue(ok, errs)
+        for k in ("door_times_s", "door_s", "n_clamped", "clamped", "warnings",
+                  "plan_doors_near_dxf", "plan_doors_attached"):
+            self.assertIn(k, pm["doors"])
+
+
+class TestDoorTimesGuards(_DoorFixture):
+    """--door-times must never be a silent no-op: the two ways it could be ignored raise."""
+
+    def test_door_times_without_plan_match_is_refused(self):
+        for pm in (None, "off"):
+            with self.assertRaises(ValueError) as cm:
+                self._place(plan_match=pm, door_times=[1.0])
+            self.assertIn("--plan-match auto", str(cm.exception))
+
+    def test_door_times_without_duration_is_refused(self):
+        """Seconds cannot be placed on the walk without the video duration — the pose time
+        axis IS t/duration*(n-1) (the --turn-time-s convention)."""
+        for dur in (None, 0.0):
+            with self.assertRaises(ValueError) as cm:
+                bc.place_rigid(self.poses, self.scan, self.ceil, self.bbox, None,
+                               horizontal_scale_override=_S_H_OVERRIDE, dxf_path=self.dxf,
+                               duration=dur, plan_match="auto", door_times=[1.0])
+            msg = str(cm.exception)
+            self.assertIn("--duration", msg)
+            self.assertIn("--door-times", msg)
+
+
+class TestDoorTimesCli(unittest.TestCase):
+    """The flag's own default and its forwarding: a default other than None would feed
+    invented door events into every build (and hit D4)."""
+
+    def setUp(self):
+        self.src = Path(bc.__file__).read_text(encoding="utf-8")
+
+    def test_door_times_defaults_to_none(self):
+        self.assertIn('ap.add_argument("--door-times", default=None,', self.src)
+
+    def test_main_parses_comma_separated_seconds_and_forwards_them(self):
+        self.assertIn('[float(v) for v in str(args.door_times).split(",") if v.strip()]', self.src)
+        self.assertIn("door_times=door_times", self.src)
 
 
 class TestPlanMatchGuards(unittest.TestCase):

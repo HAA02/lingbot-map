@@ -859,7 +859,85 @@ def _forward_scale_auto(dxf_path, fxx_file, Ct_iso, legA_arc_raw, run_dir, s_h):
     return s_f, est
 
 
-def _plan_match_auto(dxf_path, traj_xz, door_s=None):
+def _door_evidence(traj_xz, pose_times, door_times, skel_info=None):
+    """--door-times (video seconds) -> the matcher's door evidence + its diagnostics.
+
+    WHY this exists (measured, not assumed): a door-passing event is the ONLY evidence
+    that resolves repeated/symmetric plan geometry. dev-core measured margin 0.22 with
+    one door vs 0.0 -> HOLD with none on the same 2-leg L walk, and measured that an
+    independent `s_h_prior` does NOT separate the two fits (scan2bim.coarse_match module
+    notes, tests/test_coarse_match.py::TestAmbiguityHolds). So a --plan-match build with
+    no --door-times is not "fine by default" — it is diagnosed here as a likely HOLD.
+
+    pose_times  the per-pose time axis t_i = duration * i/(n-1). That is the SAME
+                second->pose-index convention --turn-time-s already uses in place_rigid
+                (raw_idx = round(t/duration*(n-1))); no new convention is introduced.
+    Returns (door_s, diag): `door_s` are recon-unit arclengths from
+    coarse_match.door_arclengths (what coarse_match consumes), `diag` is exposed as
+    reginfo['plan_match']['doors'] and persisted in the candidate JSON.
+
+    Two conditions are SURFACED rather than swallowed:
+      * CLAMP — door_arclengths (np.interp) clamps a time outside the pose span onto
+        the walk ends, i.e. it silently invents a door at the walk start/end. Every such
+        time is listed with the side it fell off and the arclength it got pinned to.
+      * COUNT MISMATCH vs the drawing's own A-DOOR inserts (dxf_plan.door_positions_near,
+        already run by plan_skeleton and reported in skel['info']['doors_dxf']) — NOT an
+        error (a user may have annotated only some of the doors), but they should be told.
+    """
+    from scan2bim.coarse_match import door_arclengths
+    info = dict(skel_info or {})
+    dd = info.get("doors_dxf") or {}
+    diag = {"door_times_s": None, "n_door_times": 0, "door_s": None,
+            "plan_doors_near_dxf": dd.get("n_near"),           # dxf_plan.door_positions_near
+            "plan_doors_total_dxf": dd.get("n_doors_total"),
+            "plan_doors_attached": info.get("n_doors_attached"),   # = the plan door EVENTS
+            "n_clamped": 0, "clamped": [], "warnings": []}
+    if door_times is None:
+        diag["diagnostic"] = (
+            "door_s=None — 문통과 이벤트 없음: 반복/대칭 기하(동일 형상 복도 2개, 2-leg L)에서는 "
+            "정·역(mirrored) 두 배치가 같은 점수로 남아 margin이 0에 머물고 hold 가능성이 높다. "
+            "문 이벤트가 그 모호성을 푸는 유일한 실측 근거이므로(s_h_prior는 반증됨) "
+            "--door-times 로 영상에서 읽은 문통과 시각(초)을 주면 매처가 그 증거를 쓴다")
+        if diag["plan_doors_attached"]:
+            diag["warnings"].append(
+                f"plan has {diag['plan_doors_attached']} door event(s) from the DXF but --door-times "
+                "was not given — that door evidence stays UNUSED (문 주석 없이는 매처가 못 씀)")
+        return None, diag
+
+    traj = np.asarray(traj_xz, dtype=np.float64).reshape(-1, 2)
+    t = np.asarray(pose_times, dtype=np.float64).reshape(-1)
+    dt = [float(v) for v in np.asarray(door_times, dtype=np.float64).reshape(-1)]
+    diag["door_times_s"] = dt
+    diag["n_door_times"] = len(dt)
+    diag["pose_time_span_s"] = [round(float(t[0]), 3), round(float(t[-1]), 3)] if len(t) else None
+    door_s = door_arclengths(traj, t, dt)                  # dev-core owned conversion
+    total = float(np.linalg.norm(np.diff(traj, axis=0), axis=1).sum()) if len(traj) >= 2 else 0.0
+    diag["door_s"] = [round(float(v), 4) for v in door_s]
+    diag["walk_arclen_total"] = round(total, 4)
+    lo, hi = (float(t[0]), float(t[-1])) if len(t) else (0.0, 0.0)
+    for v, s in zip(dt, door_s):                           # the clamp the docstring warns about
+        if v < lo or v > hi:
+            diag["clamped"].append({"door_time_s": v, "side": "before_start" if v < lo else "after_end",
+                                    "clamped_to_s": round(float(s), 4)})
+    diag["n_clamped"] = len(diag["clamped"])
+    if diag["n_clamped"]:
+        diag["warnings"].append(
+            f"--door-times: {diag['n_clamped']} of {len(dt)} door time(s) fall OUTSIDE the pose time "
+            f"span [{lo:.3f}, {hi:.3f}]s and were CLAMPED to the walk ends by door_arclengths "
+            f"({diag['clamped']}) — 영상 길이를 벗어난 문 시각은 궤적 양끝에 없는 문을 만들어 "
+            "잘못된 증거가 된다(시각/duration 확인 필요)")
+    n_near = diag["plan_doors_near_dxf"]
+    if n_near is not None and int(n_near) != len(dt):
+        diag["warnings"].append(
+            f"--door-times count {len(dt)} != DXF A-DOOR inserts near the plan centreline {int(n_near)} "
+            f"(attached as plan door events: {diag['plan_doors_attached']}) — 에러 아님(문 일부만 "
+            "주석했을 수 있음), 다만 남는 문은 outlier로 잡히거나 증거로 못 쓰인다")
+    if len(dt) and not door_s:
+        diag["warnings"].append("walk too short for door arclengths (<2 poses) — door_s empty")
+    return door_s, diag
+
+
+def _plan_match_auto(dxf_path, traj_xz, door_times=None, pose_times=None):
     """Run the P1-Match coarse matcher (scan2bim.coarse_match) against the --dxf plan
     skeleton (scan2bim.plan_skeleton) for --plan-match auto.
 
@@ -872,12 +950,19 @@ def _plan_match_auto(dxf_path, traj_xz, door_s=None):
     coarse_match) contract bug, reported loudly here rather than patched (this module
     does not own those files).
 
+    `door_times` (video seconds, --door-times) are converted to the recon-unit
+    arclengths coarse_match speaks (`coarse_match.door_arclengths`) against `pose_times`
+    — see _door_evidence for why the door events are the load-bearing evidence here and
+    what is diagnosed when they are missing/out of range. The diagnostics land in
+    result['doors'].
+
     Adds a build_coplay-local `candidate_id` (str(rank), stable within one result) to
     every candidate so --accept-plan-match has a name to reference; this key is
     additive and does not alter the plan_skeleton schema."""
     from scan2bim import plan_skeleton as ps
     from scan2bim.coarse_match import coarse_match
     skel = ps.plan_skeleton(dxf_path)
+    door_s, door_diag = _door_evidence(traj_xz, pose_times, door_times, skel.get("info", {}))
     result = coarse_match(skel, traj_xz, door_s=door_s)
     ok, errs = ps.validate_match_result(result)
     if not ok:
@@ -887,14 +972,15 @@ def _plan_match_auto(dxf_path, traj_xz, door_s=None):
     for c in result["candidates"]:
         c["candidate_id"] = str(c["rank"])
     result["skeleton_info"] = skel.get("info", {})
-    return result
+    result["doors"] = door_diag              # additive (validate_match_result checks required
+    return result                            # fields only) — the door evidence audit trail
 
 
 def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, duration=None,
                 wall_points=None, corridor_width_hint=None, horizontal_scale_override=None,
                 dxf_widths=None, s_h_band=(1.8, 2.8), turn_time_s=None,
                 forward_scale=None, dxf_path=None, plan_match=None,
-                plan_match_out=None, accept_plan_match=None):
+                plan_match_out=None, accept_plan_match=None, door_times=None):
     """RIGID placement: axis-split METRIC scale + ONE yaw rotation + ONE translation
     — no ICP, no CAD-polyline snap, no per-pose warping. The recon trajectory keeps
     its OWN shape; it is only rotated and shifted into the model frame.
@@ -959,7 +1045,17 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     (chi/theta_deg/s_f/s_h/yaw_deg/translation) instead of this function's scale/yaw/
     offset heuristic. Requires plan_match='auto'; raises if the matched result isn't
     status 'ok' or the candidate_id isn't among the returned candidates — never
-    silently falls back to the heuristic placement on a bad accept request."""
+    silently falls back to the heuristic placement on a bad accept request.
+
+    door_times: video-read door-PASSING instants in seconds (--door-times). Converted to
+    the matcher's arclengths on the pose time axis t_i = duration*i/(n-1) — the same
+    convention --turn-time-s uses — and handed to coarse_match as `door_s`. This is the
+    evidence that resolves repeated/symmetric geometry (measured: margin 0.22 with a door
+    vs 0.0 -> HOLD without); without it --plan-match auto behaves exactly as before and
+    says so in info['plan_match']['doors']['diagnostic']. Requires plan_match='auto' and
+    a `duration` (raises otherwise — no silent no-op). Door evidence NEVER confirms
+    anything by itself: it only changes the matcher's candidates/margin, and design
+    invariant (2) still routes every placement change through accept_plan_match."""
     do_plan_match = plan_match not in (None, "off")
     if do_plan_match and plan_match != "auto":
         raise ValueError(f"--plan-match: unknown value {plan_match!r} (expected 'off' or 'auto')")
@@ -969,6 +1065,13 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     if accept_plan_match is not None and not do_plan_match:
         raise ValueError("--accept-plan-match requires --plan-match auto "
                          "(nothing was matched to accept)")
+    if door_times is not None and not do_plan_match:
+        raise ValueError("--door-times requires --plan-match auto (nothing consumes the door "
+                         "events otherwise) — refusing a silent no-op")
+    if door_times is not None and not (duration and float(duration) > 0):
+        raise ValueError("--door-times requires --duration > 0: the pose time axis is "
+                         "t_i = duration*i/(n-1) (the same convention --turn-time-s uses), "
+                         "so seconds cannot be placed on the walk without it")
     from scan2bim.metric_scale import (
         apply_axis_split_scale, bbox_height_warning, camera_height_scale,
         estimate_floor_level, fuse_scale_estimates, speed_warning,
@@ -1189,7 +1292,12 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
 
     # --- --plan-match auto: match + persist candidates; ONLY --accept-plan-match applies one ---
     if do_plan_match:
-        match_result = _plan_match_auto(dxf_path, Cg0[:, [0, 2]])
+        # pose time axis = the --turn-time-s convention (raw_idx = t/duration*(n-1)) read
+        # the other way round: t_i = duration*i/(n-1). Same axis, no second convention.
+        pose_times = (np.linspace(0.0, float(duration), n)
+                      if (duration and float(duration) > 0) else None)
+        match_result = _plan_match_auto(dxf_path, Cg0[:, [0, 2]], door_times=door_times,
+                                        pose_times=pose_times)
         pm = dict(match_result)
         pm["accepted_candidate_id"] = None
         pm["applied"] = False
@@ -1442,6 +1550,14 @@ def main():
                          "place_rigid 출력과 완전 byte-동일(무회귀). 'auto'는 --dxf 필수(없으면 에러) — "
                          "그 자체로는 배치를 바꾸지 않는다(설계 불변식: --accept-plan-match 없이는 후보 "
                          "JSON+reginfo 진단만, HTML/배치에 확정 표기 없음)")
+    ap.add_argument("--door-times", default=None,
+                    help="영상에서 실측한 문통과 시각(초, 쉼표구분 예 '4.2,11.8,26.5') — --plan-match "
+                         "auto 전용: 포즈 시간축(t/duration, --turn-time-s와 동일 관례)으로 arclength"
+                         "(coarse_match.door_arclengths)로 환산해 매처에 문 이벤트 증거로 전달. 반복/대칭 "
+                         "기하(동일 형상 복도 2개·2-leg L)의 모호성을 푸는 유일한 실측 근거 — 실측: 문 1개면 "
+                         "margin 0.22(확정), 없으면 0.0(hold). 없으면 기존과 동일하게 문 없이 매칭하고 그 "
+                         "사유를 reginfo['plan_match']['doors']에 진단으로 남긴다(--duration 필수). "
+                         "문 증거만으로 확정되는 일은 없다 — 배치 변경은 여전히 --accept-plan-match만")
     ap.add_argument("--accept-plan-match", default=None,
                     help="--plan-match auto가 낸 후보 중 candidate_id(문자열 rank, 예 '0')를 명시적으로 "
                          "수락 — 그때만 배치가 그 후보의 transform(chi/theta_deg/s_f/s_h/yaw_deg/"
@@ -1513,13 +1629,16 @@ def main():
         if args.forward_scale is not None:
             fscale = args.forward_scale if args.forward_scale == "auto" else float(args.forward_scale)
         plan_match_out = out.with_name(out.stem + ".plan_match.json") if args.plan_match == "auto" else None
+        door_times = ([float(v) for v in str(args.door_times).split(",") if v.strip()]
+                      if args.door_times else None)
         pose_json, reginfo = place_rigid(poses, scan_pts, ceil, bbox, fxx, anchor=anchor, duration=args.duration,
                                          wall_points=wall_points, corridor_width_hint=args.corridor_width_hint,
                                          horizontal_scale_override=args.horizontal_scale_override,
                                          dxf_widths=dxf_widths, turn_time_s=args.turn_time_s,
                                          forward_scale=fscale, dxf_path=args.dxf,
                                          plan_match=args.plan_match, plan_match_out=plan_match_out,
-                                         accept_plan_match=args.accept_plan_match)
+                                         accept_plan_match=args.accept_plan_match,
+                                         door_times=door_times)
         print("  rigid:", reginfo, "anchor:", anchor)
         if args.desmear_turn:      # post-process only: place_rigid output is not touched above
             from scan2bim.turn_desmear import desmear_turn
