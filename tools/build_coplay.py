@@ -859,10 +859,42 @@ def _forward_scale_auto(dxf_path, fxx_file, Ct_iso, legA_arc_raw, run_dir, s_h):
     return s_f, est
 
 
+def _plan_match_auto(dxf_path, traj_xz, door_s=None):
+    """Run the P1-Match coarse matcher (scan2bim.coarse_match) against the --dxf plan
+    skeleton (scan2bim.plan_skeleton) for --plan-match auto.
+
+    Builds the skeleton straight off the DXF (plan_skeleton.plan_skeleton — the P0-
+    Skeleton entry point) and matches it to `traj_xz` (RAW gravity-aligned recon plan
+    points — place_rigid passes its pre-chirality Cg0, since the candidate's own `chi`
+    supplies the handedness flip; see plan_skeleton.TRANSFORM_FIELDS). The result is
+    validated against plan_skeleton.validate_match_result before this module ever
+    trusts or persists it — a violation is a dev-core (scan2bim.plan_skeleton/
+    coarse_match) contract bug, reported loudly here rather than patched (this module
+    does not own those files).
+
+    Adds a build_coplay-local `candidate_id` (str(rank), stable within one result) to
+    every candidate so --accept-plan-match has a name to reference; this key is
+    additive and does not alter the plan_skeleton schema."""
+    from scan2bim import plan_skeleton as ps
+    from scan2bim.coarse_match import coarse_match
+    skel = ps.plan_skeleton(dxf_path)
+    result = coarse_match(skel, traj_xz, door_s=door_s)
+    ok, errs = ps.validate_match_result(result)
+    if not ok:
+        raise RuntimeError(
+            "scan2bim.coarse_match/plan_skeleton result failed validate_match_result "
+            f"(dev-core-owned contract violation — report, do not patch in build_coplay.py): {errs}")
+    for c in result["candidates"]:
+        c["candidate_id"] = str(c["rank"])
+    result["skeleton_info"] = skel.get("info", {})
+    return result
+
+
 def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, duration=None,
                 wall_points=None, corridor_width_hint=None, horizontal_scale_override=None,
                 dxf_widths=None, s_h_band=(1.8, 2.8), turn_time_s=None,
-                forward_scale=None, dxf_path=None, plan_match=None):
+                forward_scale=None, dxf_path=None, plan_match=None,
+                plan_match_out=None, accept_plan_match=None):
     """RIGID placement: axis-split METRIC scale + ONE yaw rotation + ONE translation
     — no ICP, no CAD-polyline snap, no per-pose warping. The recon trajectory keeps
     its OWN shape; it is only rotated and shifted into the model frame.
@@ -910,19 +942,33 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     _resolve_horizontal_scale (same semantics as place_registered/place_pipe_auto).
 
     plan_match: None/'off' (default) leaves every line below untouched -> byte-identical
-    output (P1-Wire-a no-regression contract, D4). 'auto' fails fast, BEFORE any of the
-    scale/yaw/offset work below runs, with an explicit error — plan-skeleton candidate
-    generation (scan2bim.coarse_match) and its JSON persistence are wired in a later
-    cycle; this flag never silently no-ops into a confirmed placement (design invariant:
-    no HTML/reginfo confirmation without an explicit accept flag)."""
-    if plan_match not in (None, "off"):
-        if plan_match == "auto":
-            from scan2bim.coarse_match import coarse_match  # lazy: fail loudly if matcher import breaks
-            raise NotImplementedError(
-                "--plan-match auto: coarse_match wiring (candidate JSON persistence, "
-                "reginfo diagnostics) is not implemented yet in this cycle — "
-                "see docs/TEAM_coplay-planmatch-01.md")
+    output (P1-Wire-a no-regression contract, D4). 'auto' matches the RAW gravity-
+    aligned walk (before this function's own FXX-handedness chirality flip — the
+    candidate's own `chi`, plan_skeleton.TRANSFORM_FIELDS, supplies that) against the
+    --dxf plan skeleton via scan2bim.coarse_match, validates the result against
+    plan_skeleton.validate_match_result, and exposes it as info['plan_match'] —
+    persisted to `plan_match_out` (JSON) when given. Requires --dxf (raises otherwise —
+    no silent no-op). By itself 'auto' NEVER changes pose_json/the rest of info: design
+    invariant (2) is enforced by requiring accept_plan_match to actually be applied (see
+    below), so a bare --plan-match auto build is byte-identical in every field except
+    the added info['plan_match'] diagnostics block.
+
+    accept_plan_match: candidate_id (str, matches a candidate's 'candidate_id' — this
+    module's own str(rank) label, additive to the plan_skeleton schema) to EXPLICITLY
+    confirm. Only then is the placement replaced by that candidate's own transform
+    (chi/theta_deg/s_f/s_h/yaw_deg/translation) instead of this function's scale/yaw/
+    offset heuristic. Requires plan_match='auto'; raises if the matched result isn't
+    status 'ok' or the candidate_id isn't among the returned candidates — never
+    silently falls back to the heuristic placement on a bad accept request."""
+    do_plan_match = plan_match not in (None, "off")
+    if do_plan_match and plan_match != "auto":
         raise ValueError(f"--plan-match: unknown value {plan_match!r} (expected 'off' or 'auto')")
+    if do_plan_match and dxf_path is None:
+        raise ValueError("--plan-match auto requires --dxf (plan-skeleton source); "
+                         "none was given — refusing a silent no-op")
+    if accept_plan_match is not None and not do_plan_match:
+        raise ValueError("--accept-plan-match requires --plan-match auto "
+                         "(nothing was matched to accept)")
     from scan2bim.metric_scale import (
         apply_axis_split_scale, bbox_height_warning, camera_height_scale,
         estimate_floor_level, fuse_scale_estimates, speed_warning,
@@ -936,6 +982,12 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     Rg = _rot_a_to_b(g, np.array([0.0, 1.0, 0.0]))
     Cg = centers @ Rg.T; Fg = fwd @ Rg.T; Ug = up @ Rg.T
     P = scan_pts.copy(); P[:, 1] *= -1.0; P[:, 2] *= -1.0; Pg = P @ Rg.T
+
+    Cg0 = Fg0 = Ug0 = None
+    if do_plan_match:                       # pre-chirality snapshot: the plan-match candidate's
+        Cg0, Fg0, Ug0 = Cg.copy(), Fg.copy(), Ug.copy()   # own `chi` supplies the handedness flip
+        # (plan_skeleton.TRANSFORM_FIELDS) — the matcher must see the RAW gravity-aligned walk,
+        # not this function's FXX-handedness-matched Cg (mutated in place a few lines below).
 
     n = len(Cg)
 
@@ -1059,6 +1111,30 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
         Ct[:, 1] += eye - float(np.median(Ct[:, 1]))
         return Ct, Fr, Ur, ci, yaw, anchor_mode
 
+    def _place_from_plan_match(Cg_raw, Fg_raw, Ug_raw, transform):
+        """Compose an ACCEPTED plan-match candidate's own transform (chi, theta_deg,
+        s_f, s_h, yaw_deg, translation — plan_skeleton.TRANSFORM_FIELDS) onto the RAW
+        (pre-chirality) gravity-aligned poses, in the SAME composition order
+        plan_skeleton.apply_candidate_transform uses (chi -> anisotropic scale -> yaw
+        -> translation), plus this function's own vertical s_v + eye-level convention
+        so the matcher's placement plugs into the same pose_json shape _finalize does."""
+        from scan2bim.forward_scale import anisotropic_scale_tensor, apply_forward_scale
+        chi_c = float(transform["chi"])
+        Cc, Fc, Uc = Cg_raw.copy(), Fg_raw.copy(), Ug_raw.copy()
+        Cc[:, 0] *= chi_c; Fc[:, 0] *= chi_c; Uc[:, 0] *= chi_c
+        A = anisotropic_scale_tensor(np.deg2rad(float(transform["theta_deg"])),
+                                     float(transform["s_f"]), float(transform["s_h"]))
+        poses_m, _ = apply_forward_scale({"c": Cc, "f": Fc, "u": Uc}, np.zeros((0, 3)), A, s_v)
+        Cm2, Fm2, Um2 = poses_m["c"], poses_m["f"], poses_m["u"]
+        R2 = _ry2(float(transform["yaw_deg"]))
+        Cr2 = np.column_stack([Cm2[:, [0, 2]] @ R2.T, Cm2[:, 1]])[:, [0, 2, 1]]
+        Fr2 = np.column_stack([Fm2[:, [0, 2]] @ R2.T, Fm2[:, 1]])[:, [0, 2, 1]]
+        Ur2 = np.column_stack([Um2[:, [0, 2]] @ R2.T, Um2[:, 1]])[:, [0, 2, 1]]
+        tx, ty = float(transform["translation"][0]), float(transform["translation"][1])
+        Ct2 = Cr2.copy(); Ct2[:, 0] += tx; Ct2[:, 2] += ty
+        Ct2[:, 1] += eye - float(np.median(Ct2[:, 1]))
+        return Ct2, Fr2, Ur2
+
     # --- isotropic axis-split placement (default; byte-identical when forward_scale is None) ---
     poses_s, _Pg = apply_axis_split_scale({"c": Cg, "f": Fg, "u": Ug}, Pg, s_h=s_h, s_v=s_v)
     Cm, Fm, Um = poses_s["c"], poses_s["f"], poses_s["u"]        # now metric (axis-split)
@@ -1110,6 +1186,56 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
     warnings = [w for w in (bbox_warn, speed_warning(path_m, duration)) if w]
     if warnings:
         info["warning"] = "; ".join(warnings)
+
+    # --- --plan-match auto: match + persist candidates; ONLY --accept-plan-match applies one ---
+    if do_plan_match:
+        match_result = _plan_match_auto(dxf_path, Cg0[:, [0, 2]])
+        pm = dict(match_result)
+        pm["accepted_candidate_id"] = None
+        pm["applied"] = False
+        if plan_match_out is not None:      # persist the CANDIDATE JSON before touching accept — an
+            Path(plan_match_out).parent.mkdir(parents=True, exist_ok=True)     # invalid --accept-plan-
+            Path(plan_match_out).write_text(json.dumps(pm, indent=2))          # match must still leave
+        if accept_plan_match is not None:   # the candidates on disk for inspection, not just an error
+            if match_result["status"] != "ok":
+                raise ValueError(
+                    f"--accept-plan-match {accept_plan_match!r}: plan_match status is "
+                    f"{match_result['status']!r} (hold_reason={match_result['hold_reason']!r}), "
+                    "not 'ok' — refusing to confirm an unresolved/rejected match")
+            cand = next((c for c in match_result["candidates"]
+                        if c.get("candidate_id") == str(accept_plan_match)), None)
+            if cand is None:
+                avail = [c.get("candidate_id") for c in match_result["candidates"]]
+                raise ValueError(
+                    f"--accept-plan-match {accept_plan_match!r}: no such candidate_id in the "
+                    f"matched result (available: {avail})")
+            Ctm, Frm, Urm = _place_from_plan_match(Cg0, Fg0, Ug0, cand["transform"])
+            cim, _, _ = _turn_split(Ctm[:, [0, 2]], fixed_ci=corner_ci)
+            pose_json = [{"c": [round(float(x), 3) for x in Ctm[i]],
+                          "f": [round(float(x), 4) for x in Frm[i]],
+                          "u": [round(float(x), 4) for x in Urm[i]]} for i in range(len(Ctm))]
+            path_m2 = float(np.linalg.norm(np.diff(Ctm[:, [0, 2]], axis=0), axis=1).sum())
+            tf2, tang2 = trajectory_turn_fraction(Ctm[:, [0, 2]])
+            tfm = cand["transform"]
+            info = {"mode": "rigid+plan_match", "s_v": round(s_v, 4),
+                    "s_h": round(float(tfm["s_h"]), 4), "yaw": round(float(tfm["yaw_deg"]), 1),
+                    "chi": int(tfm["chi"]), "turn_frac": round(float(tf2), 2),
+                    "turn_angle_deg": round(float(tang2), 1), "path_m": round(path_m2, 2),
+                    "anchor": f"plan_match_candidate:{cand['candidate_id']}",
+                    "cam_h": round(eye - float(lo[1]), 2), "corner_idx": int(cim),
+                    "corner_xz": [round(float(Ctm[cim, 0]), 2), round(float(Ctm[cim, 2]), 2)],
+                    "arclen_turn_frac": round(float(tf2), 3),
+                    "fallback_reason": None, "scale_anchors": scale_info}
+            warnings2 = [w for w in (bbox_warn, speed_warning(path_m2, duration)) if w]
+            if warnings2:
+                info["warning"] = "; ".join(warnings2)
+            pm["accepted_candidate_id"] = str(accept_plan_match)
+            pm["applied"] = True
+            if plan_match_out is not None:                          # re-persist with applied=True
+                Path(plan_match_out).write_text(json.dumps(pm, indent=2))
+        if plan_match_out is not None:
+            pm["persisted_to"] = str(plan_match_out)
+        info["plan_match"] = pm
     return pose_json, info
 
 
@@ -1311,10 +1437,17 @@ def main():
                          "기존 등방 diag(s_h,s_v,s_h)와 완전 byte-동일(무회귀). s_h=복도폭(측방), s_f=진행방향")
     ap.add_argument("--plan-match", default="off", choices=["off", "auto"],
                     help="place_rigid 전용(--auto-rigid): 평면도 스켈레톤 매칭(scan2bim.coarse_match)으로 "
-                         "배치 후보를 산출·진단에 노출(reginfo). 'off'(기본)=기존 place_rigid 출력과 완전 "
-                         "byte-동일(무회귀) — 이 사이클엔 후보를 HTML/reginfo에 확정 표기하지 않음(설계 "
-                         "불변식: 명시적 수락 플래그 전까지 후보 JSON만). 'auto'=매칭 시도(현재 배선 미완료 "
-                         "— 명확히 실패, 조용한 성공 반환 없음)")
+                         "배치 후보를 산출해 <out>.plan_match.json에 저장하고 reginfo['plan_match']에 "
+                         "진단(schema/status/candidates/hold_reason/margin/gates) 노출. 'off'(기본)=기존 "
+                         "place_rigid 출력과 완전 byte-동일(무회귀). 'auto'는 --dxf 필수(없으면 에러) — "
+                         "그 자체로는 배치를 바꾸지 않는다(설계 불변식: --accept-plan-match 없이는 후보 "
+                         "JSON+reginfo 진단만, HTML/배치에 확정 표기 없음)")
+    ap.add_argument("--accept-plan-match", default=None,
+                    help="--plan-match auto가 낸 후보 중 candidate_id(문자열 rank, 예 '0')를 명시적으로 "
+                         "수락 — 그때만 배치가 그 후보의 transform(chi/theta_deg/s_f/s_h/yaw_deg/"
+                         "translation)으로 대체된다(place_rigid의 axis-split 휴리스틱 대신). 매칭 결과가 "
+                         "status=='ok'가 아니거나 candidate_id가 없으면 에러(휴리스틱으로 조용히 폴백하지 "
+                         "않음). --plan-match auto와 함께 줘야 한다")
     ap.add_argument("--desmear-turn", action="store_true",
                     help="place_rigid 배치 후처리(--auto-rigid 전용): 단안 VO가 물리 회전 순간이 "
                          "아니라 그 뒤로 흩뿌린(smear) 방향전환을, step 길이 보존한 채 헤딩만 "
@@ -1379,12 +1512,14 @@ def main():
         fscale = None
         if args.forward_scale is not None:
             fscale = args.forward_scale if args.forward_scale == "auto" else float(args.forward_scale)
+        plan_match_out = out.with_name(out.stem + ".plan_match.json") if args.plan_match == "auto" else None
         pose_json, reginfo = place_rigid(poses, scan_pts, ceil, bbox, fxx, anchor=anchor, duration=args.duration,
                                          wall_points=wall_points, corridor_width_hint=args.corridor_width_hint,
                                          horizontal_scale_override=args.horizontal_scale_override,
                                          dxf_widths=dxf_widths, turn_time_s=args.turn_time_s,
                                          forward_scale=fscale, dxf_path=args.dxf,
-                                         plan_match=args.plan_match)
+                                         plan_match=args.plan_match, plan_match_out=plan_match_out,
+                                         accept_plan_match=args.accept_plan_match)
         print("  rigid:", reginfo, "anchor:", anchor)
         if args.desmear_turn:      # post-process only: place_rigid output is not touched above
             from scan2bim.turn_desmear import desmear_turn
