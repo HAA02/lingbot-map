@@ -862,7 +862,7 @@ def _forward_scale_auto(dxf_path, fxx_file, Ct_iso, legA_arc_raw, run_dir, s_h):
 def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, duration=None,
                 wall_points=None, corridor_width_hint=None, horizontal_scale_override=None,
                 dxf_widths=None, s_h_band=(1.8, 2.8), turn_time_s=None,
-                forward_scale=None, dxf_path=None):
+                forward_scale=None, dxf_path=None, plan_match=None):
     """RIGID placement: axis-split METRIC scale + ONE yaw rotation + ONE translation
     — no ICP, no CAD-polyline snap, no per-pose warping. The recon trajectory keeps
     its OWN shape; it is only rotated and shifted into the model frame.
@@ -907,7 +907,22 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
                band; pinning leg-A's X keeps it inside. NOT a verified registration.
     Height = eye level (model floor + 1.5 m), keeping the metric vertical bob.
     Returns (pose_json, info). corridor_width_hint / horizontal_scale_override: see
-    _resolve_horizontal_scale (same semantics as place_registered/place_pipe_auto)."""
+    _resolve_horizontal_scale (same semantics as place_registered/place_pipe_auto).
+
+    plan_match: None/'off' (default) leaves every line below untouched -> byte-identical
+    output (P1-Wire-a no-regression contract, D4). 'auto' fails fast, BEFORE any of the
+    scale/yaw/offset work below runs, with an explicit error — plan-skeleton candidate
+    generation (scan2bim.coarse_match) and its JSON persistence are wired in a later
+    cycle; this flag never silently no-ops into a confirmed placement (design invariant:
+    no HTML/reginfo confirmation without an explicit accept flag)."""
+    if plan_match not in (None, "off"):
+        if plan_match == "auto":
+            from scan2bim.coarse_match import coarse_match  # lazy: fail loudly if matcher import breaks
+            raise NotImplementedError(
+                "--plan-match auto: coarse_match wiring (candidate JSON persistence, "
+                "reginfo diagnostics) is not implemented yet in this cycle — "
+                "see docs/TEAM_coplay-planmatch-01.md")
+        raise ValueError(f"--plan-match: unknown value {plan_match!r} (expected 'off' or 'auto')")
     from scan2bim.metric_scale import (
         apply_axis_split_scale, bbox_height_warning, camera_height_scale,
         estimate_floor_level, fuse_scale_estimates, speed_warning,
@@ -1294,6 +1309,12 @@ def main():
                     help="place_rigid 전용(--auto-rigid): 진행방향(heading) 이방성 스케일 s_f 적용. "
                          "'auto'=DXF 복도끝(L_end)/leg-A recon arclen로 산출, 또는 직접 수치. 없으면 "
                          "기존 등방 diag(s_h,s_v,s_h)와 완전 byte-동일(무회귀). s_h=복도폭(측방), s_f=진행방향")
+    ap.add_argument("--plan-match", default="off", choices=["off", "auto"],
+                    help="place_rigid 전용(--auto-rigid): 평면도 스켈레톤 매칭(scan2bim.coarse_match)으로 "
+                         "배치 후보를 산출·진단에 노출(reginfo). 'off'(기본)=기존 place_rigid 출력과 완전 "
+                         "byte-동일(무회귀) — 이 사이클엔 후보를 HTML/reginfo에 확정 표기하지 않음(설계 "
+                         "불변식: 명시적 수락 플래그 전까지 후보 JSON만). 'auto'=매칭 시도(현재 배선 미완료 "
+                         "— 명확히 실패, 조용한 성공 반환 없음)")
     ap.add_argument("--desmear-turn", action="store_true",
                     help="place_rigid 배치 후처리(--auto-rigid 전용): 단안 VO가 물리 회전 순간이 "
                          "아니라 그 뒤로 흩뿌린(smear) 방향전환을, step 길이 보존한 채 헤딩만 "
@@ -1362,7 +1383,8 @@ def main():
                                          wall_points=wall_points, corridor_width_hint=args.corridor_width_hint,
                                          horizontal_scale_override=args.horizontal_scale_override,
                                          dxf_widths=dxf_widths, turn_time_s=args.turn_time_s,
-                                         forward_scale=fscale, dxf_path=args.dxf)
+                                         forward_scale=fscale, dxf_path=args.dxf,
+                                         plan_match=args.plan_match)
         print("  rigid:", reginfo, "anchor:", anchor)
         if args.desmear_turn:      # post-process only: place_rigid output is not touched above
             from scan2bim.turn_desmear import desmear_turn
