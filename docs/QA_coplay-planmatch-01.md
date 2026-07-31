@@ -1,0 +1,226 @@
+# QA 종결 보고 — coplay-planmatch-01 (사이클 16, P3-QA-final)
+
+작업 루트: `/run/media/iaan/1TB-WD/Github/lingbot-map/.claude/worktrees/loop-coplay-planmatch-01`
+브랜치: `loop/coplay-planmatch-01`, 측정 시작 HEAD=`500741e`
+
+## ⚠️ 측정 도중 발견한 충돌 (진행중 상태 경고)
+
+`git status --short` (측정 도중 실측):
+```
+ M scan2bim/coarse_match.py
+ M tests/test_coarse_match.py
+```
+**dev-core가 이 QA 측정과 동시에 `scan2bim/coarse_match.py`·`tests/test_coarse_match.py`를 실시간 편집 중**(씨앗 개선, 확정오답 잔여 1건). 두 파일은 QA 소유가 아니므로 건드리지 않았고 working tree도 stash 등으로 건드리지 않았다(dev 작업 유실 위험 회피).
+
+**대응**: D1(pytest)·처음 실행한 D2(robust gate) 측정은 이 WIP 포함 상태를 반영한다(측정 시각 명시). **적대검증(P2 공격, 반복기하 latch)은 `git show HEAD:scan2bim/{coarse_match,plan_skeleton}.py`로 커밋 500741e 버전을 별도 프로세스에 얼려(import 시점에 `sys.modules` 치환) dev-core의 WIP과 완전히 분리해 실행**했다(아래 적대검증 절 — "HEAD-frozen" 표기). D4는 애초에 `coarse_match.py`를 import하지 않는 경로라 WIP과 무관(코드로 확인).
+
+---
+
+## D1~D7 집계표 (최종)
+
+| # | 판정식 | 결과 | 근거 |
+|---|---|---|---|
+| D1 | `pytest tests/ -q` | **PASS** | `355 passed in 29.67s`, exit 0 (측정 시각 기준 WIP 포함 상태) |
+| D2(기본) | `check_plan_match_robust.py --upload upload_1781521406685 --n-perturb 20 --seed 7` (팀 DoD 문구 그대로) | **FAIL(미달)** | exit 1. ①성공률 15.0%(<90%) ②outlier recall 38.8%(<80%) ③PASS |
+| D2(sweep) | `--sweep` (열화곡선, 참고측정) | **FAIL(전 구간 미달)** | 7개 T지점 전부 게이트 `FFP` — recall이 5~50% 전 구간에서 80%를 단 한 번도 못 넘음(최댓값 60.0%@T=40%, 그 지점 성공률 8.3%로 붕괴). **재현 편차 발견**(아래 참조) |
+| D3 | `check_coplay_geometry.py <배포 html>` 기존 플래그 + `--post-turn-heading-span-min 120` | **FLAG SET에 따라 갈림 — 아래 참조** | 최신(desmear) 플래그 전체 세트로는 FAIL(turn_z_min), rigid-01 기준 플래그로는 PASS |
+| D4 | `--plan-match` off byte-identical | **PASS(QA 독립 재현)** | 함수레벨 3-way + 전체 CLI 2-way 모두 byte-identical, 두 방법 모두 QA 자체 실행 |
+| D5 | 불변식② behavioral test | **PASS** | pytest 38/38(`test_build_coplay_planmatch.py`) + QA 독립 코드경로 확인(아래) |
+| D6 | s_f 2소스 교차검증 | **불가로 종결** | 실업로드 `door_times()==[]` QA 독립 재현 완료 — 원리적으로 문통과 타이밍 소스 없음 |
+| D7 | fixtures-untouched + 소유 파일만 변경 | **PASS** | `git diff --stat db93f40 500741e` — 팀 소유 파일 11개만 변경, `realtime/_uploads`·`lingbot_map` diff 0 |
+
+**종합**: D1 PASS / **D2 FAIL** / D3 조건부(플래그 세트 의존) / D4 PASS / D5 PASS / D6 불가(단일소스로 종결) / D7 PASS.
+**D2가 이 팀의 핵심 목표(강건 정합)의 기계 판정 그 자체이므로, D2 FAIL은 이 사이클 전체를 "미완료"로 판정하는 근거다.**
+
+---
+
+## D2 상세
+
+### 기본 게이트 (팀 DoD 문구 그대로)
+```
+$ .venv/bin/python tools/check_plan_match_robust.py --upload upload_1781521406685 --n-perturb 20 --seed 7
+EXIT=1
+[structured] ① 성공률: 3/20 = 15.0% (gate >= 90%) [ok_outside_d2(위험: 확정오답)=0 hold=12 reject=5 error=0]
+[structured] ② outlier recall: 31/80 (scoreable) = 38.8% (radius=5.46m, gate >= 80%)
+[structured] ③ 모호 시 HOLD: PASS (자동확정 위반 0건)
+[structured] 게이트 판정: FAIL (①FAIL ②FAIL ③PASS)
+```
+`--upload`는 스크립트 자체 docstring상 "accepted but UNUSED"(합성 STAIR 하네스만 사용, 실업로드 자체를 섭동시키지 않음 — 설계·실측 일치).
+
+**팀 DoD에 문자 그대로 적힌 명령은 이번 사이클도 실패(exit 1)한다.** 사이클 지시문의 "게이트 90% 달성" 서술은 이 기본 명령이 아니라 `--sweep`의 특정 지점(T=10%) **평균 성공률**만을 가리킨다.
+
+### 열화곡선(`--sweep`, ratios=5/10/15/20/30/40/50%, seeds=7/42/123, n=20/point)
+```
+   목표T     실측T평균 |    성공률평균(범위) |   recall평균(범위)         | 게이트①②③
+    5%     13.5% |  93.3%(85-100%) |  30.1%(15-52%)  | FFP
+   10%     18.5% |  90.0%(85-95%)  |  30.9%(17-51%)  | FFP
+   15%     21.6% |  88.3%(80-95%)  |  37.4%(24-52%)  | FFP
+   20%     25.5% |  86.7%(85-90%)  |  48.6%(24-71%)  | FFP
+   30%     33.8% |  36.7%(20-50%)  |  22.8%(0-38%)   | FFP
+   40%     46.2% |   8.3%(5-10%)   |  60.0%(38-100%) | FFP
+   50%     55.9% |   5.0%(5-5%)    |  24.1%(0-50%)   | FFP
+```
+(첫 실행 EXIT=0, 실행시간 75초)
+
+**핵심 발견 1 — recall은 전 구간에서 게이트 미달**: `게이트①②③` 열이 7개 지점 전부 `FFP`. ②outlier recall은 5%~50% 전 구간에서 80%를 단 한 번도 넘지 못했다(최댓값 60.0%@T=40%, 그 지점은 성공률이 8.3%로 붕괴). "게이트 90% 달성"은 T=10%에서 ①의 **평균값**만을 가리키며, D2가 요구하는 ①∧②∧③ 종합 게이트가 어느 지점에서도 통과했다는 뜻이 아니다. P2-Robust 수정 전(commit `f84ab5a`, 5%→73.3%/12.3%recall, 10%→68.3%/24.0%recall)과 비교해 ①은 크게 개선됐으나 **②는 개선 전후 모두 구조적으로 80% 미달**.
+
+**핵심 발견 2 — sweep 결과 자체가 완전히 재현되지 않는다 (QA 소유 도구의 신규 결함, 실측)**: 동일한 `--sweep` 명령을 반복 실행하면 케이스 경계에 걸린 소수 항목의 판정이 실행마다 바뀐다.
+```
+1회차(원본, 세션 시작 시): T=20% seed=42 -> 성공률=85.0%(17/20) ok_outside_d2=1 recall=71.0%
+2회차(재실행, 동일 명령)  : T=20% seed=42 -> 성공률=90.0%(18/20) ok_outside_d2=0 recall=60.9%
+3회차(재실행, 동일 명령)  : T=20% seed=42 -> 성공률=90.0%(18/20) ok_outside_d2=0 recall=60.9%
+```
+직접 라이브러리 호출로 분리 검증: `generate_perturbation_suite_at_total_ratio`(섭동 생성 자체)는 완전 결정적(동일 인자·동일 호출 순서·이전 호출 이력 무관 — 해시 100% 일치, 확인함). 차이는 `_evaluate_suite`(매처 실행+채점) 쪽에서 발생. `PYTHONHASHSEED=0`, `OMP/MKL/OPENBLAS_NUM_THREADS=1` 두 가지 통상 원인을 개별 테스트했으나 재현되지 않음(둘 다 90.0%/0 결과만 나옴) — **근본 원인 미확정**(경계에 걸린 케이스의 실수 연산 순서 의존 추정, 추가 조사 필요). **이 문제는 QA 소유 파일(`tools/check_plan_match_robust.py`) 자체의 결함**이며, 이번 사이클엔 시간상 수정하지 않고 사실만 보고한다 — "시드 고정"을 전제로 한 이 도구의 재현성 주장에 예외가 있다는 뜻. **D2 최종 판정에는 영향 없음**: recall이 80%를 못 넘는 것은 재현되는 모든 실행에서 공통(60.9%~71.0% 등 어느 쪽이든 80% 미달)이고, 성공률도 매 실행 85~90% 경계라 ①도 안정적으로 90%를 넘지 못한다.
+
+→ **D2 최종 판정: FAIL(미달)**. 기본 게이트도, 열화곡선의 어떤 지점도 종합 게이트를 통과하지 못한다. 임계 완화 없음.
+
+---
+
+## D3 상세 (실측, 배포 산출물 `realtime/_uploads/upload_1781521406685.coplay.html` 대상)
+
+"기존 플래그"의 정확한 정의가 팀 문서에 문자 그대로 박혀 있지 않아, git 이력에서 확인 가능한 두 세트를 모두 실행했다.
+
+**세트 1 — coplay-desmear-01 D2 플래그(가장 최근 기록된 전체 세트) + 이번 사이클 지시 플래그**:
+```
+$ check_coplay_geometry.py <html> --turn-z-max 4 --turn-z-min 2 --end-x -8,4 --end-z-max 2.5 --pre-turn-x-range 2,6 --post-turn-heading-span-min 120
+turn_point x=3.37 z=0.60 (fraction=0.83 angle=47.2deg) turn_z_max=4.0 -> OK
+turn_z_min z=0.60 turn_z_min=2.0 -> FAIL
+endpoint x=1.72 z=1.74 -> OK
+pre_turn_x drift=1.56 band=[2.0,6.0] -> OK
+post_turn_heading_span=923.8 deg min=120.0 -> OK
+verdict=FAIL, EXIT=1
+```
+**세트 2 — coplay-rigid-01 D2 플래그(더 이른 기록) + 이번 사이클 지시 플래그**:
+```
+$ check_coplay_geometry.py <html> --turn-z-max 4 --end-x -8,4 --end-z-max 2.5 --post-turn-heading-span-min 120
+verdict=PASS, EXIT=0
+```
+차이는 `turn_z_min 2`(및 `pre_turn_x_range`) 유무 하나 — desmear 세트를 쓰면 FAIL(turn_point z=0.60 < 2.0), rigid 세트를 쓰면 PASS. `turn_z_min=2`는 desmear 사이클 당시의 특정 geometry(다른 회전점)를 겨냥해 QA가 붙인 값으로 보이며, fwdscale 이후 회전점이 t=19.5s(라운지 입구, z=0.60 — desmear 시절보다 얕은 지점)로 재정의됐다는 점(팀 문서 기록)과 부합한다. **QA가 자체 판단으로 어느 세트가 "정답"인지 결정하지 않고 양쪽 다 실측·보고**한다 — turn_z_min을 이번 배포 형상에 재적용할지는 PM 판단 필요.
+
+post_turn_heading_span=923.8도(2바퀴 이상 회전)는 fwdscale팀의 "라운지는 둘러보기, desmear 미적용, 자기형상 보존" 설계 결정과 일치(라운지에서 실제로 여러 번 돈 궤적을 그대로 보존).
+
+---
+
+## D4 상세 (QA 독립 재현 — dev-wire 주장 그대로 믿지 않음)
+
+### 방법 1: 함수레벨 3-way 해시 비교 (HEAD-unspecified / HEAD-off / db93f40-baseline)
+실 fixture: `realtime/_uploads/upload_1781521406685.lbp2` + `models/Gasan_7F/*.dtdx`. 사전 확인: `place_rigid`가 의존하는 `scan2bim/{metric_scale,forward_scale,pipe_path,dxf_plan}.py`는 db93f40↔HEAD 간 diff 없음(4개 파일 전부 무출력).
+```
+hash HEAD(unspecified) pose_json: bc65319ea09532df2161bc8a3f3ee425b91c4c039242917d052153e27d664b2a
+hash HEAD(off)         pose_json: (동일)
+hash db93f40(baseline) pose_json: (동일)
+hash HEAD(unspecified) info     : cd333b731c501eefc41ab24f2a835c8c1660c928aa7dc9fbdb2ae63a61e19957
+hash HEAD(off)/db93f40 info     : (동일)
+```
+(스크립트 `/tmp/qa_d4/d4_hash_compare.py`, kwargs: `horizontal_scale_override=2.30, turn_time_s=19.5, duration=35.3`)
+
+### 방법 2: 전체 CLI 엔드투엔드 (QA가 직접 기동한 실서버 경유, `--upload` 실사용)
+```
+cmp qa_rebuild_unspecified.html qa_rebuild_off.html  → 무출력(byte-identical)
+sha256sum 둘 다: b7af036102f8e20d531871115d077b5a675dc72f017cd1d6b25f20cf62806c37
+(4.1MB, tris=84,092, poses=144, 둘 다 동일)
+```
+**D4 판정: PASS.** dev-wire가 주장한 해시(`8ce3c6cc...64b4`)는 QA의 해시 방식(HTML/필드 sha256)과 달라 문자 그대로 재현되진 않았으나, 같은 성질(byte-identical)을 QA가 독립적으로 두 가지 방법으로 재확인했다. `scan2bim/coarse_match.py` WIP과 무관(off 경로는 `_plan_match_auto`를 호출하지 않음 — `do_plan_match=False`, 코드 확인).
+
+---
+
+## D5 / 불변식② 상세
+
+pytest `tests/test_build_coplay_planmatch.py` 38/38 통과(`TestAutoAloneConfirmsNothing`, `TestExplicitAcceptIsTheOnlyWayIn`, `TestHoldCannotBeAccepted`, `TestCliDefaultsCannotAutoConfirm` 등). QA 독립 코드 확인: `tools/build_coplay.py`의 `_place_from_plan_match(...)` 호출은 **오직** `if accept_plan_match is not None:` 블록 내부에서만 일어난다(구조적으로 `--plan-match auto` 단독 실행 시 이 함수 자체가 호출되지 않음 — diff로 직접 읽어 확인). 아래 적대검증(chirality) 항목에서 추가 확인.
+
+---
+
+## D6 판정 — 종결
+
+`reports/coplay/rgb_doors/upload_1781521406685.door_rgb.json`을 QA가 직접 로드해 재현(커밋 `5a26a78` 서술을 그대로 믿지 않고 산출물 자체를 확인):
+```python
+door_times(d) == []          # scan2bim.door_detect_rgb.door_times, min_confidence 기본값
+len(d['doors']) == 0         # 확정된 문 0건
+len(d['candidates']) == 42   # 검토된 후보 전체
+max(c['confidence'] for c in d['candidates']) == 0.0   # 전원 신뢰도 0
+```
+가장 근접한 두 후보(t=11.80s, t=17.25s)의 거부 사유: `reject=['no_lintel:no_member_spanning_the_pair', 'below_min_confidence']` — 폭은 각각 recon 1.308/1.109 유닛(× s_h≈1.97 ≈ 2.58m/2.18m, commit 서술과 일치)으로 문 규격이 아니라 복도 폭 스케일이고, 상인방(스팬부재)이 관측되지 않아 기각. 점군 고도분포(82%가 카메라보다 위 등)는 QA가 이번 사이클엔 재도출하지 않음(원 커밋 주장만 인용, 미검증 — 다만 D6 판정에 필수적이지 않음: `door_times()==[]` 자체가 이미 충분한 근거).
+
+**→ 판정: "미실행"이 아니라 "이 데이터로는 불가 — s_f는 단일소스(DXF 복도끝)로 남는다."** 문통과 타이밍은 이 업로드에 원리적으로 존재하지 않는 증거(개방형 오피스, 실제 문 없음, RGB 검출기 확정 0건)이며, 재시도로 얻어질 수 있는 종류의 실패가 아니다.
+
+**대안 교차검증 소스 검토**: 코너(t=19.5s) 통과 타이밍은 이미 s_f 산출의 1차 소스(DXF L_end / leg-A recon arclen)의 분자·분모 구성요소 그 자체이므로 이를 재사용해도 독립 소스가 아니다(순환논증). RGB 검출기가 확인한 바로는 복도 구간에 문 외의 식별 가능한 고정 랜드마크(예: 별도 개구부·기둥·바닥재질 경계)도 관측되지 않았다(개방형 오피스, 천장지향 촬영으로 벽 자체가 프레임에 거의 담기지 않음). **결론: 이 업로드에서 두 번째 독립 기하 앵커는 QA가 검토한 범위 내에서 발견되지 않았다** — s_f 단일소스 상태를 이번 사이클에 "불가"로 명시 종결하는 것이 맞다.
+
+---
+
+## 적대검증 (실측 — HEAD 500741e 고정 버전, dev-core WIP과 분리)
+
+방법: `git show HEAD:scan2bim/{coarse_match,plan_skeleton}.py`를 별도 파일로 추출, `sys.modules['scan2bim.coarse_match'/'scan2bim.plan_skeleton']`에 직접 등록해 로드(dev-core가 편집 중인 working-tree 버전을 우회). `scan2bim.forward_scale`/`scan2bim.dxf_plan`은 db93f40 이후 diff 없음을 먼저 확인했으므로 실제 패키지에서 그대로 로드.
+
+### 1) "말도 안 되는 스케일 통과" 공격 — over-run 비용 제거 직접 공격
+`DEFAULT_SCALE_BAND = (0.05, 50.0)`(m/recon-unit, 1000배 폭)를 확인 — 매처 자체의 절대 스케일 방어선은 사실상 **비율 밴드(`DEFAULT_ANISO_BAND = (0.2, 5.0)`)** 하나뿐이다. 이를 겨냥해 STAIR 하네스에서 leg 절단률을 QA D2 밴드(10~30%)보다 훨씬 크게 밀어붙였다:
+
+```
+문 증거 없음(실업로드와 동일 조건):
+  leg B 74.1% 제거 -> hold(ambiguous_margin)
+  leg B 87.8~99.8% 제거 -> reject(inlier_ratio_below_min)   [전부 REJECT, ok 없음]
+문 증거 있음(최선 조건):
+  leg B 74.1% 제거 -> ok, s_f/s_h 오차 0.0% (2번째 코너 seed로 정확 복구)
+  leg B 87.8~99.8% 제거 -> reject(inlier_ratio_below_min)   [전부 REJECT]
+
+P2 커밋이 인용한 정확한 버그 사례(벽 세그먼트 1개 제거 = leg 시작 0.91m 삭제) 재현:
+  문 증거 없음 -> hold(ambiguous_margin)   [확정오답 아님]
+  문 증거 있음 -> ok, s_h 오차 0.00%, offset 0.0000m  [정확 복구]
+```
+**결론: 이번에 시도한 단일-leg 극단 절단 공격으로는 "말도 안 되는 스케일"이 `ok`로 통과하는 사례를 만들지 못했다** — 문 증거가 없을 때(실업로드 조건)는 극단적 절단에서 항상 HOLD 또는 REJECT, 문 증거가 있을 때는 오히려 second-corner-seed 메커니즘이 정확히 복구한다. 다만 **D2 sweep 자체는 T=15~20%에서 `ok_outside_d2`(확정오답)가 실제로 발생한다**(각 1건, T=20%는 위 재현성 문제로 실행마다 0~1건) — 이는 STRUCTURED 다중 벽 동시 섭동(제거+이동+잡음이 한 케이스에 동시 발생) 조건이며, 이번 시간 내 단일 벡터 공격으로는 그 정확한 발생 경로를 못 밟았다. **DEFAULT_SCALE_BAND(0.05, 50.0)이 사실상 무력한 절대 게이트라는 사실 자체는 실측 확인됐고, 이는 실질적 위험(다른 조건에서 극단적 스케일이 통과할 여지)으로 남아있다** — QA는 이를 코드 사실로 보고하되, 이 문서의 시간 범위 내에서 그 정확한 재현 케이스를 만들지는 못했음을 명시한다.
+
+### 2) 엉뚱한 복도(반복기하) latch 공격
+QA가 dev 픽스처와 무관하게 직접 구성: 동일한 2-leg L 복도 2개(50m 이격, 문 전혀 없음 — 실업로드와 동일 조건)를 하나의 skeleton에 넣고, 그중 하나(코리더 A)를 실제로 걸음:
+```
+status: hold, hold_reason: ambiguous_margin, margin: 0.0
+후보 8개, translation-X 버킷: [-7, 9, 12, 43, 59, 62] -- 코리더 A(~0)와 B(~50) 양쪽에 후보가 걸쳐있음
+```
+**결론: 엉뚱한 복도로 확정되는 경로 없음** — 반복 기하 + 문 증거 부재 조건에서 정확히 HOLD, 두 복도 모두 후보로만 노출되고 자동확정 없음(설계대로).
+
+### 3) chirality 뒤집기 누출 경로
+코드 구조 확인(`tools/build_coplay.py`): 미러(chi 반전) 변환을 실제로 pose_json에 적용하는 `_place_from_plan_match(...)`는 **오직** `if accept_plan_match is not None:` 분기 안에서만 호출된다 — `--plan-match auto` 단독 실행 경로에는 이 함수 호출 자체가 존재하지 않는다(diff로 직접 확인, D5 절 참조). pytest `TestAutoAloneConfirmsNothing`(6건, 최상위 후보가 완벽히 맞는 매치인 최악의 유혹적 케이스 포함) 전부 통과 — `plan_match='auto'`만으로는 pose_json이 `off`와 byte-identical임을 검증. **QA는 이번 사이클에 chi가 뒤집힌 것이 최상위 후보인 별도 시나리오를 직접 구성한 신규 테스트는 만들지 못했음**(시간 제약) — 위 코드 구조 증명 + 기존 pytest로 결론 대체.
+
+### 4) P2 4건 수정 관대화 여부 종합
+- **over-run 비용 제거**: 위 1)에서 직접 공격 — 시도한 범위에서 확정오답 유발 못 찾음(단, sweep 자체에선 드물게 발생 — 근본 벡터 미특정).
+- **median→mean(RESID_AGG)**: 별도 미공격(시간 제약) — pytest만 근거.
+- **residual 정규화**: 별도 미공격(시간 제약) — pytest만 근거.
+- **문 xy_pass**: 별도 미공격(시간 제약) — pytest만 근거.
+
+---
+
+## 서버
+QA가 D4용으로 직접 기동한 `realtime/server.py`(PID 632744, `127.0.0.1:8767`)는 **측정 종료 후 정리(kill) 완료**.
+
+---
+
+## 재현 명령 모음
+```
+cd /run/media/iaan/1TB-WD/Github/lingbot-map/.claude/worktrees/loop-coplay-planmatch-01
+PY=/run/media/iaan/1TB-WD/Github/lingbot-map/.venv/bin/python
+
+# D1
+$PY -m pytest tests/ -q
+
+# D2 기본게이트 / 열화곡선
+$PY tools/check_plan_match_robust.py --upload upload_1781521406685 --n-perturb 20 --seed 7
+$PY tools/check_plan_match_robust.py --sweep
+
+# D3 (배포 html 대상, 두 플래그 세트)
+$PY tools/check_coplay_geometry.py realtime/_uploads/upload_1781521406685.coplay.html \
+  --turn-z-max 4 --turn-z-min 2 --end-x -8,4 --end-z-max 2.5 --pre-turn-x-range 2,6 \
+  --post-turn-heading-span-min 120
+$PY tools/check_coplay_geometry.py realtime/_uploads/upload_1781521406685.coplay.html \
+  --turn-z-max 4 --end-x -8,4 --end-z-max 2.5 --post-turn-heading-span-min 120
+
+# D4 (스크립트 /tmp/qa_d4/d4_hash_compare.py, 전체 CLI는 서버 기동 후 tools/build_coplay.py 직접 호출)
+
+# D6 (재현)
+$PY -c "
+import json,sys; sys.path.insert(0,'.')
+from scan2bim.door_detect_rgb import door_times
+d = json.load(open('reports/coplay/rgb_doors/upload_1781521406685.door_rgb.json'))
+print(door_times(d), len(d['candidates']))"
+
+# 적대검증 (스크립트, HEAD-frozen 로더 /tmp/qa_adv/setup_head.py 선행 필요)
+#   /tmp/qa_adv/probe_a_overrun_attack.py   (over-run/스케일 공격)
+#   /tmp/qa_adv/probe_b_repeated_corridor.py (반복기하 latch)
+```
