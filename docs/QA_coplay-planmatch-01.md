@@ -224,3 +224,99 @@ print(door_times(d), len(d['candidates']))"
 #   /tmp/qa_adv/probe_a_overrun_attack.py   (over-run/스케일 공격)
 #   /tmp/qa_adv/probe_b_repeated_corridor.py (반복기하 latch)
 ```
+
+---
+
+## 사이클 19 — 게이트② 설계 결함 보정: 정밀도 지표 편입
+
+작업 루트: 동일. 시작 HEAD=`8d7fcbf`(dev-core "span 변경 스캔" 커밋, recall 38.8%→91.2%, 정밀도 결여를 자진신고).
+수정 파일: `tools/check_plan_match_robust.py`만(패치 스크립트로 정확히 16개 앵커 지점 편집, `git diff --stat` 확인 예정). `scan2bim/**`·`tools/build_coplay.py`는 읽기만.
+
+### 문제 (dev-core 자진신고, 커밋 8d7fcbf 원문)
+> FLOOD 상한: 84개 span 을 전부 깃발 꽂으면 recall 100%. ②는 커버리지로 포화되므로 recall 수치만으로는 검출과 범람을 구별할 수 없다. 구별하는 숫자는 정밀도다 — 정상 도면 오경보 0/28 span, 발화는 24~25/84.
+
+게이트②(outlier recall≥80%)에는 정밀도 짝이 없어, "모든 span에 깃발을 꽂는" 미래의 회귀가 recall만으로는 항상 PASS로 통과한다. 이번 사이클은 이 설계 결함을 막는 것이 목적이다.
+
+### 설계 — 새 게이트 항목 ④⑤ (QA 소유, 근거 명시)
+
+| 항목 | 정의 | 임계 | 근거 |
+|---|---|---|---|
+| ④ 무섭동(clean) 도면 span 오경보율 | 무섭동 STAIR 도면(clean baseline)에서 발화한 span 수 / 전체 span 수 | **0% (엄격)** | 무섭동 도면은 정의상 실제 변경이 전무하므로 발화는 전부 오경보. R1/R2 판정식(`SPAN_CROSS_MARGIN=0.20m`, `SPAN_WIDTH_TOL=0.30m`)이 이미 기하 노이즈를 흡수하도록 설계됐으므로, 이 조건에서 0이 아니면 그 자체가 톨러런스 결함. 현재 실측 0(아래)과 일치 — **이 목표에 맞춰 임계를 역산한 게 아니라, 물리적으로 "변경이 없으면 발화도 없어야 한다"는 요구를 먼저 세우고 그것이 우연히 현재값과 같음을 확인한 것**(FLOOD 자가진단이 이 항목을 즉시 100%로 깨는 것으로 증명 — 아래). |
+| ⑤ span 정밀도(precision) vs. prevalence | `compute_span_precision`: 변환이 확정된(item①) 케이스들의 top candidate에 대해 span 단위 TP/FP/FN/TN 집계. `precision=TP/(TP+FP)`, `prevalence=(TP+FN)/n`("실제 변경분이 차지하는 span 비율", **매 실행마다 ground truth로 새로 계산**, 하드코딩 없음) | **precision ≥ 1.5 × prevalence** | "모든 span에 깃발을 꽂는" flood 구현은 TP=전체 양성, FP=전체 음성이 되어 precision이 수학적으로 **정확히 prevalence와 같아진다**(그 이상 절대 못 감) — 이건 정의상 항상 참인 명제이지, 관측치에 맞춘 임계가 아니다. 1.0배(경계값)가 아니라 1.5배로 여유를 둔 이유는 표본이 작을 때(3케이스×spans) 경계선 근처의 우연한 통과를 막기 위함. **24~25/84라는 관측 수치는 임계에 전혀 쓰이지 않았다** — 매 실행 자신의 prevalence를 기준으로 삼는 상대 검정이라 미래의 다른 섭동 강도·다른 업로드에도 적응적으로 작동한다. |
+
+두 항목 모두 `gate_ok = gate1 AND gate2 AND gate3 AND gate4 AND gate5`로 편입되며, `_print_single_gate_report`가 ④⑤를 별도 줄로 분해 출력하므로 FAIL 시 어느 항목 때문인지 항상 특정 가능하다.
+
+### FLOOD 회귀 테스트 (`selftest_flood_detection`, `--selftest-flood`) — 이 과제의 핵심 증거
+
+`scan2bim.coarse_match._span_outliers`를 "모든 span을 무조건 발화"하는 가짜 함수로 **인메모리 monkeypatch**(디스크 미수정, `finally`에서 원복 — `scan2bim/**` 읽기전용 제약 준수)한 뒤 같은 D2 하네스로 재측정.
+
+```
+$ .venv/bin/python tools/check_plan_match_robust.py --selftest-flood --seed 7 --n-perturb 20
+[flood selftest] 무섭동(clean) 도면(패치 하에서 재빌드): 24/24 span 발화 (오경보율=100.0%) -> ④ FAIL
+[flood selftest] 섭동 스위트(seed=7 n=20): precision=65.3% prevalence=65.3% (TP=47 FP=25 FN=0) -> ⑤ FAIL
+[flood selftest] 참고로 ①②③(가짜 구현이 판정 경로를 건드리지 않았다는 격리 확인): ①FAIL ②PASS ③PASS
+[flood selftest] 결과: PASS -- 게이트가 범람을 잡았다(④ 또는 ⑤가 FAIL)
+EXIT=0
+```
+
+**핵심 관찰**:
+- **②(기존 recall)는 flood 하에서도 PASS**(별도 측정: 91.2%→98.75%(79/80)로 오히려 상승) — dev-core의 우려가 정확했음을 실측으로 재확인. recall 단독으로는 이 결함을 못 잡는다.
+- **④는 즉시 FAIL**: 무섭동 도면에서 24/24(100%) 오경보 — 실제 변경이 0건인데 전부 "변경됨"으로 발화.
+- **⑤도 FAIL**: precision(65.3%) == prevalence(65.3%) **소수점까지 정확히 일치** — "flood의 precision은 수학적으로 prevalence와 같다"는 설계 근거가 실측으로 그대로 검증됨(우연이 아니라 항등식).
+- exit code 0 = "self-test 통과"(=게이트가 범람을 실제로 잡았다는 뜻, 가짜 구현이 뚫었으면 exit 1).
+
+재현:
+```
+cd /run/media/iaan/1TB-WD/Github/lingbot-map/.claude/worktrees/loop-coplay-planmatch-01
+PY=/run/media/iaan/1TB-WD/Github/lingbot-map/.venv/bin/python
+$PY tools/check_plan_match_robust.py --selftest-flood --seed 7 --n-perturb 20
+```
+
+### 하위호환 확인 — 기존 판정 뒤집히지 않음
+
+```
+$ $PY tools/check_plan_match_robust.py --upload upload_1781521406685 --n-perturb 20 --seed 7
+[structured] ① 성공률: 3/20 = 15.0% (gate >= 90%)  -- 불변(수정 전과 동일)
+[structured] ② outlier recall: 73/80 = 91.2% (gate >= 80%)  -- 불변(수정 전과 동일), PASS
+[structured] ③ 모호 시 HOLD: PASS  -- 불변
+[structured] ④ 무섭동(clean) 도면 span 오경보율: 0/24 = 0.0% (gate <= 0.0%) => PASS  -- 신규, 통과
+[structured] ⑤ span 정밀도: TP=22 FP=0 FN=25 TN=25 precision=100.0% recall_span=46.8% F1=63.8%
+             prevalence=65.3% 발화율=30.6% (gate: precision >= 1.5x prevalence) => PASS  -- 신규, 통과
+[structured] 게이트 판정: FAIL (①FAIL ②PASS ③PASS ④PASS ⑤PASS)
+EXIT=1
+```
+①②③ 수치와 개별 PASS/FAIL은 수정 전(사이클 16 P3-QA-final, 사이클 18 dev-core 커밋)과 **완전 동일**하게 재현됐다(①15.0%/②91.2%/③PASS, 종합 FAIL). 신규 ④⑤도 현재 실구현에선 PASS이므로, **종합 판정(FAIL, ①때문)은 지표 추가로 뒤집히지 않았다** — 정밀도 임계를 현재 구현이 통과하도록 역산하지 않았다는 방증이기도 하다(⑤는 100.0% vs 임계 97.95%로 여유가 크지 않은 정직한 통과이지 느슨한 임계가 아니다).
+
+`⑤`의 표본이 3케이스(item①이 확정한 case #08/#11/#13)뿐이라 `n_cases_included=3`으로 작다는 점은 정직하게 출력에 노출된다(`n_cases`) — item①이 90% 게이트를 통과하지 못하는 한(현재 15%) ⑤의 통계적 힘도 구조적으로 제한된다는 뜻이며, 이는 은폐하지 않고 그대로 보고한다.
+
+### pytest / 전체 재현
+
+```
+$ $PY -m pytest tests/ -q
+369 passed in 32.81s   (수정 전과 동일 — tests/, scan2bim/ 무변경이므로 당연)
+
+$ $PY tools/check_plan_match_robust.py --sweep --sweep-ratios 0.10,0.20 --sweep-seeds 7,42 --n-perturb 10
+EXIT=0 (정상 동작 확인 -- ④⑤ 열/게이트 문자열 5자리로 확장, precision 평균 열 추가)
+
+$ $PY tools/check_plan_match_robust.py --perturb-mode both --n-perturb 5 --seed 7
+EXIT=1 (정상 동작 확인 -- structured/fragment 양쪽 다 ④⑤ 출력, FAIL 분해 메시지에도 ④⑤ 반영)
+```
+
+### 재현 명령 모음 (사이클 19 신규분)
+```
+cd /run/media/iaan/1TB-WD/Github/lingbot-map/.claude/worktrees/loop-coplay-planmatch-01
+PY=/run/media/iaan/1TB-WD/Github/lingbot-map/.venv/bin/python
+
+# pytest 회귀 없음 확인
+$PY -m pytest tests/ -q
+
+# D2 기본 게이트 (④⑤ 포함, 하위호환 확인)
+$PY tools/check_plan_match_robust.py --upload upload_1781521406685 --n-perturb 20 --seed 7
+
+# FLOOD 회귀 테스트 (이 사이클의 핵심 증거)
+$PY tools/check_plan_match_robust.py --selftest-flood --seed 7 --n-perturb 20
+
+# sweep/both 모드 정상 동작 확인(스모크)
+$PY tools/check_plan_match_robust.py --sweep --sweep-ratios 0.10,0.20 --sweep-seeds 7,42 --n-perturb 10
+$PY tools/check_plan_match_robust.py --perturb-mode both --n-perturb 5 --seed 7
+```

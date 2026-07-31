@@ -1026,6 +1026,54 @@ GATE_SCALE_REL_MAX = 0.10          # D2: per-axis (s_f, s_h) relative error <= 1
 #: flagged" / "was the region even walked", not sub-metre agreement.
 OUTLIER_RECALL_RADIUS_M = 3.0 * DEFAULT_CORRIDOR_WIDTH
 
+# ---- CYCLE 19: precision-paired gate items (dev-core self-reported flood loophole) ----
+#
+# dev-core's own commit (8d7fcbf) that raised recall 38.8% -> 91.2% flagged the exact gap
+# this section closes, VERBATIM: "FLOOD 상한: 84개 span 을 전부 깃발 꽂으면 recall 100%. ②는
+# 커버리지로 포화되므로 recall 수치만으로는 검출과 범람을 구별할 수 없다. 구별하는 숫자는
+# 정밀도다." Measured (this cycle, `selftest_flood_detection`): patching
+# `scan2bim.coarse_match._span_outliers` to unconditionally flag EVERY span (no geometry
+# check at all) pushes item② recall toward its ceiling too -- recall alone, unmodified,
+# does not by itself catch this, exactly as reported. Two NEW gate items close the
+# loophole, both scored on the SAME span-outlier mechanism recall already reads
+# (`candidate['outliers']`, `kind=='span'`), never on a second copy of the matcher:
+#
+#   ④ CLEAN-PLAN FALSE-ALARM RATE. The unperturbed base plan (STAIR, densified, the SAME
+#      "clean baseline" `_build_d2_harness_context` already builds and sanity-checks) has
+#      ZERO real changes by construction -- there is nothing ambiguous to weigh here, so
+#      the target is exactly 0%, not a tolerance band: `GATE_SPAN_CLEAN_FPR_MAX = 0.0`.
+#      A NONZERO value here means the R1/R2 rules' own built-in tolerances
+#      (`SPAN_CROSS_MARGIN`, `SPAN_WIDTH_TOL`, scan2bim/coarse_match.py) are mis-set for
+#      THIS plan, independent of any perturbation -- exactly the kind of defect a flood
+#      implementation (or a tolerance regression) would introduce, caught with zero
+#      ground-truth machinery at all.
+#
+#   ⑤ PRECISION-OVER-PREVALENCE. `GATE_SPAN_PRECISION_PREVALENCE_FACTOR = 1.5`. Physical
+#      basis (NOT fit to any observed number): an "always fire" (flood) detector's
+#      precision is, BY CONSTRUCTION, exactly equal to the base rate of true positives in
+#      whatever it is applied to (TP = every real positive, FP = every real negative,
+#      precision = positives / total = prevalence) -- flooding can therefore NEVER exceed
+#      prevalence, no matter how severe a given perturbation suite's actual changes are.
+#      Requiring precision to clear prevalence by a real margin (1.5x, not the fragile
+#      exact-1.0x boundary a single lucky/unlucky case could cross either way by chance)
+#      is a DATA-RELATIVE test: it self-scales to however much of the plan a given suite
+#      actually changed (`compute_span_precision`'s own `prevalence` field, computed
+#      fresh from ground truth every run) -- this IS the "실제 변경분이 차지하는 span 비율의
+#      기댓값" this cycle's instruction asked the ceiling be grounded in. The measured
+#      24-25/84 span-firing rate dev-core's commit cited is NEVER read by this threshold
+#      (it is only ever printed as a data point) -- a threshold copied from one run's
+#      observed number would catch nothing (per instruction: "현재 값에 맞춘 임계를 만들지
+#      마라").
+#
+# Both items are scored ALONGSIDE ①②③ (same `gate*_ok` pattern, same
+# `gate_ok = all(...)` composite) -- NEVER folded silently into ②'s own number, so a FAIL
+# is always attributable to a SPECIFIC item (see `_print_single_gate_report`'s ④/⑤ lines
+# and `main`'s FAIL-reason decomposition). `selftest_flood_detection` is the regression
+# test that proves ④/⑤ actually reject the exact failure mode dev-core reported -- run it
+# via `--selftest-flood`.
+GATE_SPAN_CLEAN_FPR_MAX = 0.0
+GATE_SPAN_PRECISION_PREVALENCE_FACTOR = 1.5
+
 #: Defensive fallback only -- every schema-valid result carries its OWN 'gates' dict
 #: (RESULT_FIELDS), which `verify_hold_on_ambiguous` reads instead of this constant.
 _FALLBACK_MARGIN_MIN = 0.08
@@ -1358,6 +1406,136 @@ def compute_outlier_recall(cases: list, base_segments, classification: dict, rev
             "radius_m": radius, "per_case": per_case}
 
 
+def _span_ground_truth_positive_set(case: dict, base_segments, spans: list, apply_transform,
+                                    radius: float = OUTLIER_RECALL_RADIUS_M) -> set:
+    """CYCLE 19. Span `event_index` set that is a GROUND-TRUTH positive for ONE case: a
+    span whose position (projected into plan metres through THIS case's OWN confirmed
+    `best` transform) lands within `radius` of ANY truly-changed segment's truth point
+    (`_changed_segment_truth_points` -- every `changed_output_indices` entry, shift OR
+    noise, regardless of the leg-association `not_observable`/`not_scoreable` buckets --
+    those are LEG-tolerance-specific classifications (Cycle 7), not applicable to the
+    span scan's own, different detection mechanism (`corridor_width_mismatch` sees the
+    FULL shift magnitude, not just the component lateral to the wall's own line -- see
+    scan2bim/coarse_match.py's span-change-scan block comment). Reuses
+    `OUTLIER_RECALL_RADIUS_M` (already the file's justified "same regional change"
+    tolerance, Cycle 7) rather than inventing a second radius constant.
+
+    `spans` is the FIXED span-event list (same across every case -- they are generated
+    from the one TRUE walk, see `_build_d2_harness_context`'s `spans_all`). A case with
+    no confirmed `best` transform, or no changed segments at all, returns the empty set
+    (nothing to be positive about / no transform to project through)."""
+    res = case.get("result") or {}
+    best = res.get("best")
+    if not best:
+        return set()
+    gt = case["ground_truth"]
+    if not gt["changed_output_indices"]:
+        return set()
+    tf = best["transform"]
+    truth_pts = list(_changed_segment_truth_points(base_segments, case["perturbed_segments"], gt).values())
+    if not truth_pts:
+        return set()
+    positive = set()
+    for e in spans:
+        p = apply_transform(tf, [e["xy"]])[0]
+        if any(float(np.linalg.norm(np.asarray(p) - np.asarray(t))) <= radius for t in truth_pts):
+            positive.add(int(e["index"]))
+    return positive
+
+
+def compute_span_precision(cases: list, base_segments, spans: list, transform_confirmed_indices,
+                           apply_transform, radius: float = OUTLIER_RECALL_RADIUS_M) -> dict:
+    """CYCLE 19, the metric that PAIRS with item② (recall) to close the flood loophole
+    dev-core self-reported (commit 8d7fcbf): recall alone cannot distinguish "detected the
+    real change" from "flagged everything", because flagging every span trivially recalls
+    100% of it. This computes a per-SPAN (not per-truth-item, unlike `compute_outlier_
+    recall`) confusion matrix, aggregated over every case in `transform_confirmed_indices`
+    (SAME restriction `compute_outlier_recall` uses -- a case whose transform was never
+    confirmed correct has no meaningful projection to test against):
+
+      TP -- span WAS flagged (`kind=='span'` in the top candidate's outliers) AND is a
+            ground-truth positive (`_span_ground_truth_positive_set`)
+      FP -- flagged but NOT a ground-truth positive (a genuine false alarm)
+      FN -- a ground-truth positive that was NOT flagged
+      TN -- neither
+
+    `precision = TP/(TP+FP)`, `recall_span = TP/(TP+FN)` (a SEPARATE number from item②'s
+    recall -- that one is per-truth-changed-segment across every outlier kind; this one is
+    per-span, span-kind only; do not conflate the two when reading the CLI output),
+    `f1` their harmonic mean, `prevalence = (TP+FN)/n` (the ground-truth positive
+    fraction -- "실제 변경분이 차지하는 span 비율", CYCLE 19's physical reference for the
+    flood gate, computed FRESH from this run's own ground truth, never hardcoded),
+    `fired_frac = (TP+FP)/n` (how much of the walk the matcher actually flagged, for the
+    report). `n == 0` (no confirmed case, or `spans` empty) leaves every ratio `None` --
+    never a fabricated number."""
+    cases_by_index = {c["index"]: c for c in cases}
+    tp = fp = fn = tn = 0
+    n_cases_included = 0
+    per_case = []
+    for ci in sorted(transform_confirmed_indices):
+        c = cases_by_index.get(ci)
+        if c is None:
+            continue
+        res = c.get("result") or {}
+        cands = res.get("candidates") or []
+        if not cands:
+            continue
+        n_cases_included += 1
+        fired = {int(o["event_index"]) for o in cands[0].get("outliers", []) if o.get("kind") == "span"}
+        positive = _span_ground_truth_positive_set(c, base_segments, spans, apply_transform, radius)
+        c_tp = c_fp = c_fn = c_tn = 0
+        for e in spans:
+            idx = int(e["index"])
+            is_fired, is_pos = idx in fired, idx in positive
+            if is_fired and is_pos:
+                c_tp += 1
+            elif is_fired:
+                c_fp += 1
+            elif is_pos:
+                c_fn += 1
+            else:
+                c_tn += 1
+        tp += c_tp; fp += c_fp; fn += c_fn; tn += c_tn
+        per_case.append({"index": ci, "tp": c_tp, "fp": c_fp, "fn": c_fn, "tn": c_tn})
+    n = tp + fp + fn + tn
+    prevalence = ((tp + fn) / n) if n else None
+    precision = (tp / (tp + fp)) if (tp + fp) else None
+    recall_span = (tp / (tp + fn)) if (tp + fn) else None
+    f1 = (2 * precision * recall_span / (precision + recall_span)
+          if (precision is not None and recall_span is not None and (precision + recall_span) > 0) else None)
+    fired_frac = ((tp + fp) / n) if n else None
+    return {"tp": tp, "fp": fp, "fn": fn, "tn": tn, "n": n, "n_cases_included": n_cases_included,
+            "prevalence": prevalence, "precision": precision, "recall_span": recall_span, "f1": f1,
+            "fired_frac": fired_frac, "radius_m": radius, "per_case": per_case}
+
+
+def span_precision_gate_ok(span_stats: dict,
+                           factor: float = GATE_SPAN_PRECISION_PREVALENCE_FACTOR) -> bool:
+    """CYCLE 19 item⑤ verdict from `compute_span_precision`'s output. Edge cases, all
+    documented rather than silently defaulted:
+      n==0            -- no confirmed-transform case had any span to score (typically
+                         because item① already has 0 confirmed cases) -- NOT a flood
+                         signal either way; item① already fails that scenario on its own,
+                         so this returns True (non-blocking) rather than double-counting.
+      tp+fp==0        -- nothing was EVER flagged across the whole suite -- trivially
+                         cannot be flooding (a flood fires on everything); True.
+      prevalence<=0   -- no real change was ever a ground-truth positive across the whole
+                         suite (rare -- e.g. every changed segment landed not_observable);
+                         with nothing to be right about, ANY firing is a straight false
+                         positive, so the bar becomes fp==0.
+      else            -- the CYCLE 19 physical test: precision must clear `factor` times
+                         the suite's own measured prevalence (see the CYCLE 19 constants
+                         block for why flooding is mathematically capped AT prevalence)."""
+    if span_stats["n"] == 0:
+        return True
+    if span_stats["tp"] + span_stats["fp"] == 0:
+        return True
+    prevalence = span_stats["prevalence"] or 0.0
+    if prevalence <= 0.0:
+        return span_stats["fp"] == 0
+    return span_stats["precision"] >= factor * prevalence
+
+
 def verify_hold_on_ambiguous(result: dict) -> bool:
     """CLIENT-side check that a TIE never gets auto-confirmed. If the top-2 candidate
     scores were within `result['gates']['margin_min']` (the threshold `finalize_match`
@@ -1503,7 +1681,21 @@ def _build_d2_harness_context() -> dict:
             "refusing to evaluate perturbed cases against a harness that does not even "
             "pass its own zero-perturbation baseline")
 
-    rev_by_index = {e["index"]: e for e in cm.recon_events(traj, door_s=door_s)}
+    rev_list = cm.recon_events(traj, door_s=door_s)
+    rev_by_index = {e["index"]: e for e in rev_list}
+    # CYCLE 19 item④: the SAME clean/unperturbed match already computed above
+    # (`clean_res`) carries its OWN span outliers -- the span scan runs on every match,
+    # perturbed or not (scan2bim/coarse_match.py's `_cand` always appends
+    # `_span_outliers(...)`). Zero real changes exist on this plan by construction, so
+    # ANY span outlier on this candidate is a genuine false alarm -- see the CYCLE 19
+    # constants block (above `GATE_SPAN_CLEAN_FPR_MAX`) for why the gate target is
+    # exactly 0, not a tolerance band.
+    spans_all = [e for e in rev_list if e["kind"] == "span"]
+    n_spans_total = len(spans_all)
+    clean_cands = clean_res.get("candidates") or []
+    clean_span_fired = (sum(1 for o in clean_cands[0].get("outliers", []) if o.get("kind") == "span")
+                        if clean_cands else 0)
+    clean_span_fpr = (clean_span_fired / n_spans_total) if n_spans_total else None
     fallback_leg_lat_tol = max(float(cm.TOL_FLOOR["leg_lat"]),
                                float(cm.TOL_PER_WIDTH["leg_lat"]) * float(tcm.W))
 
@@ -1515,7 +1707,9 @@ def _build_d2_harness_context() -> dict:
             "offset_max": offset_max,
             "clean_baseline": {"status": clean_res.get("status"), "within_d2": clean_ok,
                                "detail": clean_detail},
-            "rev_by_index": rev_by_index, "fallback_leg_lat_tol": fallback_leg_lat_tol}
+            "rev_by_index": rev_by_index, "fallback_leg_lat_tol": fallback_leg_lat_tol,
+            "spans_all": spans_all, "n_spans_total": n_spans_total,
+            "clean_span_fired": clean_span_fired, "clean_span_fpr": clean_span_fpr}
 
 
 def _evaluate_suite(ctx: dict, suite: list) -> dict:
@@ -1558,6 +1752,9 @@ def _evaluate_suite(ctx: dict, suite: list) -> dict:
                                                fallback_leg_lat_tol=ctx["fallback_leg_lat_tol"])
     recall = compute_outlier_recall(cases, ctx["base_segments"], classification, ctx["rev_by_index"],
                                     ps.apply_candidate_transform, transform_confirmed_indices)
+    span_stats = compute_span_precision(cases, ctx["base_segments"], ctx["spans_all"],
+                                        transform_confirmed_indices, ps.apply_candidate_transform)
+
     ambiguous = build_ambiguous_fixture(cm, ps, ctx["tcm"], ctx["tps"])
     hold = verify_hold_gate(cases, ambiguous)
 
@@ -1579,11 +1776,20 @@ def _evaluate_suite(ctx: dict, suite: list) -> dict:
     gate1_ok = succ["rate"] >= GATE_SUCCESS_RATE_MIN
     gate2_ok = recall["recall"] is not None and recall["recall"] >= GATE_OUTLIER_RECALL_MIN
     gate3_ok = hold["ok"]
+    # CYCLE 19 items ④/⑤ -- see the constants block above `GATE_SPAN_CLEAN_FPR_MAX`. ④
+    # reads the ctx-level (suite-independent) clean-plan measurement straight through;
+    # ⑤ is THIS suite's own span_stats (computed just above, from THIS suite's cases).
+    gate4_ok = ctx["clean_span_fpr"] is None or ctx["clean_span_fpr"] <= GATE_SPAN_CLEAN_FPR_MAX
+    gate5_ok = span_precision_gate_ok(span_stats)
     return {"cases": cases, "case_summaries": case_summaries, "contract_violations": contract_violations,
             "success": succ, "failure_reasons": failure_reasons,
             "outlier_recall": recall, "hold": hold,
+            "span_precision": span_stats,
+            "clean_span_fired": ctx["clean_span_fired"], "clean_span_fpr": ctx["clean_span_fpr"],
+            "n_spans_total": ctx["n_spans_total"],
             "gate1_ok": gate1_ok, "gate2_ok": gate2_ok, "gate3_ok": gate3_ok,
-            "gate_ok": bool(gate1_ok and gate2_ok and gate3_ok)}
+            "gate4_ok": gate4_ok, "gate5_ok": gate5_ok,
+            "gate_ok": bool(gate1_ok and gate2_ok and gate3_ok and gate4_ok and gate5_ok)}
 
 
 def _run_d2_gate_single(seed: int, n_perturb: int, perturb_mode: str) -> dict:
@@ -1620,7 +1826,11 @@ def _run_d2_gate_single(seed: int, n_perturb: int, perturb_mode: str) -> dict:
             "contract_violations": ev["contract_violations"],
             "success": ev["success"], "failure_reasons": ev["failure_reasons"],
             "outlier_recall": ev["outlier_recall"], "hold": ev["hold"],
+            "span_precision": ev["span_precision"],
+            "clean_span_fired": ev["clean_span_fired"], "clean_span_fpr": ev["clean_span_fpr"],
+            "n_spans_total": ev["n_spans_total"],
             "gate1_ok": ev["gate1_ok"], "gate2_ok": ev["gate2_ok"], "gate3_ok": ev["gate3_ok"],
+            "gate4_ok": ev["gate4_ok"], "gate5_ok": ev["gate5_ok"],
             "gate_ok": ev["gate_ok"]}
 
 
@@ -1642,6 +1852,66 @@ def run_d2_gate(seed: int, n_perturb: int, perturb_mode: str = "structured") -> 
                 "structured": g_structured, "fragment": g_fragment,
                 "gate_ok": bool(g_structured["gate_ok"] and g_fragment["gate_ok"])}
     return _run_d2_gate_single(seed, n_perturb, perturb_mode)
+
+
+def selftest_flood_detection(seed: int = 7, n_perturb: int = 20) -> dict:
+    """CYCLE 19 -- THE regression test this cycle exists to add. Proves items ④/⑤
+    (`GATE_SPAN_CLEAN_FPR_MAX` / `GATE_SPAN_PRECISION_PREVALENCE_FACTOR`) actually reject
+    the exact failure mode dev-core self-reported in commit 8d7fcbf: "flag every span,
+    recall goes to 100%". Monkeypatches `scan2bim.coarse_match._span_outliers` (in
+    memory, restored in a `finally` -- scan2bim/** is never written to disk, this team's
+    read-only rule on it is honoured) to a fake that unconditionally returns EVERY span
+    of the walk as an outlier, no geometry check at all -- the simplest possible flood
+    implementation -- then runs the SAME harness build + suite evaluation the real D2
+    gate runs, and returns whether ④ or ⑤ (or both) caught it.
+
+    Two things are measured, both under the SAME patch:
+      1. The clean (UNPERTURBED) baseline -- rebuilt fresh under the patch, so its own
+         span scan is flooded too. Zero real changes exist on this plan, so a flood
+         reports EVERY span as a false alarm: this alone should fail ④ outright.
+      2. The `seed`/`n_perturb` perturbed suite (default: the same seed=7, n=20 the D2
+         gate's own DoD command uses) -- item⑤'s precision collapses toward the suite's
+         own prevalence (a flood cannot discriminate real change from unchanged plan by
+         construction, see the CYCLE 19 constants block), which the 1.5x-prevalence bar
+         is designed to catch regardless of how much of the suite is genuinely changed.
+
+    Returns a dict with both measurements plus `caught` (bool: gate4_ok is False OR
+    gate5_ok is False under the flood patch -- `False` here would mean the flood slipped
+    through undetected, the exact defect this cycle's instruction asked to be tested
+    for). Raises ImportError/RuntimeError exactly as `_build_d2_harness_context` does
+    (propagated, not swallowed -- the CLI turns either into exit 2)."""
+    cm, ps, tcm, tps = _load_d2_harness()
+    original_span_outliers = cm._span_outliers
+
+    def _flood_all_spans(tf, R, P, walls, width_ref):
+        return [{"kind": "span", "event_index": int(e["index"]), "plan_event_id": None,
+                "residual": 0.0, "reason": "FAKE_FLOOD_SELFTEST_ALL_SPANS_UNCONDITIONALLY"}
+               for e in (R.get("span") or [])]
+
+    try:
+        cm._span_outliers = _flood_all_spans
+        # Rebuilt UNDER the patch (not reusing any pre-patch ctx) so the clean baseline's
+        # OWN span scan is flooded too -- proves the flood is caught even before any
+        # perturbation exists, the sharpest possible demonstration.
+        flooded_ctx = _build_d2_harness_context()
+        suite = generate_perturbation_suite(flooded_ctx["base_segments"], seed, n_perturb,
+                                            mode="structured", wall_ids=flooded_ctx["wall_ids"])
+        ev = _evaluate_suite(flooded_ctx, suite)
+    finally:
+        cm._span_outliers = original_span_outliers
+
+    return {
+        "seed": int(seed), "n_perturb": int(n_perturb),
+        "clean_span_fired": flooded_ctx["clean_span_fired"],
+        "n_spans_total": flooded_ctx["n_spans_total"],
+        "clean_span_fpr": flooded_ctx["clean_span_fpr"],
+        "gate4_ok": ev["gate4_ok"],
+        "span_precision": ev["span_precision"],
+        "gate5_ok": ev["gate5_ok"],
+        "gate1_ok": ev["gate1_ok"], "gate2_ok": ev["gate2_ok"], "gate3_ok": ev["gate3_ok"],
+        "gate_ok": ev["gate_ok"],
+        "caught": bool((not ev["gate4_ok"]) or (not ev["gate5_ok"])),
+    }
 
 
 def run_sweep(ratios=SWEEP_RATIOS_DEFAULT, seeds=SWEEP_SEEDS_DEFAULT,
@@ -1698,7 +1968,10 @@ def run_sweep(ratios=SWEEP_RATIOS_DEFAULT, seeds=SWEEP_SEEDS_DEFAULT,
                 "recall_n_total": recall["n_total"],
                 "hold_violations": len(ev["hold"]["perturbation_invariant_violations"]),
                 "failure_reasons": ev["failure_reasons"],
+                "span_precision": ev["span_precision"],
+                "clean_span_fpr": ev["clean_span_fpr"],
                 "gate1_ok": ev["gate1_ok"], "gate2_ok": ev["gate2_ok"], "gate3_ok": ev["gate3_ok"],
+                "gate4_ok": ev["gate4_ok"], "gate5_ok": ev["gate5_ok"],
                 "gate_ok": ev["gate_ok"],
             })
 
@@ -1708,6 +1981,8 @@ def run_sweep(ratios=SWEEP_RATIOS_DEFAULT, seeds=SWEEP_SEEDS_DEFAULT,
         for s in per_seed:
             for k, v in s["failure_reasons"].items():
                 merged_failure_reasons[k] = merged_failure_reasons.get(k, 0) + v
+        precisions = [s["span_precision"]["precision"] for s in per_seed
+                     if s["span_precision"]["precision"] is not None]
         points.append({
             "ratio_target": float(ratio), "per_seed": per_seed,
             "achieved_ratio_mean": float(np.mean([s["achieved_ratio_mean"] for s in per_seed])),
@@ -1717,12 +1992,16 @@ def run_sweep(ratios=SWEEP_RATIOS_DEFAULT, seeds=SWEEP_SEEDS_DEFAULT,
             "recall_min": (float(np.min(recalls)) if recalls else None),
             "recall_max": (float(np.max(recalls)) if recalls else None),
             "recall_n_seeds_scoreable": len(recalls), "recall_n_seeds_total": len(per_seed),
+            "precision_mean": (float(np.mean(precisions)) if precisions else None),
+            "precision_n_seeds_scoreable": len(precisions),
             "n_ok_outside_d2_total": sum(s["n_ok_outside_d2"] for s in per_seed),
             "hold_violations_total": sum(s["hold_violations"] for s in per_seed),
             "failure_reasons_merged": merged_failure_reasons,
             "all_seeds_gate1_ok": all(s["gate1_ok"] for s in per_seed),
             "all_seeds_gate2_ok": all(s["gate2_ok"] for s in per_seed),
             "all_seeds_gate3_ok": all(s["gate3_ok"] for s in per_seed),
+            "all_seeds_gate4_ok": all(s["gate4_ok"] for s in per_seed),
+            "all_seeds_gate5_ok": all(s["gate5_ok"] for s in per_seed),
         })
 
     return {"ratios": [float(r) for r in ratios], "seeds": [int(s) for s in seeds],
@@ -1760,6 +2039,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--selftest-only", action="store_true",
                     help="run ONLY the reproducibility self-test (2x generation, compare) and exit; "
                          "skips suite generation and the D2 gate")
+    ap.add_argument("--selftest-flood", action="store_true",
+                    help="CYCLE 19: run ONLY the flood-detection regression self-test "
+                         "(selftest_flood_detection -- monkeypatch "
+                         "scan2bim.coarse_match._span_outliers, in memory only, to flag EVERY "
+                         "span unconditionally, verify gate items ④/⑤ reject it) and exit. Uses "
+                         "--seed/--n-perturb for the perturbed half of the check.")
     ap.add_argument("--json", type=Path, default=None,
                     help="write the generated suite (segments + ground_truth per perturbation) plus the "
                          "D2 gate result (if it ran) as JSON (or, with --sweep, the sweep result)")
@@ -1856,10 +2141,29 @@ def _print_single_gate_report(gate: dict) -> None:
           f"{len(hold['perturbation_invariant_violations'])}건 "
           f"{hold['perturbation_invariant_violations'] or ''} "
           f"(reject 는 정상 -- finalize_match 의 하드게이트 우선순위, verify_hold_on_ambiguous 참고)")
+
+    clean_fpr_pct = (gate['clean_span_fpr'] or 0.0) * 100
+    print(f"{tag} ④ 무섭동(clean) 도면 span 오경보율(CYCLE 19, ②의 범람 취약점과 짝: dev-core 자진신고): "
+          f"{gate['clean_span_fired']}/{gate['n_spans_total']} = {clean_fpr_pct:.1f}% "
+          f"(gate <= {GATE_SPAN_CLEAN_FPR_MAX*100:.1f}%) => {'PASS' if gate['gate4_ok'] else 'FAIL'}")
+    sp = gate["span_precision"]
+    prec_s = "N/A" if sp["precision"] is None else f"{sp['precision']*100:.1f}%"
+    recs_s = "N/A" if sp["recall_span"] is None else f"{sp['recall_span']*100:.1f}%"
+    f1_s = "N/A" if sp["f1"] is None else f"{sp['f1']*100:.1f}%"
+    prev_s = "N/A" if sp["prevalence"] is None else f"{sp['prevalence']*100:.1f}%"
+    fired_s = "N/A" if sp["fired_frac"] is None else f"{sp['fired_frac']*100:.1f}%"
+    print(f"{tag} ⑤ span 정밀도(CYCLE 19, TP={sp['tp']} FP={sp['fp']} FN={sp['fn']} TN={sp['tn']} "
+          f"n_cases={sp['n_cases_included']}): precision={prec_s} recall_span={recs_s} F1={f1_s} "
+          f"prevalence(실제변경 span 비율)={prev_s} 발화율={fired_s} "
+          f"(gate: precision >= {GATE_SPAN_PRECISION_PREVALENCE_FACTOR}x prevalence) "
+          f"=> {'PASS' if gate['gate5_ok'] else 'FAIL'}")
+
     print(f"{tag} 게이트 판정: {'PASS' if gate['gate_ok'] else 'FAIL'} "
           f"(①{'PASS' if gate['gate1_ok'] else 'FAIL'} "
           f"②{'PASS' if gate['gate2_ok'] else 'FAIL'} "
-          f"③{'PASS' if gate['gate3_ok'] else 'FAIL'})")
+          f"③{'PASS' if gate['gate3_ok'] else 'FAIL'} "
+          f"④{'PASS' if gate['gate4_ok'] else 'FAIL'} "
+          f"⑤{'PASS' if gate['gate5_ok'] else 'FAIL'})")
 
 
 def _print_sweep_report(sweep: dict) -> None:
@@ -1878,32 +2182,43 @@ def _print_sweep_report(sweep: dict) -> None:
     print(f"[sweep] 무섭동 기준해: status={cb['status']} within_D2={cb['within_d2']}")
     print("")
     header = (f"{'목표T':>6} {'실측T평균':>9} | {'성공률 평균(범위)':>20} | {'recall 평균(범위)':>26} | "
-             f"{'ok_outside_d2':>13} | {'HOLD위반':>8} | {'게이트①②③':>10} | 실패사유 분포(3seed 합산)")
+             f"{'precision 평균':>13} | {'ok_outside_d2':>13} | {'HOLD위반':>8} | {'게이트①②③④⑤':>14} | "
+             f"실패사유 분포(3seed 합산)")
     print(header)
     print("-" * len(header))
     for p in sweep["points"]:
         recall_str = ("N/A(scoreable 0)" if p["recall_mean"] is None else
                       f"{p['recall_mean']*100:5.1f}%({p['recall_min']*100:.0f}-{p['recall_max']*100:.0f}%)"
                       f"[{p['recall_n_seeds_scoreable']}/{p['recall_n_seeds_total']}seed]")
+        precision_str = ("N/A" if p["precision_mean"] is None
+                         else f"{p['precision_mean']*100:5.1f}%[{p['precision_n_seeds_scoreable']}seed]")
         gates = (f"{'P' if p['all_seeds_gate1_ok'] else 'F'}"
                 f"{'P' if p['all_seeds_gate2_ok'] else 'F'}"
-                f"{'P' if p['all_seeds_gate3_ok'] else 'F'}")
+                f"{'P' if p['all_seeds_gate3_ok'] else 'F'}"
+                f"{'P' if p['all_seeds_gate4_ok'] else 'F'}"
+                f"{'P' if p['all_seeds_gate5_ok'] else 'F'}")
         row = (f"{p['ratio_target']*100:5.0f}% {p['achieved_ratio_mean']*100:8.1f}% | "
               f"{p['success_rate_mean']*100:5.1f}%({p['success_rate_min']*100:.0f}-{p['success_rate_max']*100:.0f}%) | "
               f"{recall_str:>26} | "
+              f"{precision_str:>13} | "
               f"{p['n_ok_outside_d2_total']:>13} | {p['hold_violations_total']:>8} | "
-              f"{gates:>10} | {json.dumps(p['failure_reasons_merged'], ensure_ascii=False)}")
+              f"{gates:>14} | {json.dumps(p['failure_reasons_merged'], ensure_ascii=False)}")
         print(row)
     print("")
     print("[sweep] 지점별 seed 상세 (위 평균/범위의 근거, per-seed 원값):")
     for p in sweep["points"]:
         for s in p["per_seed"]:
             recall_s = "N/A" if s["recall"] is None else f"{s['recall']*100:.1f}%"
+            sp = s["span_precision"]
+            prec_s = "N/A" if sp["precision"] is None else f"{sp['precision']*100:.1f}%"
+            prev_s = "N/A" if sp["prevalence"] is None else f"{sp['prevalence']*100:.1f}%"
+            gate45 = (f"{'P' if s['gate4_ok'] else 'F'}{'P' if s['gate5_ok'] else 'F'}")
             print(f"  T={p['ratio_target']*100:.0f}% seed={s['seed']:>4} 실측T={s['achieved_ratio_mean']*100:.1f}% "
                   f"({s['achieved_ratio_min']*100:.1f}-{s['achieved_ratio_max']*100:.1f}%) "
                   f"성공률={s['success_rate']*100:.1f}%({s['n_ok_within_d2']}/{s['n']}) "
                   f"ok_outside_d2={s['n_ok_outside_d2']} recall={recall_s} "
-                  f"HOLD위반={s['hold_violations']} 실패사유={json.dumps(s['failure_reasons'], ensure_ascii=False)}")
+                  f"HOLD위반={s['hold_violations']} 실패사유={json.dumps(s['failure_reasons'], ensure_ascii=False)} "
+                  f"span_precision={prec_s} prevalence={prev_s} 게이트④⑤={gate45}")
 
 
 def _run_sweep_cli(args) -> int:
@@ -1945,6 +2260,39 @@ def main(argv=None) -> int:
 
     if args.sweep:
         return _run_sweep_cli(args)
+
+    if args.selftest_flood:
+        try:
+            res = selftest_flood_detection(seed=args.seed, n_perturb=args.n_perturb)
+        except ImportError as e:
+            print(f"[flood selftest 평가 불가] {e}", file=sys.stderr)
+            return 2
+        except RuntimeError as e:
+            print(f"[flood selftest 평가 불가] {e}", file=sys.stderr)
+            return 2
+        print("[flood selftest] scan2bim.coarse_match._span_outliers 를 '모든 span 무조건 발화'로 "
+              "인메모리 monkeypatch(디스크 미수정, finally 에서 원복) -- dev-core 8d7fcbf 자진신고 "
+              "재현: recall 38.8%->91.2% 개선과 함께 '84개 span 전부 깃발 꽂으면 recall 100%'을 "
+              "self-report 했던 바로 그 가짜 구현")
+        print(f"[flood selftest] 무섭동(clean) 도면(패치 하에서 재빌드): "
+              f"{res['clean_span_fired']}/{res['n_spans_total']} span 발화 "
+              f"(오경보율={(res['clean_span_fpr'] or 0)*100:.1f}%) -> "
+              f"④ {'PASS' if res['gate4_ok'] else 'FAIL'}")
+        sp = res["span_precision"]
+        prec_s = "N/A" if sp["precision"] is None else f"{sp['precision']*100:.1f}%"
+        prev_s = "N/A" if sp["prevalence"] is None else f"{sp['prevalence']*100:.1f}%"
+        print(f"[flood selftest] 섭동 스위트(seed={res['seed']} n={res['n_perturb']}): "
+              f"precision={prec_s} prevalence={prev_s} (TP={sp['tp']} FP={sp['fp']} FN={sp['fn']}) -> "
+              f"⑤ {'PASS' if res['gate5_ok'] else 'FAIL'}")
+        print(f"[flood selftest] 참고로 ①②③(가짜 구현이 판정 경로를 건드리지 않았다는 격리 확인): "
+              f"①{'PASS' if res['gate1_ok'] else 'FAIL'} ②{'PASS' if res['gate2_ok'] else 'FAIL'} "
+              f"③{'PASS' if res['gate3_ok'] else 'FAIL'}")
+        if res["caught"]:
+            print("[flood selftest] 결과: PASS -- 게이트가 범람을 잡았다(④ 또는 ⑤가 FAIL)")
+            return 0
+        print("[flood selftest] 결과: FAIL -- 게이트가 범람을 통과시켰다(④⑤ 모두 PASS로 나옴) -- "
+              "정밀도 지표가 무력화됐다는 뜻, 즉시 보고 필요", file=sys.stderr)
+        return 1
 
     if args.plan_dxf is not None:
         if not args.plan_dxf.exists():
@@ -2065,6 +2413,11 @@ def main(argv=None) -> int:
                 sub.append(f"②{rr}(<{GATE_OUTLIER_RECALL_MIN*100:.0f}%)")
             if not g["gate3_ok"]:
                 sub.append("③HOLD위반")
+            if not g["gate4_ok"]:
+                sub.append(f"④무섭동오경보{g['clean_span_fired']}/{g['n_spans_total']}>0")
+            if not g["gate5_ok"]:
+                pv = "N/A" if g["span_precision"]["precision"] is None else f"{g['span_precision']['precision']*100:.1f}%"
+                sub.append(f"⑤precision{pv}<{GATE_SPAN_PRECISION_PREVALENCE_FACTOR}x prevalence")
             misses.append(f"[{m}] " + "; ".join(sub))
         print("D2 게이트: FAIL -- " + " | ".join(misses), file=sys.stderr)
         return 1
@@ -2077,6 +2430,15 @@ def main(argv=None) -> int:
         misses.append(f"②outlier recall {rr} (gate >= {GATE_OUTLIER_RECALL_MIN*100:.0f}%)")
     if not gate["gate3_ok"]:
         misses.append("③모호 시 HOLD 위반")
+    if not gate["gate4_ok"]:
+        misses.append(f"④무섭동 span 오경보 {gate['clean_span_fired']}/{gate['n_spans_total']} > 0 "
+                      f"(gate <= {GATE_SPAN_CLEAN_FPR_MAX*100:.1f}%)")
+    if not gate["gate5_ok"]:
+        sp = gate["span_precision"]
+        pv = "N/A" if sp["precision"] is None else f"{sp['precision']*100:.1f}%"
+        pr = "N/A" if sp["prevalence"] is None else f"{sp['prevalence']*100:.1f}%"
+        misses.append(f"⑤span precision {pv} < {GATE_SPAN_PRECISION_PREVALENCE_FACTOR}x "
+                      f"prevalence({pr})")
     print(f"D2 게이트: FAIL(mode={args.perturb_mode}) -- " + "; ".join(misses), file=sys.stderr)
     return 1
 
