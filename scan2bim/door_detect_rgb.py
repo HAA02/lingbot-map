@@ -978,3 +978,107 @@ def door_s_values(result: dict, min_confidence=None) -> list:
         raise ValueError("detections carry no arclength — pass traj_xz= and pose_times= "
                          "to detect_doors()")
     return [float(c["s"]) for c in ds]
+
+
+# --------------------------------------------------------------------------------------
+# SECTION 6 — reproduction CLI (observation, not judgement)
+# --------------------------------------------------------------------------------------
+# `python -m scan2bim.door_detect_rgb <video> [--lbp X.lbp2] [--duration 35.3]
+#                                    [--out DIR] [--metric-scale 1.97]`
+# prints EVERY candidate, accepted or not, with the gate it failed — the table a human
+# needs to line the detector up against the video. It judges nothing: with no annotated
+# door in any upload there is no ground truth to score against.
+
+def _cli(argv=None):
+    import argparse
+    import json
+
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("video")
+    ap.add_argument("--lbp", help="matching .lbp2/3/4 payload, for the arclength axis")
+    ap.add_argument("--duration", type=float, default=None,
+                    help="video seconds spanned by the poses (build_coplay's axis); "
+                         "defaults to the decoded frame count / fps")
+    ap.add_argument("--metric-scale", type=float, default=None,
+                    help="recon units -> metres, POST HOC: it is applied to the reported "
+                         "width only and is never seen by the detector")
+    ap.add_argument("--width-hint", type=float, default=None,
+                    help="corridor clear width in RECON units (enables the width gate)")
+    ap.add_argument("--out", help="directory for the JSON result + candidate filmstrips")
+    ap.add_argument("--max-frames", type=int, default=None)
+    a = ap.parse_args(argv)
+
+    traj = ptimes = None
+    if a.lbp:
+        from .door_detect import gravity_align, read_lbp
+        d = read_lbp(a.lbp)
+        g = gravity_align(d["poses"], d["points"])
+        traj = g["traj_xz"]
+        n = len(traj)
+        dur = a.duration
+        if dur is None:
+            cap = cv2.VideoCapture(str(a.video))
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+            dur = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0) / max(fps, 1e-9)
+            cap.release()
+        ptimes = np.arange(n) * float(dur) / max(n - 1, 1)
+
+    r = detect_doors(a.video, pose_times=ptimes, traj_xz=traj,
+                     width_hint=a.width_hint, max_frames=a.max_frames)
+    i = r["info"]
+    print(f"# {SCHEMA}  {a.video}")
+    print(f"# {i['n_frames']} frames @ {i['fps']:.3f} fps, work {i['work_size']}, "
+          f"rows {i['row_band_px']}, fx {i.get('fx_px')} px (hfov "
+          f"{i['params']['hfov_deg']} deg assumed)")
+    print(f"# tracks {i['n_tracks']} -> diverging {i['n_diverging_tracks']} -> pairs "
+          f"{i['n_candidates']} -> ACCEPTED {i['n_doors']}")
+    print(f"# view {i.get('view')}")
+    print(f"# track rejections   {i.get('track_reject_hist')}")
+    print(f"# pair rejections    {i.get('candidate_reject_hist')}")
+    if i.get("warn"):
+        print(f"# WARN {i['warn']}")
+    sc = a.metric_scale
+    hdr = ["t_s", "frame", "s_recon", "width_recon", "width_m", "conf", "shape",
+           "n_pair", "turn_deg", "arrival", "lintel", "verdict"]
+    print("\t".join(hdr))
+    for c in r["candidates"]:
+        w = c["width_recon"]
+        print("\t".join([
+            f"{c['time_s']:.3f}", str(c["frame"]),
+            ("-" if c["s"] is None else f"{c['s']:.4f}"),
+            ("-" if w is None else f"{w:.4f}"),
+            ("-" if (w is None or sc is None) else f"{w * sc:.2f}"),
+            f"{c['confidence']:.3f}", f"{shape_score(c):.3f}",
+            str(c["n_pair_frames"]), f"{c['turn_deg']:.1f}",
+            ("-" if c["arrival_ratio"] is None else f"{c['arrival_ratio']:.2f}"),
+            (str(c["lintel"]["reason"]) if not c["lintel"]["found"]
+             else f"T={c['lintel']['T']:.2f},cov={c['lintel']['coverage']}"),
+            ("ACCEPTED" if c["accepted"] else ",".join(c["reject"]))]))
+    print(f"# door_times = {door_times(r)}")
+    if a.out:
+        out = Path(a.out)
+        out.mkdir(parents=True, exist_ok=True)
+        stem = Path(a.video).stem
+        (out / f"{stem}.door_rgb.json").write_text(json.dumps(r, indent=1))
+        print(f"# wrote {out / (stem + '.door_rgb.json')}")
+    return r
+
+
+def shape_score(cand: dict) -> float:
+    """The confidence a candidate would carry if no HARD gate had fired.
+
+    Reported next to `confidence` because the two say different things: `confidence` is 0
+    the moment any gate fires, so a table of confidences cannot show HOW close a rejected
+    candidate came. MEASURED, and the reason this is worth printing: the dead-end fixture
+    scores 0.910 here against 0.922-0.939 for real doorways — its shape is not
+    distinguishable, only its arrival is."""
+    s = cand.get("scores", {})
+    ax = [s.get("cross_time", 0.0), s.get("symmetry", 0.0), s.get("fit", 0.0),
+          s.get("straight", 0.0), s.get("lintel", 0.0)]
+    if "width_ratio" in s:
+        ax.append(s["width_ratio"])
+    return float(np.exp(np.mean(np.log(np.maximum(ax, 1e-12))))) * s.get("trust", 0.0)
+
+
+if __name__ == "__main__":       # pragma: no cover
+    _cli()
