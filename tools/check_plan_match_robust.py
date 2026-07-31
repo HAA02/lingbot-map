@@ -789,6 +789,150 @@ def perturb_wall_segments_structured(segments, wall_ids, seed: int, *,
     return out, ground_truth
 
 
+# ==========================================================================================
+# SECTION 2c -- CYCLE 12: TOTAL-CHANGE-RATIO sweep generator (`--sweep`)
+# ==========================================================================================
+#
+# WHY THIS EXISTS, AND WHAT IT DOES NOT DO (read before touching): Section 2b draws
+# remove_frac / shift_frac / noise_frac INDEPENDENTLY, each from its OWN QA-owned range
+# (REMOVE_FRAC_RANGE / SHIFT_FRAC_RANGE / NOISE_FRAC_RANGE -- UNCHANGED here, still the
+# default D2 gate's budget). Measured (cycle-11 session, seed=7, n_perturb=20,
+# structured): stacking three INDEPENDENT 10-30%/10-30%/5-20% draws means every case
+# changes roughly 30-75% of the base plan's 232 fragments (removed 24-67 + shifted
+# 26-62 + noise 14-46), because the three draws are never small TOGETHER by
+# construction -- there is no way, using ONLY Section 2b's own knobs, to ask "what if
+# the total site change were 5%". This section does NOT touch, replace, or relax
+# REMOVE_FRAC_RANGE / SHIFT_FRAC_RANGE / NOISE_FRAC_RANGE, and it is NEVER called by
+# `run_d2_gate` / `_run_d2_gate_single` (the default gate path, still exactly Section
+# 2b's independent-range draw, unchanged, see the `--n-perturb 20 --seed 7` no-regression
+# check in the cycle report) -- it is an ADDITIONAL, separate axis of measurement
+# (`--sweep`), per instruction: "게이트를 통과시키려 정의를 또 고치는 것은 금지... 그러나
+# '몇 % 변경까지 강건한가'는 정의 변경이 아니라 추가 측정이다".
+#
+# ALLOCATION RULE (how a single TOTAL ratio T -- e.g. 0.05 for "5% of the 232 base
+# fragments changed" -- is split into a remove/shift/noise triple), stated explicitly per
+# instruction ("배분 규칙을 명시하라"): reuse the RELATIVE WEIGHT the three QA-owned
+# ranges' OWN midpoints already imply, and split T in those SAME proportions -- no new
+# weighting is invented:
+#   mid_remove          = mean(REMOVE_FRAC_RANGE)                = 0.20   (of N)
+#   mid_shift_of_kept    = mean(SHIFT_FRAC_RANGE)                 = 0.20   (of KEPT,
+#                          i.e. N - removed -- Section 2b's own parameterisation)
+#   mid_noise            = mean(NOISE_FRAC_RANGE)                 = 0.125  (of N)
+#   mid_shift_of_total   = mid_shift_of_kept * (1 - mid_remove)   = 0.16   (of N --
+#                          converted to the SAME "of N" basis as the other two so the
+#                          three CAN be added; shift's own knob stays "of kept" in the
+#                          generator itself, unchanged -- this conversion is only for
+#                          computing the WEIGHT)
+#   (w_remove, w_shift, w_noise) = the three "of N" midpoints above, normalised to sum to
+#                          1: (0.20, 0.16, 0.125) / 0.485 =~ (0.412, 0.330, 0.258), see
+#                          `_sweep_allocation_weights` / `SWEEP_ALLOC_WEIGHTS` (computed,
+#                          not hand-typed, from the three live QA constants).
+# Given a target T, `perturb_wall_segments_structured_at_total_ratio` sets:
+#   remove_frac        = T * w_remove   (EXACT -- Section 2b's own remove-to-budget
+#                        mechanism, the "one partial bite" trick, lands on this count
+#                        exactly, same guarantee as the default path)
+#   noise_frac          = T * w_noise    (EXACT, ditto for the one-new-wall mechanism)
+#   shift_frac_of_kept  = (T * w_shift * N) / max(1, N - round(N*remove_frac))
+#                        (Section 2b's shift mechanism only guarantees MET-OR-EXCEEDED,
+#                        same caveat as the default path -- see its own docstring; the
+#                        ACHIEVED total ratio is therefore reported per-case, never
+#                        assumed to equal T exactly)
+# All three are passed to `perturb_wall_segments_structured` (Section 2b, UNCHANGED) as
+# DEGENERATE ranges `(x, x)` (`numpy.random.Generator.uniform(x, x) == x`) -- the EXACT
+# SAME function the default gate already uses, called with a single point instead of a
+# band, so every byte of the remove/shift/noise MECHANISM (whole-wall edit unit, one
+# contiguous partial bite, one new wall) is shared, unchanged, with the default path;
+# only the SAMPLING WIDTH of the three fractions differs (a point, not a 10-30%-style
+# band, because the sweep's own independent axis IS the total ratio -- widening each of
+# the three around it as well would re-introduce Section 2b's stacking effect this
+# section exists to avoid).
+#
+# `shift_dist_range` (0.3-1.0 m, the DISPLACEMENT magnitude, not a fraction of anything)
+# is UNCHANGED and NOT part of "total change ratio" -- QA-owned, still the DoD text's
+# literal band, passed through unmodified.
+
+
+def _sweep_allocation_weights() -> tuple:
+    """(w_remove, w_shift, w_noise), summing to 1.0 -- see the block comment above this
+    function for the derivation. Computed FROM REMOVE_FRAC_RANGE / SHIFT_FRAC_RANGE /
+    NOISE_FRAC_RANGE (QA-owned, unchanged) rather than hardcoded, so if those ranges are
+    ever legitimately revised the sweep's allocation stays consistent with them
+    automatically -- this function does NOT redefine or relax any of the three ranges."""
+    mid_remove = 0.5 * (REMOVE_FRAC_RANGE[0] + REMOVE_FRAC_RANGE[1])
+    mid_shift_of_kept = 0.5 * (SHIFT_FRAC_RANGE[0] + SHIFT_FRAC_RANGE[1])
+    mid_noise = 0.5 * (NOISE_FRAC_RANGE[0] + NOISE_FRAC_RANGE[1])
+    mid_shift_of_total = mid_shift_of_kept * (1.0 - mid_remove)
+    total = mid_remove + mid_shift_of_total + mid_noise
+    return (mid_remove / total, mid_shift_of_total / total, mid_noise / total)
+
+
+#: (w_remove, w_shift, w_noise) -- see `_sweep_allocation_weights` / the block comment
+#: above it. NOT used by the default D2 gate path (`run_d2_gate` / Section 2b), only by
+#: `--sweep` (this section).
+SWEEP_ALLOC_WEIGHTS = _sweep_allocation_weights()
+
+#: `--sweep`'s default total-change-ratio axis points (fraction of the 232-fragment
+#: densified STAIR base) -- 5/10/15/20/30/40/50%, per this cycle's instruction.
+SWEEP_RATIOS_DEFAULT = (0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50)
+
+#: `--sweep`'s default seeds -- at least 3, per this cycle's instruction, so every ratio
+#: point is reported as a mean AND a range, not a single (possibly lucky/unlucky) draw.
+SWEEP_SEEDS_DEFAULT = (7, 42, 123)
+
+
+def perturb_wall_segments_structured_at_total_ratio(segments, wall_ids, seed: int,
+                                                     total_frac: float, *,
+                                                     alloc_weights=SWEEP_ALLOC_WEIGHTS,
+                                                     shift_dist_range=SHIFT_DIST_RANGE,
+                                                     target_piece_len: float = DENSIFY_TARGET_PIECE_LEN_M,
+                                                     bbox_pad: float = 2.0) -> tuple:
+    """`--sweep` generator: a SINGLE-POINT (not a range) structured perturbation whose
+    remove+shift+noise fragment count sums to (approximately -- see the module-level
+    block comment's shift caveat) `total_frac` of `len(segments)`. Delegates entirely to
+    `perturb_wall_segments_structured` (Section 2b, UNCHANGED) with degenerate `(x, x)`
+    ranges for remove_frac/shift_frac/noise_frac -- same mechanism, same ground_truth
+    schema (plus the same `ground_truth['structured']` audit trail), just a point
+    instead of a band. Returns (perturbed_segments, ground_truth), same shape as every
+    other perturbation function in this file."""
+    seg0 = np.asarray(segments, dtype=np.float64).reshape(-1, 2, 2)
+    n = len(seg0)
+    w_r, w_s, w_n = alloc_weights
+    t = float(total_frac)
+    remove_frac = t * w_r
+    noise_frac = t * w_n
+    n_remove_est = int(round(n * remove_frac))
+    n_remove_est = min(max(n_remove_est, 0), max(n - 1, 0))
+    kept_est = max(1, n - n_remove_est)
+    shift_frac_of_kept = (t * w_s * n) / kept_est
+    return perturb_wall_segments_structured(
+        segments, wall_ids, seed,
+        remove_frac_range=(remove_frac, remove_frac),
+        shift_frac_range=(shift_frac_of_kept, shift_frac_of_kept),
+        shift_dist_range=shift_dist_range,
+        noise_frac_range=(noise_frac, noise_frac),
+        target_piece_len=target_piece_len, bbox_pad=bbox_pad)
+
+
+def generate_perturbation_suite_at_total_ratio(base_segments, wall_ids, seed: int,
+                                               n_perturb: int, total_frac: float,
+                                               **kwargs) -> list:
+    """`--sweep`'s per-ratio-point suite: `n_perturb` perturbations at a FIXED
+    `total_frac` (WHICH walls/where noise lands still varies per child seed --
+    `derive_seeds`, same reproducibility contract as `generate_perturbation_suite`).
+    Item shape matches `generate_perturbation_suite`'s (`mode` is always `'structured'`
+    here -- the sweep is deliberately structured-only, the site-change model, see the
+    module docstring's CYCLE 11 block for why fragment-scatter is a different
+    measurement), plus `total_frac_target` for the report."""
+    child_seeds = derive_seeds(seed, n_perturb)
+    suite = []
+    for i, cs in enumerate(child_seeds):
+        segs, gt = perturb_wall_segments_structured_at_total_ratio(
+            base_segments, wall_ids, cs, total_frac, **kwargs)
+        suite.append({"index": i, "seed": int(seed), "child_seed": int(cs), "segments": segs,
+                      "ground_truth": gt, "mode": "structured", "total_frac_target": float(total_frac)})
+    return suite
+
+
 def derive_seeds(seed: int, n: int) -> list:
     """n independent child seeds from one base seed via numpy's SeedSequence.spawn
     (reproducible AND statistically independent across suite members -- unlike
@@ -1298,29 +1442,28 @@ def verify_hold_gate(cases: list, ambiguous_fixture: dict) -> dict:
             "ok": bool(fixture_ok and not violations)}
 
 
-def _run_d2_gate_single(seed: int, n_perturb: int, perturb_mode: str) -> dict:
-    """Runs the full D2 gate for ONE perturbation model: builds the dev-core STAIR
-    harness (4 legs / 3 corners / 5 doors, unambiguous), DENSIFIES its wall segments
-    with wall-id tracking (Cycle 7 item (A) + Cycle 11's `wall_ids` -- verified as a
-    no-op on the clean skeleton and on single-fragment removal BEFORE anything is
-    perturbed), perturbs the densified WALL SEGMENTS ONLY `n_perturb` times using
-    `perturb_mode` (`'structured'` or `'fragment'`, QA's seeded generators, Section 2 /
-    2b -- doors are held fixed, see the module docstring), matches each perturbed plan
-    against the SAME walk (generated once, from the UNPERTURBED plan's known true
-    transform -- the perturbation simulates a stale/drifted DRAWING or a real site
-    CHANGE never redrawn, not a different walk), and evaluates all three D2 items
-    (item (2)'s denominator per Cycle 7 item (B), see `classify_changed_segments` /
-    `compute_outlier_recall`; the new failure-reason breakdown per Cycle 11, see
-    `failure_reason_breakdown`).
+def _build_d2_harness_context() -> dict:
+    """CYCLE 12: harness build factored out of `_run_d2_gate_single` so `--sweep` (many
+    (ratio, seed) points) can reuse ONE build instead of repeating it per point -- pure
+    performance refactor, ZERO behaviour change: this is EXACTLY the sequence
+    `_run_d2_gate_single` ran inline before this cycle (still runs, unchanged, for every
+    call the default D2 gate path makes -- see `_run_d2_gate_single` below, now a thin
+    wrapper around this + `_evaluate_suite`). Builds the dev-core STAIR harness (4 legs /
+    3 corners / 5 doors, unambiguous), DENSIFIES its wall segments with wall-id tracking
+    (Cycle 7 item (A) + Cycle 11's `wall_ids` -- verified as a no-op on the clean
+    skeleton and on single-fragment removal BEFORE anything is perturbed), and confirms
+    the UNPERTURBED plan recovers its own known-true transform exactly. Deterministic --
+    no seed argument; none of this depends on which perturbation seed will later be
+    evaluated against it (`assert_single_fragment_removal_is_graceful`'s OWN internal
+    probe seed defaults to 0, unrelated to any outer `--seed`, unchanged from before this
+    cycle).
 
-    Raises ImportError (matcher/tests-harness missing) or RuntimeError (the density
-    pass changed the skeleton it should have left untouched, the single-fragment-
-    removal regression probe found a topology collapse, or the harness's OWN
-    zero-perturbation baseline was not recovered exactly) -- the caller (`main`) turns
-    any of these into exit 2, never a fabricated verdict."""
-    if perturb_mode not in ("structured", "fragment"):
-        raise ValueError(f"_run_d2_gate_single: perturb_mode must be 'structured' or "
-                         f"'fragment', got {perturb_mode!r}")
+    Raises ImportError (matcher/tests-harness missing) or RuntimeError (the density pass
+    changed the skeleton it should have left untouched, the single-fragment-removal
+    regression probe found a topology collapse, or the harness's OWN zero-perturbation
+    baseline was not recovered exactly) -- same conditions, same exceptions, as
+    `_run_d2_gate_single` raised inline before this cycle; the caller (`main` /
+    `run_sweep`) turns either into exit 2, never a fabricated verdict."""
     cm, ps, tcm, tps = _load_d2_harness()
 
     raw_segments = tcm._corridor_walls(tcm.STAIR)                        # (10,2,2) m -- dev-core's own fixture
@@ -1360,12 +1503,36 @@ def _run_d2_gate_single(seed: int, n_perturb: int, perturb_mode: str) -> dict:
             "refusing to evaluate perturbed cases against a harness that does not even "
             "pass its own zero-perturbation baseline")
 
-    if perturb_mode == "fragment":
-        suite = generate_perturbation_suite(base_segments, seed, n_perturb, mode="fragment")
-    else:
-        suite = generate_perturbation_suite(base_segments, seed, n_perturb, mode="structured",
-                                            wall_ids=wall_ids)
     rev_by_index = {e["index"]: e for e in cm.recon_events(traj, door_s=door_s)}
+    fallback_leg_lat_tol = max(float(cm.TOL_FLOOR["leg_lat"]),
+                               float(cm.TOL_PER_WIDTH["leg_lat"]) * float(tcm.W))
+
+    return {"cm": cm, "ps": ps, "tcm": tcm, "tps": tps,
+            "raw_segments": raw_segments, "plan_doors": plan_doors,
+            "base_segments": base_segments, "wall_ids": wall_ids,
+            "density_check": density_check, "single_removal_check": single_removal_check,
+            "tf_true": tf_true, "traj": traj, "plan_walk": plan_walk, "door_s": door_s,
+            "offset_max": offset_max,
+            "clean_baseline": {"status": clean_res.get("status"), "within_d2": clean_ok,
+                               "detail": clean_detail},
+            "rev_by_index": rev_by_index, "fallback_leg_lat_tol": fallback_leg_lat_tol}
+
+
+def _evaluate_suite(ctx: dict, suite: list) -> dict:
+    """CYCLE 12: the per-suite matching + scoring tail of `_run_d2_gate_single`, factored
+    out so `--sweep` can call it once per (ratio, seed) point against the ONE shared
+    `ctx` (`_build_d2_harness_context`). UNCHANGED math/logic from what
+    `_run_d2_gate_single` ran inline before this cycle -- matches every case in `suite`
+    against `ctx`'s fixed walk, then runs the SAME `compute_success_rate` /
+    `failure_reason_breakdown` / `classify_changed_segments` / `compute_outlier_recall` /
+    `build_ambiguous_fixture` / `verify_hold_gate` sequence. Returns the tail half of
+    `_run_d2_gate_single`'s result dict (`case_summaries`, `contract_violations`,
+    `success`, `failure_reasons`, `outlier_recall`, `hold`,
+    `gate1_ok`/`gate2_ok`/`gate3_ok`/`gate_ok`) -- `_run_d2_gate_single` merges this with
+    `ctx`'s harness-level fields to reproduce its EXACT pre-cycle-12 return shape."""
+    ps, cm = ctx["ps"], ctx["cm"]
+    plan_doors, traj, door_s = ctx["plan_doors"], ctx["traj"], ctx["door_s"]
+
     contract_violations = []
     cases = []
     for item in suite:
@@ -1383,21 +1550,17 @@ def _run_d2_gate_single(seed: int, n_perturb: int, perturb_mode: str) -> dict:
                       "perturbed_segments": segs, "ground_truth": item["ground_truth"],
                       "result": res, "error": err})
 
-    succ = compute_success_rate(cases, tf_true, offset_max)
+    succ = compute_success_rate(cases, ctx["tf_true"], ctx["offset_max"])
     transform_confirmed_indices = {d["index"] for d in succ["detail"] if d["outcome"] == "ok_within_d2"}
     failure_reasons = failure_reason_breakdown(succ)
 
-    fallback_leg_lat_tol = max(float(cm.TOL_FLOOR["leg_lat"]),
-                               float(cm.TOL_PER_WIDTH["leg_lat"]) * float(tcm.W))
-    classification = classify_changed_segments(cases, base_segments, plan_walk,
-                                               fallback_leg_lat_tol=fallback_leg_lat_tol)
-    recall = compute_outlier_recall(cases, base_segments, classification, rev_by_index,
+    classification = classify_changed_segments(cases, ctx["base_segments"], ctx["plan_walk"],
+                                               fallback_leg_lat_tol=ctx["fallback_leg_lat_tol"])
+    recall = compute_outlier_recall(cases, ctx["base_segments"], classification, ctx["rev_by_index"],
                                     ps.apply_candidate_transform, transform_confirmed_indices)
-    ambiguous = build_ambiguous_fixture(cm, ps, tcm, tps)
+    ambiguous = build_ambiguous_fixture(cm, ps, ctx["tcm"], ctx["tps"])
     hold = verify_hold_gate(cases, ambiguous)
 
-    #: per-perturbation summary (JSON-safe scalars only -- for --json / the cycle
-    #: report; NOT used by the gate math itself, which reads `cases` directly).
     case_summaries = []
     for c in cases:
         r = c.get("result")
@@ -1416,17 +1579,49 @@ def _run_d2_gate_single(seed: int, n_perturb: int, perturb_mode: str) -> dict:
     gate1_ok = succ["rate"] >= GATE_SUCCESS_RATE_MIN
     gate2_ok = recall["recall"] is not None and recall["recall"] >= GATE_OUTLIER_RECALL_MIN
     gate3_ok = hold["ok"]
-    return {"n_perturb": n_perturb, "seed": seed, "perturb_mode": perturb_mode,
-            "density_check": density_check,
-            "single_removal_check": single_removal_check,
-            "clean_baseline": {"status": clean_res.get("status"), "within_d2": clean_ok,
-                               "detail": clean_detail},
-            "case_summaries": case_summaries,
-            "contract_violations": contract_violations,
+    return {"cases": cases, "case_summaries": case_summaries, "contract_violations": contract_violations,
             "success": succ, "failure_reasons": failure_reasons,
             "outlier_recall": recall, "hold": hold,
             "gate1_ok": gate1_ok, "gate2_ok": gate2_ok, "gate3_ok": gate3_ok,
             "gate_ok": bool(gate1_ok and gate2_ok and gate3_ok)}
+
+
+def _run_d2_gate_single(seed: int, n_perturb: int, perturb_mode: str) -> dict:
+    """Runs the full D2 gate for ONE perturbation model: builds the dev-core STAIR
+    harness (`_build_d2_harness_context`), perturbs the densified WALL SEGMENTS ONLY
+    `n_perturb` times using `perturb_mode` (`'structured'` or `'fragment'`, QA's seeded
+    generators, Section 2 / 2b -- doors are held fixed, see the module docstring),
+    matches each perturbed plan against the SAME walk, and evaluates all three D2 items
+    (`_evaluate_suite`). CYCLE 12: now a thin wrapper -- harness build and per-case
+    scoring both moved to `_build_d2_harness_context` / `_evaluate_suite` so `--sweep`
+    can reuse them; this function's OWN return shape and every value in it are BYTE-
+    IDENTICAL to before this cycle for the same (seed, n_perturb, perturb_mode) -- see
+    the `--n-perturb 20 --seed 7` no-regression check, cycle report.
+
+    Raises ImportError / RuntimeError exactly as `_build_d2_harness_context` does -- the
+    caller (`main`) turns either into exit 2, never a fabricated verdict."""
+    if perturb_mode not in ("structured", "fragment"):
+        raise ValueError(f"_run_d2_gate_single: perturb_mode must be 'structured' or "
+                         f"'fragment', got {perturb_mode!r}")
+    ctx = _build_d2_harness_context()
+
+    if perturb_mode == "fragment":
+        suite = generate_perturbation_suite(ctx["base_segments"], seed, n_perturb, mode="fragment")
+    else:
+        suite = generate_perturbation_suite(ctx["base_segments"], seed, n_perturb, mode="structured",
+                                            wall_ids=ctx["wall_ids"])
+    ev = _evaluate_suite(ctx, suite)
+
+    return {"n_perturb": n_perturb, "seed": seed, "perturb_mode": perturb_mode,
+            "density_check": ctx["density_check"],
+            "single_removal_check": ctx["single_removal_check"],
+            "clean_baseline": ctx["clean_baseline"],
+            "case_summaries": ev["case_summaries"],
+            "contract_violations": ev["contract_violations"],
+            "success": ev["success"], "failure_reasons": ev["failure_reasons"],
+            "outlier_recall": ev["outlier_recall"], "hold": ev["hold"],
+            "gate1_ok": ev["gate1_ok"], "gate2_ok": ev["gate2_ok"], "gate3_ok": ev["gate3_ok"],
+            "gate_ok": ev["gate_ok"]}
 
 
 def run_d2_gate(seed: int, n_perturb: int, perturb_mode: str = "structured") -> dict:
@@ -1447,6 +1642,94 @@ def run_d2_gate(seed: int, n_perturb: int, perturb_mode: str = "structured") -> 
                 "structured": g_structured, "fragment": g_fragment,
                 "gate_ok": bool(g_structured["gate_ok"] and g_fragment["gate_ok"])}
     return _run_d2_gate_single(seed, n_perturb, perturb_mode)
+
+
+def run_sweep(ratios=SWEEP_RATIOS_DEFAULT, seeds=SWEEP_SEEDS_DEFAULT,
+             n_perturb: int = GATE_N_PERTURB_DEFAULT) -> dict:
+    """CYCLE 12 (`--sweep`): the DEGRADATION CURVE -- success-rate / outlier-recall /
+    HOLD-violation-count measured across the TOTAL-change-ratio axis (Section 2c),
+    `structured` mode only (the sweep is about the site-change model this team's DoD
+    targets, not drawing-noise -- see Section 2c / the module docstring's CYCLE 11
+    block), at each of `ratios` x each of `seeds`. Reuses ONE `_build_d2_harness_context`
+    across every point (deterministic, seed-independent -- see that function's own
+    docstring) instead of rebuilding it `len(ratios)*len(seeds)` times.
+
+    THIS DOES NOT REDEFINE OR RELAX THE D2 GATE. `GATE_SUCCESS_RATE_MIN` /
+    `GATE_OUTLIER_RECALL_MIN` (90%/80%) are read UNCHANGED for the per-point
+    gate1_ok/gate2_ok/gate3_ok flags reported alongside each point (so a reader can see
+    exactly where the curve crosses the SAME thresholds `run_d2_gate` uses) -- but
+    `run_sweep`'s OWN CLI exit-code contract (see `_run_sweep_cli`) is a MEASUREMENT, not
+    a pass/fail gate: a low-ratio point failing is exactly as reportable a result as a
+    high-ratio one failing, per this cycle's instruction to measure the whole curve,
+    never to declare only one point in isolation.
+
+    Returns {"ratios", "seeds", "n_perturb", "n_base_fragments", "alloc_weights",
+    "clean_baseline", "points": [...]}; each point carries `per_seed` (one dict per seed
+    -- achieved ratio, success rate, recall, ok_outside_d2 count, HOLD-violation count,
+    failure-reason breakdown, gate1/2/3_ok) PLUS the seed-aggregated mean/min/max the
+    report table reads (`success_rate_mean` etc.) -- both levels always present,
+    per-seed detail never collapsed away."""
+    ctx = _build_d2_harness_context()
+    base_segments, wall_ids = ctx["base_segments"], ctx["wall_ids"]
+    n_base = len(base_segments)
+
+    points = []
+    for ratio in ratios:
+        per_seed = []
+        for seed in seeds:
+            suite = generate_perturbation_suite_at_total_ratio(base_segments, wall_ids, seed,
+                                                                n_perturb, ratio)
+            ev = _evaluate_suite(ctx, suite)
+            achieved = []
+            for item in suite:
+                p = item["ground_truth"]["params"]
+                achieved.append((p["n_removed"] + p["n_shifted"] + p["n_noise"]) / n_base)
+            succ = ev["success"]
+            recall = ev["outlier_recall"]
+            per_seed.append({
+                "seed": int(seed), "ratio_target": float(ratio),
+                "achieved_ratio_mean": float(np.mean(achieved)),
+                "achieved_ratio_min": float(np.min(achieved)),
+                "achieved_ratio_max": float(np.max(achieved)),
+                "n": succ["n"], "success_rate": succ["rate"],
+                "n_ok_within_d2": succ["n_ok_within_d2"], "n_ok_outside_d2": succ["n_ok_outside_d2"],
+                "n_hold": succ["n_hold"], "n_reject": succ["n_reject"], "n_error": succ["n_error"],
+                "recall": recall["recall"], "recall_n_detected": recall["n_detected"],
+                "recall_n_total": recall["n_total"],
+                "hold_violations": len(ev["hold"]["perturbation_invariant_violations"]),
+                "failure_reasons": ev["failure_reasons"],
+                "gate1_ok": ev["gate1_ok"], "gate2_ok": ev["gate2_ok"], "gate3_ok": ev["gate3_ok"],
+                "gate_ok": ev["gate_ok"],
+            })
+
+        rates = [s["success_rate"] for s in per_seed]
+        recalls = [s["recall"] for s in per_seed if s["recall"] is not None]
+        merged_failure_reasons: dict = {}
+        for s in per_seed:
+            for k, v in s["failure_reasons"].items():
+                merged_failure_reasons[k] = merged_failure_reasons.get(k, 0) + v
+        points.append({
+            "ratio_target": float(ratio), "per_seed": per_seed,
+            "achieved_ratio_mean": float(np.mean([s["achieved_ratio_mean"] for s in per_seed])),
+            "success_rate_mean": float(np.mean(rates)), "success_rate_min": float(np.min(rates)),
+            "success_rate_max": float(np.max(rates)),
+            "recall_mean": (float(np.mean(recalls)) if recalls else None),
+            "recall_min": (float(np.min(recalls)) if recalls else None),
+            "recall_max": (float(np.max(recalls)) if recalls else None),
+            "recall_n_seeds_scoreable": len(recalls), "recall_n_seeds_total": len(per_seed),
+            "n_ok_outside_d2_total": sum(s["n_ok_outside_d2"] for s in per_seed),
+            "hold_violations_total": sum(s["hold_violations"] for s in per_seed),
+            "failure_reasons_merged": merged_failure_reasons,
+            "all_seeds_gate1_ok": all(s["gate1_ok"] for s in per_seed),
+            "all_seeds_gate2_ok": all(s["gate2_ok"] for s in per_seed),
+            "all_seeds_gate3_ok": all(s["gate3_ok"] for s in per_seed),
+        })
+
+    return {"ratios": [float(r) for r in ratios], "seeds": [int(s) for s in seeds],
+            "n_perturb": int(n_perturb), "n_base_fragments": n_base,
+            "alloc_weights": {"w_remove": SWEEP_ALLOC_WEIGHTS[0], "w_shift": SWEEP_ALLOC_WEIGHTS[1],
+                             "w_noise": SWEEP_ALLOC_WEIGHTS[2]},
+            "clean_baseline": ctx["clean_baseline"], "points": points}
 
 
 # ==========================================================================================
@@ -1479,7 +1762,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "skips suite generation and the D2 gate")
     ap.add_argument("--json", type=Path, default=None,
                     help="write the generated suite (segments + ground_truth per perturbation) plus the "
-                         "D2 gate result (if it ran) as JSON")
+                         "D2 gate result (if it ran) as JSON (or, with --sweep, the sweep result)")
+    ap.add_argument("--sweep", action="store_true",
+                    help="CYCLE 12: run the DEGRADATION-CURVE sweep (total-change-ratio axis, "
+                         "structured mode only, --sweep-seeds x --n-perturb per ratio point) INSTEAD OF "
+                         "the default single-suite D2 gate; prints a table. Does NOT change any gate "
+                         "definition/threshold (GATE_SUCCESS_RATE_MIN/GATE_OUTLIER_RECALL_MIN read "
+                         "unchanged) -- a measurement, not a new judgement. Every other flag above "
+                         "(--upload/--plan-dxf/--perturb-mode/--selftest-only) is IGNORED with --sweep "
+                         "except --n-perturb/--seed's sibling --json; without --sweep this flag's mere "
+                         "existence changes nothing (see run_sweep/_print_sweep_report/_run_sweep_cli).")
+    ap.add_argument("--sweep-ratios", type=str, default=None,
+                    help="comma-separated total-change-ratio points (fractions of the densified base "
+                         "fragment count), e.g. '0.05,0.10,0.15,0.20,0.30,0.40,0.50' (the default). "
+                         "Only used with --sweep.")
+    ap.add_argument("--sweep-seeds", type=str, default=None,
+                    help="comma-separated seeds, e.g. '7,42,123' (the default -- at least 3 recommended "
+                         "so mean AND range are meaningful, per this cycle's instruction). Only used "
+                         "with --sweep.")
     return ap
 
 
@@ -1562,9 +1862,89 @@ def _print_single_gate_report(gate: dict) -> None:
           f"③{'PASS' if gate['gate3_ok'] else 'FAIL'})")
 
 
+def _print_sweep_report(sweep: dict) -> None:
+    """Prints the degradation-curve TABLE (총변경비율 x 성공률/recall/실패사유/HOLD위반/
+    ok_outside_d2), per instruction "표를 반드시 포함" -- then the same table's per-seed
+    rows (mean AND range come from these, never reported alone)."""
+    w = sweep["alloc_weights"]
+    print(f"[sweep] 열화곡선 측정 (게이트 정의/임계 불변, mode=structured 전용): "
+          f"seeds={sweep['seeds']} n_perturb(지점당 seed당)={sweep['n_perturb']} "
+          f"base_fragments={sweep['n_base_fragments']}")
+    print(f"[sweep] 배분 규칙(Section 2c, QA 기본 범위의 중앙값 비율 그대로 -- 범위 자체는 미변경): "
+          f"총변경비율 T -> remove_frac=T*{w['w_remove']:.4f}(of N), "
+          f"noise_frac=T*{w['w_noise']:.4f}(of N), "
+          f"shift_frac(of kept)=T*{w['w_shift']:.4f}*N/kept")
+    cb = sweep["clean_baseline"]
+    print(f"[sweep] 무섭동 기준해: status={cb['status']} within_D2={cb['within_d2']}")
+    print("")
+    header = (f"{'목표T':>6} {'실측T평균':>9} | {'성공률 평균(범위)':>20} | {'recall 평균(범위)':>26} | "
+             f"{'ok_outside_d2':>13} | {'HOLD위반':>8} | {'게이트①②③':>10} | 실패사유 분포(3seed 합산)")
+    print(header)
+    print("-" * len(header))
+    for p in sweep["points"]:
+        recall_str = ("N/A(scoreable 0)" if p["recall_mean"] is None else
+                      f"{p['recall_mean']*100:5.1f}%({p['recall_min']*100:.0f}-{p['recall_max']*100:.0f}%)"
+                      f"[{p['recall_n_seeds_scoreable']}/{p['recall_n_seeds_total']}seed]")
+        gates = (f"{'P' if p['all_seeds_gate1_ok'] else 'F'}"
+                f"{'P' if p['all_seeds_gate2_ok'] else 'F'}"
+                f"{'P' if p['all_seeds_gate3_ok'] else 'F'}")
+        row = (f"{p['ratio_target']*100:5.0f}% {p['achieved_ratio_mean']*100:8.1f}% | "
+              f"{p['success_rate_mean']*100:5.1f}%({p['success_rate_min']*100:.0f}-{p['success_rate_max']*100:.0f}%) | "
+              f"{recall_str:>26} | "
+              f"{p['n_ok_outside_d2_total']:>13} | {p['hold_violations_total']:>8} | "
+              f"{gates:>10} | {json.dumps(p['failure_reasons_merged'], ensure_ascii=False)}")
+        print(row)
+    print("")
+    print("[sweep] 지점별 seed 상세 (위 평균/범위의 근거, per-seed 원값):")
+    for p in sweep["points"]:
+        for s in p["per_seed"]:
+            recall_s = "N/A" if s["recall"] is None else f"{s['recall']*100:.1f}%"
+            print(f"  T={p['ratio_target']*100:.0f}% seed={s['seed']:>4} 실측T={s['achieved_ratio_mean']*100:.1f}% "
+                  f"({s['achieved_ratio_min']*100:.1f}-{s['achieved_ratio_max']*100:.1f}%) "
+                  f"성공률={s['success_rate']*100:.1f}%({s['n_ok_within_d2']}/{s['n']}) "
+                  f"ok_outside_d2={s['n_ok_outside_d2']} recall={recall_s} "
+                  f"HOLD위반={s['hold_violations']} 실패사유={json.dumps(s['failure_reasons'], ensure_ascii=False)}")
+
+
+def _run_sweep_cli(args) -> int:
+    """CLI dispatch for `--sweep` (CYCLE 12) -- entirely SEPARATE from the default
+    single-suite D2 gate path in `main` (`main` calls this and returns IMMEDIATELY, before
+    touching `--plan-dxf`/`--selftest-only`/the default `run_d2_gate` call at all, so
+    `--n-perturb 20 --seed 7` WITHOUT `--sweep` is provably unaffected by this function's
+    existence -- see the cycle report's no-regression check). NOT a pass/fail gate --
+    exits 0 once the sweep is MEASURED (a low- or high-ratio point failing
+    GATE_SUCCESS_RATE_MIN/GATE_OUTLIER_RECALL_MIN is exactly as valid and reportable a
+    measurement as one passing -- that is the whole point of a degradation curve); exits
+    2 only if the harness itself could not be built/evaluated (ImportError/RuntimeError
+    from `_build_d2_harness_context`, same conditions `run_d2_gate` treats as "not
+    evaluable" -- never a fabricated pass)."""
+    ratios = (tuple(float(x) for x in args.sweep_ratios.split(","))
+             if args.sweep_ratios else SWEEP_RATIOS_DEFAULT)
+    seeds = (tuple(int(x) for x in args.sweep_seeds.split(","))
+            if args.sweep_seeds else SWEEP_SEEDS_DEFAULT)
+    print(f"[sweep] ratios={list(ratios)} seeds={list(seeds)} n_perturb={args.n_perturb} "
+          f"(--upload/--plan-dxf/--perturb-mode/--selftest-only 무시됨 -- --sweep 전용 경로)")
+    try:
+        sweep = run_sweep(ratios=ratios, seeds=seeds, n_perturb=args.n_perturb)
+    except ImportError as e:
+        print(f"[sweep 평가 불가] {e}", file=sys.stderr)
+        return 2
+    except RuntimeError as e:
+        print(f"[sweep 평가 불가] {e}", file=sys.stderr)
+        return 2
+    _print_sweep_report(sweep)
+    if args.json is not None:
+        args.json.write_text(json.dumps(sweep, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"sweep 결과 written: {args.json}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = build_arg_parser()
     args = ap.parse_args(argv)
+
+    if args.sweep:
+        return _run_sweep_cli(args)
 
     if args.plan_dxf is not None:
         if not args.plan_dxf.exists():
