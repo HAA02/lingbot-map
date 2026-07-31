@@ -417,6 +417,129 @@ class TestWhatSteersThePlacement(_MatchAssertions):
 
 
 # --------------------------------------------------------------------------------------
+# 2c — P2: what the SEED can see (a second corner correspondence)
+# --------------------------------------------------------------------------------------
+
+def _truncated_leg_skeleton(cut_x: float = 5.36) -> dict:
+    """The staircase with leg B's corridor CUT SHORT at x = `cut_x`: both of its walls
+    stop there, so the drawing keeps only a stub of the leg the walk crosses and LOSES
+    the corner at (18.09, 11.09) entirely. Everything else — legs A/C/D, the two
+    surviving corners, all five doors — is untouched.
+
+    This is the site-change shape the qa sweep kept producing and the one the one-corner
+    seed cannot see past: `_plan_approaches` measures scale by how much plan leg is
+    AVAILABLE past a node, and a cut leg reports less than the walk actually covered."""
+    segs = _corridor_walls(STAIR).copy()
+    for i in (1, 5):                    # leg B's two walls: left[1]->left[2], right[1]->right[2]
+        segs[i, 1, 0] = float(cut_x)
+    return ps.corridor_skeleton(segs, doors=list(STAIR_PLAN_DOORS))
+
+
+class TestSecondCornerSeed(_MatchAssertions):
+    """A CUT plan leg makes the one-corner seed's scale wrong, and no local search over
+    scale can repair it (moving the scale also moves the placement — `_refine`'s measured
+    limit). Two corner NODES, on the other hand, are an observable that does not care
+    where a leg was cut, and they pin the scale AND the placement in one step."""
+
+    def setUp(self):
+        self.tf, self.traj, self.plan_walk, self.ds = _make_walk(STAIR, STAIR_WALK_DOORS)
+        self.skel = _truncated_leg_skeleton()
+
+    def _run(self, pair_seeds: bool) -> dict:
+        res = cm.coarse_match(self.skel, self.traj, door_s=self.ds, pair_seeds=pair_seeds)
+        self.assert_contract(res, self.skel, self.traj, self.ds)
+        self.assertEqual(res["status"], "ok", (res["hold_reason"], res["margin"]))
+        return res
+
+    def _offset(self, res: dict) -> float:
+        return float(np.linalg.norm(np.asarray(res["best"]["transform"]["translation"])
+                                    - np.asarray(self.tf["translation"])))
+
+    def test_the_fixture_really_lost_the_leg_and_its_corner(self):
+        """Guard: if this stops holding, the two tests below stop testing anything."""
+        pev = ps.plan_events(self.skel)
+        legs = {e["id"]: e for e in pev if e["kind"] == "leg"}
+        self.assertEqual(len(legs), 4, legs)
+        cut = min(legs.values(), key=lambda e: e["length"])
+        self.assertLess(cut["length"], 5.0, cut)          # leg B, 17.18 m -> ~4.45 m
+        corners = [np.asarray(e["xy"]) for e in pev if e["kind"] == "corner"]
+        self.assertEqual(len(corners), 2, corners)        # the middle corner is gone
+        self.assertTrue(all(np.linalg.norm(c - np.array([18.09, 11.09])) > 1.0
+                            for c in corners), corners)
+
+    def test_a_second_corner_recovers_what_the_cut_leg_hid(self):
+        """MEASURED, and the reason this seed exists: on the cut plan the one-corner seed
+        confirms a placement that is 0.62 m and 2.4 % of s_f away from the truth, while the
+        second-corner seed lands EXACTLY on it. Both are 'ok' here — the point is not that
+        the old answer was refused, it is that the right answer was never GENERATED."""
+        off_res, on_res = self._run(False), self._run(True)
+        off, on = self._offset(off_res), self._offset(on_res)
+        self.assertGreater(off, 0.3, off_res["best"]["transform"])
+        self.assertLess(on, 0.01, on_res["best"]["transform"])
+        self.assert_transform_close(on_res["best"]["transform"], self.tf,
+                                    yaw_tol=0.05, scale_rel=2e-3, offset=0.01)
+        self.assertGreater(on_res["best"]["score"], off_res["best"]["score"])
+        # ...and it is still a decided answer, not a tie bought by adding seeds.
+        self.assertGreaterEqual(on_res["margin"], on_res["gates"]["margin_min"])
+
+    def test_the_winner_names_the_second_correspondence_it_used(self):
+        res = self._run(True)
+        self.assertGreater(res["info"]["n_pair_seeds"], 0, res["info"])
+        self.assertEqual(res["best"]["method"].count("->"), 3, res["best"]["method"])
+
+    def test_pair_seeds_change_nothing_but_attribution_on_the_clean_plan(self):
+        """On a drawing that agrees with the field the extra seeds must not move the
+        answer, and MEASURED they do not: every candidate — transform, score, inliers,
+        outliers — and the margin come out bit-identical, and the ONLY difference in the
+        whole result is that one tie-scored candidate is now credited to the pair seed
+        that also found it (`method`). The clean plan's one-corner scale already IS the
+        corner-to-corner one, so a pair adds information exactly when a leg end moved."""
+        skel = _stair_skeleton()
+        off = cm.coarse_match(skel, self.traj, door_s=self.ds, pair_seeds=False)
+        on = cm.coarse_match(skel, self.traj, door_s=self.ds, pair_seeds=True)
+        self.assertEqual((off["status"], off["margin"]), (on["status"], on["margin"]))
+        self.assertEqual(len(off["candidates"]), len(on["candidates"]))
+        strip = lambda c: json.dumps({k: v for k, v in c.items() if k != "method"},
+                                     sort_keys=True)
+        for a, b in zip(off["candidates"], on["candidates"]):
+            self.assertEqual(strip(a), strip(b))
+        self.assertEqual(off["best"]["method"], on["best"]["method"])
+
+    def test_two_corners_solve_the_scales_from_a_badly_wrong_seed(self):
+        """The solver itself (`_scales_from_pair`), away from the ranking: handed scales
+        that are HALF and DOUBLE the truth, one L-shaped corner pair returns the truth to
+        6 decimals. That is what 'a second corner is a measurement, not a bound' means."""
+        R = cm._prep_recon(cm.recon_events(self.traj, door_s=self.ds))
+        chi = np.array([float(self.tf["chi"]), 1.0])
+        rc0, rc2 = R["corner"][0], R["corner"][2]
+        u_f = cm._unit(R["leg"][rc0["legs"][0]]["dir"] * chi)
+        got = cm._scales_from_pair(
+            self.tf["theta_deg"], u_f, np.array([0.0, 1.0]),
+            (np.asarray(rc2["xy"]) - np.asarray(rc0["xy"])) * chi,
+            np.asarray(STAIR[3], dtype=np.float64) - np.asarray(STAIR[1], dtype=np.float64),
+            0.5 * self.tf["s_f"], 2.0 * self.tf["s_h"])
+        self.assertAlmostEqual(got[0], self.tf["s_f"], places=6)
+        self.assertAlmostEqual(got[1], self.tf["s_h"], places=6)
+
+    def test_a_pair_on_one_straight_leg_measures_one_axis_and_says_so(self):
+        """Two corners joined by a SINGLE straight leg observe the scale along that leg
+        only. The honest answer is to take that one and KEEP the seed's other value
+        (PAIR_MIN_PROJ) — not to divide by a near-zero projection and invent a number."""
+        R = cm._prep_recon(cm.recon_events(self.traj, door_s=self.ds))
+        chi = np.array([float(self.tf["chi"]), 1.0])
+        rc0, rc1 = R["corner"][0], R["corner"][1]
+        u_f = cm._unit(R["leg"][rc0["legs"][0]]["dir"] * chi)
+        seed_f = 0.5 * self.tf["s_f"]
+        got = cm._scales_from_pair(
+            self.tf["theta_deg"], u_f, np.array([0.0, 1.0]),
+            (np.asarray(rc1["xy"]) - np.asarray(rc0["xy"])) * chi,
+            np.asarray(STAIR[2], dtype=np.float64) - np.asarray(STAIR[1], dtype=np.float64),
+            seed_f, 2.0 * self.tf["s_h"])
+        self.assertAlmostEqual(got[0], seed_f, places=9)          # untouched, not invented
+        self.assertAlmostEqual(got[1], self.tf["s_h"], places=6)  # measured exactly
+
+
+# --------------------------------------------------------------------------------------
 # 3 — SCENARIO 2: perturbed drawing -> recovered anyway, changes reported as outliers
 # --------------------------------------------------------------------------------------
 
