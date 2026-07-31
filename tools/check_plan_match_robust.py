@@ -43,6 +43,65 @@ Section 3); this is the short version for anyone diffing the module docstring.
     are ALWAYS printed, never silently dropped from the denominator -- see Section 3.
 ===========================================================================================
 
+===========================================================================================
+CYCLE 11 -- PERTURBATION MODEL SPLIT: STRUCTURED (new default) vs FRAGMENT (Cycle-7's
+original model, kept, not deleted, selectable). Measured (main session, cycle 11 order):
+Cycle 7's harness-density fix (item (A) above) fed the matcher REMOVE/SHIFT draws that
+scatter across ALL ~232 post-densify fragments independently -- 10-30% of 232 = 23-70
+fragments, picked without any notion of which of the STAIR fixture's 10 original walls each
+one came from. A 30% removal at that granularity puts a hole in EVERY wall of the fixture at
+once. That is a model of drawing/scan INCOMPLETENESS (missing or noisy fragments scattered
+everywhere), not the team's actual DoD target -- "현장이 변경됐는데 BIM에 반영 안 된 상태"
+(the site changed but the drawing was never updated). A real as-built change is a WHOLE
+torn-down partition, a WHOLE relocated wall, or a WHOLE new partition -- structurally
+CONTIGUOUS, never a scatter of unrelated fragments across every wall simultaneously.
+
+`perturb_wall_segments` (Section 2) is UNCHANGED this cycle and NOT deleted (per
+instruction) -- it still produces exactly that fragment-scatter model, now reachable as
+`--perturb-mode fragment`. Section 2b (`perturb_wall_segments_structured`) is the NEW
+DEFAULT (`--perturb-mode structured`): it draws from the EXACT SAME QA-owned budget ranges
+as Section 2 (`REMOVE_FRAC_RANGE` / `SHIFT_FRAC_RANGE` / `SHIFT_DIST_RANGE` /
+`NOISE_FRAC_RANGE` -- none redefined, none relaxed; only the EDIT UNIT changed, per
+instruction "바꾸는 것은 어디에 분포하는가 이지 얼마나가 아니다"). The edit unit becomes a
+WHOLE wall: `densify_wall_segments_with_ids` (Section 1c, new) tags every post-densify
+fragment with which of the ORIGINAL (pre-densify) wall rows it was split from -- fragments
+of one original wall are CONTIGUOUS in the output array by construction (the densifier
+iterates input rows in order and emits all of one row's pieces before the next), so "a
+contiguous run within a wall" is just a contiguous slice of that row's own index range, no
+extra bookkeeping needed. With that tag:
+  REMOVE -- whole walls, removed entirely, in a random order, until the drawn 10-30% budget
+            is reached; only if the NEXT whole wall would overshoot it is that ONE wall cut
+            down to a single contiguous bite sized to land EXACTLY on the budget (so the
+            total removed COUNT matches `perturb_wall_segments`'s draw exactly -- same total
+            change quantity, per instruction -- while every removed unit is a whole wall or
+            one contiguous bite of one wall, never scattered fragments).
+  SHIFT  -- whole (surviving) walls, translated together by ONE shared vector per wall
+            (still 0.3-1.0 m, QA-owned, unchanged) -- a shifted wall stays a straight wall
+            at its new location, never an independently-drifted fragment cloud. Candidates
+            accumulate in random order until the shift budget is met or exceeded (a wall is
+            never split to land on it exactly -- an as-built wall does not partially drift),
+            so the achieved shift fraction is approximate, unlike remove's exact match;
+            always reported alongside the drawn target, never silently substituted.
+  ADD    -- exactly ONE new wall (one straight run of touching fragments, densified at the
+            SAME piece length as every real wall), sized so its fragment count matches the
+            drawn noise-fraction budget -- "새 벽 하나를 통째로 추가" (a room subdivision),
+            not many independent furniture-scale blips (Section 2's noise model, which stays
+            exactly as it was for `fragment` mode).
+
+`--perturb-mode both` runs BOTH suites (same seed, same n_perturb, each mode's OWN
+`derive_seeds` stream so the two suites are genuinely different draws, not the same draws
+reinterpreted) and reports both sets of ①②③ numbers SIDE BY SIDE, never averaged or merged
+-- they measure two different things (site-change robustness vs. drawing-noise robustness)
+and merging them would hide which one the matcher is actually failing. Thresholds (90%/80%)
+and every QA-owned budget range are UNCHANGED this cycle in BOTH modes -- this is a
+model/harness correction (Cycle 7 asked "what does a fragment-scatter model measure";
+Cycle 11 asks "what does it FAIL to measure, which is the team's actual DoD target"), not a
+threshold relaxation. Per repeated instruction across cycles 7 and 11: if `structured`
+STILL misses a gate, that is reported as a genuine matcher limitation (P2-Robust input,
+including the new failure-reason breakdown, `failure_reason_breakdown`), never papered over
+by loosening a threshold or a budget range.
+===========================================================================================
+
 PERTURBATION MODEL (operates on `scan2bim.dxf_plan.load_wall_segments`'s (N,2,2)
 metre format, whether the array came from a real DXF or a synthetic fixture, AFTER
 Section 1b's density pass has split it into many fragments per wall):
@@ -59,7 +118,10 @@ fixture keeps its doors fixed across every perturbation for that reason (see
 flat (N,2,2) array it is handed, fragment-by-fragment, with no notion of "which
 fragments belong to the same original wall" -- it stays generic over any DXF-shaped
 input, per this module's own design philosophy); only WHAT it is handed (Section 1b's
-denser base) changed.
+denser base) changed. Cycle 11 (see block above) adds a SECOND perturbation model,
+Section 2b, whose edit unit IS "which fragments belong to the same original wall" --
+selectable via `--perturb-mode {structured,fragment,both}` (default `structured`); the
+description above still applies verbatim to `fragment` mode / Section 2.
 
 BASE SYNTHETIC PLAN (Section 1, `synth_l_corridor_segments`): no real SXX/Gasan DXF
 exists in this repo. Confirmed by `find / -iname '*.dxf' -not -path '*/.git/*'` under
@@ -70,7 +132,7 @@ claim is AMBIGUOUS by construction without a door, so it is used for the CLI's
 generator self-test/demo, not for the D2 accuracy gate (see next paragraph for why the
 gate uses a different, imported fixture).
 
-D2 GATE FIXTURE (Section 3, `run_d2_gate` / `_load_d2_harness`): DELIBERATELY
+D2 GATE FIXTURE (Section 3, `run_d2_gate` / `_run_d2_gate_single`): DELIBERATELY
 DIFFERENT from Section 1's fixture, and DELIBERATELY imported from
 `tests/test_coarse_match.py` rather than re-derived, per the cycle-6 instruction to
 reuse that harness (still honoured this cycle). The STAIR corridor (4 legs / 3 corners
@@ -78,12 +140,15 @@ reuse that harness (still honoured this cycle). The STAIR corridor (4 legs / 3 c
 an unambiguous plan to be measuring ACCURACY under perturbation, not tie-breaking (the
 tie-breaking case, item (3) of the gate, uses a SEPARATE fixed fixture reused from
 `tests/test_plan_skeleton.py`'s 2-leg L instead, see `build_ambiguous_fixture`). This
-cycle, `run_d2_gate` runs `densify_wall_segments` on that harness's raw 10-segment
-`_corridor_walls(STAIR)` output BEFORE perturbing it -- see Section 1b / Section 3.
+cycle, `_run_d2_gate_single` runs `densify_wall_segments_with_ids` on that harness's raw
+10-segment `_corridor_walls(STAIR)` output BEFORE perturbing it -- see Section 1b/1c /
+Section 3 -- so BOTH perturbation models (structured and fragment) share the identical
+densified base plan; only the perturbation step differs.
 
 CLI:
     .venv/bin/python tools/check_plan_match_robust.py [--upload PATH] \\
-        [--plan-dxf PLAN.dxf] [--n-perturb 20] [--seed 0] [--selftest-only] [--json OUT.json]
+        [--plan-dxf PLAN.dxf] [--n-perturb 20] [--seed 0] \\
+        [--perturb-mode {structured,fragment,both}] [--selftest-only] [--json OUT.json]
 
 `--upload` is accepted but UNUSED by the D2 gate: no real recon-walk-from-upload
 extraction exists in this repo as of this cycle (that is separate P3 scope), and the
@@ -91,9 +156,14 @@ D2 gate needs a walk with a CONSTRUCTIVELY known correct answer to measure accur
 against, which only the synthetic harness provides (dev-core's own test suite is
 synthetic-only for the same reason, see its module docstring).
 
+`--perturb-mode` (Cycle 11, default `structured`) selects the perturbation model: see
+the CYCLE 11 block above. `both` runs and reports both models independently -- exit 0
+only if EVERY item of BOTH suites passes; the printed report always separates them.
+
 Exit codes: 0 = D2 gate PASS (success-rate AND outlier-recall AND ambiguous-HOLD all
-met), or `--selftest-only` PASS; 1 = a generator self-test failed, OR the D2 gate ran
-but one or more of its three items missed the threshold (stated on stderr with the
+met, for every mode run -- BOTH modes if `--perturb-mode both`), or `--selftest-only`
+PASS for every mode run; 1 = a generator self-test failed, OR the D2 gate ran but one or
+more of its three items missed the threshold in ANY mode run (stated on stderr with the
 measured number -- thresholds are never relaxed to make a number pass); 2 = the D2
 gate could not be evaluated at all (matcher or tests/ harness import failed, the
 harness's own zero-perturbation baseline was not recovered exactly, the density pass
@@ -247,6 +317,45 @@ def _piece_count(length: float, target: float = DENSIFY_TARGET_PIECE_LEN_M,
     return int(np.clip(round(length / target), min_pieces, max_pieces))
 
 
+def densify_wall_segments_with_ids(segments,
+                                   target_piece_len: float = DENSIFY_TARGET_PIECE_LEN_M,
+                                   min_pieces: int = DENSIFY_MIN_PIECES_PER_WALL,
+                                   max_pieces: int = DENSIFY_MAX_PIECES_PER_WALL) -> tuple:
+    """CYCLE 11 addition. Identical splitting logic to `densify_wall_segments` (same
+    output geometry, byte-for-byte -- `densify_wall_segments` now just delegates here and
+    drops the second return value), but ALSO returns a parallel `wall_ids` int64 array
+    (len == M, the output fragment count) giving, for every output fragment, the index
+    (0..len(segments)-1) into the INPUT `segments` array of the original wall row it was
+    split from. Fragments of one input row are CONTIGUOUS in the output array (this
+    function iterates input rows in order and emits all of one row's pieces before moving
+    to the next) -- Section 2b's `perturb_wall_segments_structured` (its STRUCTURED
+    perturbation, the new default) relies on that contiguity to edit "a whole wall" or "a
+    contiguous run within one wall" as a single index-range slice, with no separate
+    bookkeeping.
+
+    Returns (segments (M,2,2) float64, wall_ids (M,) int64)."""
+    seg = np.asarray(segments, dtype=np.float64).reshape(-1, 2, 2)
+    out = []
+    wall_ids = []
+    for wi, (p, q) in enumerate(seg):
+        p = np.asarray(p, dtype=np.float64)
+        q = np.asarray(q, dtype=np.float64)
+        d = q - p
+        L = float(np.linalg.norm(d))
+        n = _piece_count(L, target_piece_len, min_pieces, max_pieces)
+        if L < 1e-9 or n <= 1:
+            out.append((p, q))
+            wall_ids.append(wi)
+            continue
+        u = d / L
+        breaks = np.linspace(0.0, L, n + 1)
+        for s0, s1 in zip(breaks, breaks[1:]):
+            out.append((p + u * s0, p + u * s1))
+            wall_ids.append(wi)
+    return (np.asarray(out, dtype=np.float64).reshape(-1, 2, 2),
+            np.asarray(wall_ids, dtype=np.int64))
+
+
 def densify_wall_segments(segments,
                           target_piece_len: float = DENSIFY_TARGET_PIECE_LEN_M,
                           min_pieces: int = DENSIFY_MIN_PIECES_PER_WALL,
@@ -263,25 +372,16 @@ def densify_wall_segments(segments,
     `assert_densify_preserves_skeleton`, which locks this as an assertion rather than
     trusting it -- run BEFORE any perturbation in `run_d2_gate`.
 
+    CYCLE 11: delegates to `densify_wall_segments_with_ids` and drops the `wall_ids`
+    column -- SAME geometry as before this cycle (verified by
+    `assert_densify_preserves_skeleton`, which still runs on this function's output
+    unchanged).
+
     Returns (M,2,2) float64, M >= len(segments) (M == len(segments) only for
     already-short walls where `_piece_count` returns 1, e.g. none at this fixture's
     wall lengths with the default target)."""
-    seg = np.asarray(segments, dtype=np.float64).reshape(-1, 2, 2)
-    out = []
-    for p, q in seg:
-        p = np.asarray(p, dtype=np.float64)
-        q = np.asarray(q, dtype=np.float64)
-        d = q - p
-        L = float(np.linalg.norm(d))
-        n = _piece_count(L, target_piece_len, min_pieces, max_pieces)
-        if L < 1e-9 or n <= 1:
-            out.append((p, q))
-            continue
-        u = d / L
-        breaks = np.linspace(0.0, L, n + 1)
-        for s0, s1 in zip(breaks, breaks[1:]):
-            out.append((p + u * s0, p + u * s1))
-    return np.asarray(out, dtype=np.float64).reshape(-1, 2, 2)
+    segs, _wall_ids = densify_wall_segments_with_ids(segments, target_piece_len, min_pieces, max_pieces)
+    return segs
 
 
 def assert_densify_preserves_skeleton(corridor_skeleton_fn, raw_segments, densified_segments,
@@ -343,7 +443,7 @@ def assert_single_fragment_removal_is_graceful(corridor_skeleton_fn, densified_s
 
 
 # ==========================================================================================
-# SECTION 2 -- seeded segment perturbation generator (QA-owned parameters; do not relax)
+# SECTION 2 -- seeded FRAGMENT-scatter perturbation generator (QA-owned; `fragment` mode)
 # ==========================================================================================
 
 REMOVE_FRAC_RANGE = (0.10, 0.30)      # 벽 10~30% 제거 (팀 DoD 문구 그대로)
@@ -367,9 +467,11 @@ def perturb_wall_segments(segments, seed: int, *,
     shift -> noise), and the code path taken for a given seed is itself
     seed-determined, so re-running never desyncs the stream.
 
-    UNCHANGED this cycle (Cycle 7 touched Section 1b / Section 3 only): still
-    operates fragment-by-fragment on whatever flat (N,2,2) array it is given, with no
-    notion of "which fragments came from the same original wall" -- this stays
+    UNCHANGED this cycle (Cycle 11 added Section 2b as a SEPARATE mode instead of
+    editing this function -- see the module docstring's CYCLE 11 block for why this
+    function's fragment-scatter model is a DIFFERENT measurement, not a superseded one).
+    Still operates fragment-by-fragment on whatever flat (N,2,2) array it is given, with
+    no notion of "which fragments came from the same original wall" -- this stays
     generic over any DXF-shaped input (real or synthetic), per this module's design.
     Fed Section 1b's denser base, SHIFT now moves an individual FRAGMENT rather than
     an entire wall face; since its lateral distance (0.3-1.0 m) is >> `offset_tol`
@@ -479,6 +581,214 @@ def perturb_wall_segments(segments, seed: int, *,
     return out, ground_truth
 
 
+# ==========================================================================================
+# SECTION 2b -- CYCLE 11: STRUCTURED perturbation (new default; `structured` mode)
+# ==========================================================================================
+#
+# See the module docstring's CYCLE 11 block for the full measured rationale. Short version:
+# Section 2 treats every post-densify fragment as independently removable/shiftable, with no
+# notion of which fragments came from the same original wall -- that models drawing/scan
+# NOISE, not the team's DoD target of a real as-built CHANGE (a torn-down partition, a
+# relocated wall, a new partition -- all structurally contiguous). `perturb_wall_segments_
+# structured` draws from the EXACT SAME QA-owned budget constants as Section 2 (none
+# redefined here) but edits whole walls (or, only where needed to hit the removal budget
+# exactly, one contiguous bite out of one wall) instead of a scatter of unrelated fragments.
+
+
+def _wall_groups(wall_ids) -> dict:
+    """`wall_ids` (len N, from `densify_wall_segments_with_ids`) -> {wall_id: [global
+    output indices]}, ascending. Fragments of one original wall are CONTIGUOUS in the
+    output array by construction of `densify_wall_segments_with_ids` (it iterates input
+    rows in order and emits all of one row's pieces before the next), so this is a
+    straight grouping pass, not a claim that needs separate verification."""
+    groups: dict = {}
+    for gi, wi in enumerate(wall_ids):
+        groups.setdefault(int(wi), []).append(int(gi))
+    for wi in groups:
+        groups[wi].sort()
+    return groups
+
+
+def perturb_wall_segments_structured(segments, wall_ids, seed: int, *,
+                                     remove_frac_range=REMOVE_FRAC_RANGE,
+                                     shift_frac_range=SHIFT_FRAC_RANGE,
+                                     shift_dist_range=SHIFT_DIST_RANGE,
+                                     noise_frac_range=NOISE_FRAC_RANGE,
+                                     target_piece_len: float = DENSIFY_TARGET_PIECE_LEN_M,
+                                     bbox_pad: float = 2.0) -> tuple:
+    """CYCLE 11 STRUCTURED perturbation of (N,2,2) wall segments, simulating on-site
+    CONSTRUCTION change (not drawing noise -- see Section 2 for that model).
+    Deterministic: one `numpy.random.default_rng(seed)` stream, fixed draw order (remove
+    -> shift -> add) -- same reproducibility contract as `perturb_wall_segments` (see
+    `selftest_reproducibility`).
+
+      remove -- whole walls (`wall_ids` groups), in a random order, removed entirely one
+                at a time until the (10-30%, QA-owned) removal budget is reached; if the
+                next whole wall would overshoot it, that ONE wall is cut down to a single
+                CONTIGUOUS run (random start offset within it) sized to land EXACTLY on
+                the budget instead -- so the total removed COUNT matches
+                `perturb_wall_segments`'s draw exactly (same total-change quantity, per
+                instruction), while every removed unit is a whole wall or one contiguous
+                bite of one wall, never scattered fragments.
+      shift   -- whole (surviving) walls translated together by ONE shared vector per
+                wall (magnitude 0.3-1.0 m, QA-owned range, unchanged), so a shifted wall
+                stays a straight wall at its new location, never an independently-drifted
+                fragment cloud. Candidates accumulate in random order until the shift
+                budget is MET OR EXCEEDED (a wall is never split to land on the budget
+                exactly -- an as-built wall does not partially drift); the achieved
+                fraction is therefore approximate, unlike remove's exact match -- always
+                reported in `params` alongside the drawn target, never silently
+                substituted.
+      add     -- exactly ONE new wall (one straight run of touching fragments, densified
+                at the SAME `target_piece_len` as every real wall passed to this
+                function), its length sized so its fragment count matches the
+                noise-fraction budget -- "새 벽 하나를 통째로 추가" (a room subdivision),
+                not many independent furniture-scale blips (Section 2's noise model).
+
+    `wall_ids` must be the SAME length as `segments` (see `densify_wall_segments_with_
+    ids`) -- every output row of `segments` tagged with which ORIGINAL (pre-densify) wall
+    row it came from. Returns (perturbed_segments (M,2,2) float64, ground_truth: dict) in
+    the EXACT SAME schema as `perturb_wall_segments` (`removed_original_indices`,
+    `shifted_original_indices`, `shift_vectors`, `output_to_original_index`,
+    `changed_output_indices`, ...) -- every downstream Section 3 consumer
+    (`classify_changed_segments`, `compute_outlier_recall`, ...) is mode-agnostic by
+    design and needed NO changes for this mode. Adds one extra key,
+    `ground_truth['structured']`, with the per-wall audit trail (which wall ids were
+    removed whole / shifted whole, the one partial-removal wall if any, and the new
+    wall's geometry) for reporting -- never read by the Section 3 scoring functions,
+    informational only."""
+    seg0 = np.asarray(segments, dtype=np.float64).reshape(-1, 2, 2)
+    n = len(seg0)
+    if n == 0:
+        raise ValueError("perturb_wall_segments_structured: input segments array is empty")
+    wids = np.asarray(wall_ids, dtype=np.int64).reshape(-1)
+    if len(wids) != n:
+        raise ValueError(f"perturb_wall_segments_structured: wall_ids length {len(wids)} "
+                         f"!= segments length {n}")
+    rng = np.random.default_rng(seed)
+    groups = _wall_groups(wids)
+
+    # ---- (a) remove: whole walls, greedy random order, exact budget via one partial bite.
+    remove_frac = float(rng.uniform(*remove_frac_range))
+    n_remove_target = int(round(n * remove_frac))
+    n_remove_target = min(max(n_remove_target, 0), n - 1)      # never remove every fragment
+
+    order = list(groups.keys())
+    rng.shuffle(order)
+    removed_indices: list = []
+    removed_whole_wall_ids: list = []
+    partial_remove = None
+    budget = n_remove_target
+    for wi in order:
+        if budget <= 0:
+            break
+        gidx = groups[wi]
+        m = len(gidx)
+        if m <= budget:
+            removed_indices.extend(gidx)
+            removed_whole_wall_ids.append(int(wi))
+            budget -= m
+        else:
+            run_len = budget
+            start = int(rng.integers(0, m - run_len + 1))
+            removed_indices.extend(gidx[start:start + run_len])
+            partial_remove = {"wall_id": int(wi), "start": start, "len": run_len}
+            budget = 0
+            break
+    removed_set = set(removed_indices)
+    kept = [i for i in range(n) if i not in removed_set]
+
+    # ---- (b) shift: whole (surviving) walls, greedy random order, budget met-or-exceeded.
+    kept_groups: dict = {}
+    for i in kept:
+        kept_groups.setdefault(int(wids[i]), []).append(i)
+
+    shift_frac = float(rng.uniform(*shift_frac_range))
+    n_shift_target = int(round(len(kept) * shift_frac))
+    n_shift_target = min(max(n_shift_target, 0), len(kept))
+
+    shift_order = list(kept_groups.keys())
+    rng.shuffle(shift_order)
+    shift_set: set = set()
+    shift_vectors: dict = {}
+    shifted_whole_wall_ids: list = []
+    sbudget = n_shift_target
+    for wi in shift_order:
+        if sbudget <= 0:
+            break
+        gidx = kept_groups[wi]
+        dist = float(rng.uniform(*shift_dist_range))
+        angle = float(rng.uniform(0.0, 2 * np.pi))
+        dv = [round(dist * float(np.cos(angle)), 5), round(dist * float(np.sin(angle)), 5)]
+        for i in gidx:
+            shift_set.add(i)
+            shift_vectors[i] = dv
+        shifted_whole_wall_ids.append(int(wi))
+        sbudget -= len(gidx)
+
+    # ---- (c) add: exactly one new wall, densified at the same piece length.
+    noise_frac = float(rng.uniform(*noise_frac_range))
+    n_noise_target = max(1, int(round(n * noise_frac)))
+    new_wall_len = n_noise_target * target_piece_len
+    flat = seg0.reshape(-1, 2)
+    lo = flat.min(axis=0) - bbox_pad
+    hi = flat.max(axis=0) + bbox_pad
+    angle = float(rng.uniform(0.0, 2 * np.pi))
+    cx = float(rng.uniform(lo[0], hi[0]))
+    cy = float(rng.uniform(lo[1], hi[1]))
+    ux, uy = float(np.cos(angle)), float(np.sin(angle))
+    p0 = np.array([cx - 0.5 * new_wall_len * ux, cy - 0.5 * new_wall_len * uy])
+    q0 = np.array([cx + 0.5 * new_wall_len * ux, cy + 0.5 * new_wall_len * uy])
+    new_wall_pieces, _new_wall_ids = densify_wall_segments_with_ids(
+        np.asarray([[p0, q0]]), target_piece_len=target_piece_len)
+
+    # ---- assemble output rows: kept (with shift applied) + new-wall pieces.
+    out_rows = []
+    output_to_original = []
+    for i in kept:
+        p, q = seg0[i, 0].copy(), seg0[i, 1].copy()
+        if i in shift_set:
+            dv = np.asarray(shift_vectors[i], dtype=np.float64)
+            p = p + dv
+            q = q + dv
+        out_rows.append((p, q))
+        output_to_original.append(i)
+
+    noise_output_indices = []
+    for p, q in new_wall_pieces:
+        noise_output_indices.append(len(out_rows))
+        out_rows.append((p, q))
+        output_to_original.append(None)
+
+    out = np.asarray([[p, q] for p, q in out_rows], dtype=np.float64).reshape(-1, 2, 2)
+    changed_output_indices = sorted(
+        [oi for oi, orig in enumerate(output_to_original) if orig in shift_set] + noise_output_indices)
+
+    ground_truth = {
+        "seed": int(seed), "n_original": int(n), "n_output": int(len(out)),
+        "params": {
+            "remove_frac": round(remove_frac, 5), "n_removed": len(removed_indices),
+            "shift_frac": round(shift_frac, 5), "n_shifted": len(shift_set),
+            "noise_frac": round(noise_frac, 5), "n_noise": len(noise_output_indices),
+        },
+        "removed_original_indices": sorted(removed_indices),
+        "shifted_original_indices": sorted(shift_set),
+        "shift_vectors": {str(k): v for k, v in shift_vectors.items()},
+        "kept_unchanged_original_indices": sorted(i for i in kept if i not in shift_set),
+        "noise_output_indices": noise_output_indices,
+        "output_to_original_index": output_to_original,
+        "changed_output_indices": changed_output_indices,
+        "structured": {
+            "removed_whole_wall_ids": sorted(removed_whole_wall_ids),
+            "partial_remove": partial_remove,
+            "shifted_whole_wall_ids": sorted(shifted_whole_wall_ids),
+            "new_wall": {"p0": p0.tolist(), "q0": q0.tolist(),
+                        "length_m": round(new_wall_len, 4), "n_pieces": len(noise_output_indices)},
+        },
+    }
+    return out, ground_truth
+
+
 def derive_seeds(seed: int, n: int) -> list:
     """n independent child seeds from one base seed via numpy's SeedSequence.spawn
     (reproducible AND statistically independent across suite members -- unlike
@@ -488,25 +798,41 @@ def derive_seeds(seed: int, n: int) -> list:
     return [int(c.generate_state(1)[0]) for c in children]
 
 
-def generate_perturbation_suite(base_segments, seed: int, n_perturb: int, **perturb_kwargs) -> list:
+def generate_perturbation_suite(base_segments, seed: int, n_perturb: int, *,
+                                mode: str = "structured", wall_ids=None,
+                                **perturb_kwargs) -> list:
     """n_perturb perturbations of `base_segments`, deterministic in (seed, n_perturb,
-    **perturb_kwargs). Each item: {"index", "seed", "child_seed", "segments",
-    "ground_truth"}."""
+    mode, **perturb_kwargs). CYCLE 11: `mode` selects the edit-unit model -- 'structured'
+    (default, Section 2b, `perturb_wall_segments_structured` -- REQUIRES `wall_ids`, see
+    `densify_wall_segments_with_ids`) or 'fragment' (Cycle-7's original model, Section 2,
+    `perturb_wall_segments`, unchanged, no `wall_ids` needed). Each item: {"index",
+    "seed", "child_seed", "segments", "ground_truth", "mode"}."""
+    if mode not in ("structured", "fragment"):
+        raise ValueError(f"generate_perturbation_suite: mode must be 'structured' or "
+                         f"'fragment', got {mode!r}")
+    if mode == "structured" and wall_ids is None:
+        raise ValueError("generate_perturbation_suite: mode='structured' requires "
+                         "wall_ids (see densify_wall_segments_with_ids)")
     child_seeds = derive_seeds(seed, n_perturb)
     suite = []
     for i, cs in enumerate(child_seeds):
-        segs, gt = perturb_wall_segments(base_segments, cs, **perturb_kwargs)
-        suite.append({"index": i, "seed": int(seed), "child_seed": int(cs),
-                      "segments": segs, "ground_truth": gt})
+        if mode == "fragment":
+            segs, gt = perturb_wall_segments(base_segments, cs, **perturb_kwargs)
+        else:
+            segs, gt = perturb_wall_segments_structured(base_segments, wall_ids, cs, **perturb_kwargs)
+        suite.append({"index": i, "seed": int(seed), "child_seed": int(cs), "segments": segs,
+                      "ground_truth": gt, "mode": mode})
     return suite
 
 
-def selftest_reproducibility(base_segments, seed: int = 0, n_perturb: int = 5) -> dict:
-    """Runs `generate_perturbation_suite` TWICE with identical arguments and checks
-    byte-identical output (segments array equality + ground_truth JSON equality) --
-    the reproducibility requirement the CLI must demonstrate every invocation."""
-    run1 = generate_perturbation_suite(base_segments, seed, n_perturb)
-    run2 = generate_perturbation_suite(base_segments, seed, n_perturb)
+def selftest_reproducibility(base_segments, seed: int = 0, n_perturb: int = 5, *,
+                             mode: str = "structured", wall_ids=None) -> dict:
+    """Runs `generate_perturbation_suite` TWICE with identical arguments (INCLUDING
+    `mode`/`wall_ids`, Cycle 11) and checks byte-identical output (segments array
+    equality + ground_truth JSON equality) -- the reproducibility requirement the CLI
+    must demonstrate every invocation, for whichever perturbation model is selected."""
+    run1 = generate_perturbation_suite(base_segments, seed, n_perturb, mode=mode, wall_ids=wall_ids)
+    run2 = generate_perturbation_suite(base_segments, seed, n_perturb, mode=mode, wall_ids=wall_ids)
     mismatches = []
     for i, (a, b) in enumerate(zip(run1, run2)):
         same_array = a["segments"].shape == b["segments"].shape and bool(
@@ -516,7 +842,7 @@ def selftest_reproducibility(base_segments, seed: int = 0, n_perturb: int = 5) -
         if not (same_array and same_gt and same_child_seed):
             mismatches.append({"index": i, "same_array": same_array, "same_gt": same_gt,
                                "same_child_seed": same_child_seed})
-    return {"ok": not mismatches, "seed": int(seed), "n_perturb": int(n_perturb),
+    return {"ok": not mismatches, "seed": int(seed), "n_perturb": int(n_perturb), "mode": mode,
             "mismatches": mismatches}
 
 
@@ -641,6 +967,30 @@ def compute_success_rate(cases: list, true_transform: dict, offset_max: float) -
     rate = (n_ok_within / n) if n else 0.0
     return {"rate": rate, "n": n, "n_ok_within_d2": n_ok_within, "n_ok_outside_d2": n_ok_outside,
             "n_hold": n_hold, "n_reject": n_reject, "n_error": n_error, "detail": detail}
+
+
+def failure_reason_breakdown(succ: dict) -> dict:
+    """CYCLE 11 P2 input: reason distribution of every NON-success case in
+    `compute_success_rate`'s `detail` -- the question PM asked, "is inlier_ratio_below_min
+    DOMINANT", which if true means the matcher is REJECTING THE WHOLE CANDIDATE instead of
+    carving the changed wall out as an outlier (the trimmed/RANSAC design's central
+    promise -- see the module docstring). Counts every HOLD_REASONS/REJECT_REASONS string
+    seen among hold/reject outcomes, PLUS two buckets that are NOT a `hold_reason` by
+    schema: 'ok_OUTSIDE_d2' (status=='ok', so `hold_reason` is forced None by
+    `plan_skeleton`'s own contract -- this is a CONFIRMED but WRONG transform, the
+    dangerous case) and 'error' (the matcher/skeleton build raised). `ok_within_d2` cases
+    (successes) are excluded -- this is a FAILURE breakdown only. Returns
+    {reason_or_outcome: count}, insertion-ordered by first occurrence (NOT sorted --
+    callers wanting a ranked view should sort by count themselves, e.g. via
+    `max(d.items(), key=...)`, done in the CLI report)."""
+    counts: dict = {}
+    for d in succ["detail"]:
+        if d["outcome"] == "ok_within_d2":
+            continue
+        key = d.get("hold_reason") if d["outcome"] in ("hold", "reject") else d["outcome"]
+        key = key or d["outcome"]
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def _changed_segment_truth_points(base_segments, perturbed_segments, ground_truth: dict) -> dict:
@@ -948,28 +1298,34 @@ def verify_hold_gate(cases: list, ambiguous_fixture: dict) -> dict:
             "ok": bool(fixture_ok and not violations)}
 
 
-def run_d2_gate(seed: int, n_perturb: int) -> dict:
-    """Runs the full D2 gate: builds the dev-core STAIR harness (4 legs / 3 corners /
-    5 doors, unambiguous), DENSIFIES its wall segments (Cycle 7 item (A) --
-    `densify_wall_segments`, verified as a no-op on the clean skeleton and on
-    single-fragment removal BEFORE anything is perturbed), perturbs the densified
-    WALL SEGMENTS ONLY `n_perturb` times (QA's seeded generator, Section 2 -- doors
-    are held fixed, see the module docstring), matches each perturbed plan against the
-    SAME walk (generated once, from the UNPERTURBED plan's known true transform -- the
-    perturbation simulates a stale/drifted DRAWING, not a different walk), and
-    evaluates all three D2 items (item (2)'s denominator redefined per Cycle 7 item
-    (B), see `classify_changed_segments` / `compute_outlier_recall`).
+def _run_d2_gate_single(seed: int, n_perturb: int, perturb_mode: str) -> dict:
+    """Runs the full D2 gate for ONE perturbation model: builds the dev-core STAIR
+    harness (4 legs / 3 corners / 5 doors, unambiguous), DENSIFIES its wall segments
+    with wall-id tracking (Cycle 7 item (A) + Cycle 11's `wall_ids` -- verified as a
+    no-op on the clean skeleton and on single-fragment removal BEFORE anything is
+    perturbed), perturbs the densified WALL SEGMENTS ONLY `n_perturb` times using
+    `perturb_mode` (`'structured'` or `'fragment'`, QA's seeded generators, Section 2 /
+    2b -- doors are held fixed, see the module docstring), matches each perturbed plan
+    against the SAME walk (generated once, from the UNPERTURBED plan's known true
+    transform -- the perturbation simulates a stale/drifted DRAWING or a real site
+    CHANGE never redrawn, not a different walk), and evaluates all three D2 items
+    (item (2)'s denominator per Cycle 7 item (B), see `classify_changed_segments` /
+    `compute_outlier_recall`; the new failure-reason breakdown per Cycle 11, see
+    `failure_reason_breakdown`).
 
     Raises ImportError (matcher/tests-harness missing) or RuntimeError (the density
     pass changed the skeleton it should have left untouched, the single-fragment-
     removal regression probe found a topology collapse, or the harness's OWN
     zero-perturbation baseline was not recovered exactly) -- the caller (`main`) turns
     any of these into exit 2, never a fabricated verdict."""
+    if perturb_mode not in ("structured", "fragment"):
+        raise ValueError(f"_run_d2_gate_single: perturb_mode must be 'structured' or "
+                         f"'fragment', got {perturb_mode!r}")
     cm, ps, tcm, tps = _load_d2_harness()
 
     raw_segments = tcm._corridor_walls(tcm.STAIR)                        # (10,2,2) m -- dev-core's own fixture
     plan_doors = list(tcm.STAIR_PLAN_DOORS)
-    base_segments = densify_wall_segments(raw_segments)                 # Cycle 7 item (A)
+    base_segments, wall_ids = densify_wall_segments_with_ids(raw_segments)   # Cycle 7 item (A) + Cycle 11 tags
 
     density_check = assert_densify_preserves_skeleton(ps.corridor_skeleton, raw_segments,
                                                       base_segments, plan_doors)
@@ -1004,7 +1360,11 @@ def run_d2_gate(seed: int, n_perturb: int) -> dict:
             "refusing to evaluate perturbed cases against a harness that does not even "
             "pass its own zero-perturbation baseline")
 
-    suite = generate_perturbation_suite(base_segments, seed, n_perturb)
+    if perturb_mode == "fragment":
+        suite = generate_perturbation_suite(base_segments, seed, n_perturb, mode="fragment")
+    else:
+        suite = generate_perturbation_suite(base_segments, seed, n_perturb, mode="structured",
+                                            wall_ids=wall_ids)
     rev_by_index = {e["index"]: e for e in cm.recon_events(traj, door_s=door_s)}
     contract_violations = []
     cases = []
@@ -1025,6 +1385,7 @@ def run_d2_gate(seed: int, n_perturb: int) -> dict:
 
     succ = compute_success_rate(cases, tf_true, offset_max)
     transform_confirmed_indices = {d["index"] for d in succ["detail"] if d["outcome"] == "ok_within_d2"}
+    failure_reasons = failure_reason_breakdown(succ)
 
     fallback_leg_lat_tol = max(float(cm.TOL_FLOOR["leg_lat"]),
                                float(cm.TOL_PER_WIDTH["leg_lat"]) * float(tcm.W))
@@ -1055,16 +1416,37 @@ def run_d2_gate(seed: int, n_perturb: int) -> dict:
     gate1_ok = succ["rate"] >= GATE_SUCCESS_RATE_MIN
     gate2_ok = recall["recall"] is not None and recall["recall"] >= GATE_OUTLIER_RECALL_MIN
     gate3_ok = hold["ok"]
-    return {"n_perturb": n_perturb, "seed": seed,
+    return {"n_perturb": n_perturb, "seed": seed, "perturb_mode": perturb_mode,
             "density_check": density_check,
             "single_removal_check": single_removal_check,
             "clean_baseline": {"status": clean_res.get("status"), "within_d2": clean_ok,
                                "detail": clean_detail},
             "case_summaries": case_summaries,
             "contract_violations": contract_violations,
-            "success": succ, "outlier_recall": recall, "hold": hold,
+            "success": succ, "failure_reasons": failure_reasons,
+            "outlier_recall": recall, "hold": hold,
             "gate1_ok": gate1_ok, "gate2_ok": gate2_ok, "gate3_ok": gate3_ok,
             "gate_ok": bool(gate1_ok and gate2_ok and gate3_ok)}
+
+
+def run_d2_gate(seed: int, n_perturb: int, perturb_mode: str = "structured") -> dict:
+    """CYCLE 11 dispatcher. `perturb_mode in {'structured', 'fragment'}` runs ONE suite
+    (`_run_d2_gate_single`) and returns its result dict directly (unchanged shape from
+    before this cycle, plus the new `perturb_mode`/`failure_reasons` keys).
+    `perturb_mode == 'both'` runs STRUCTURED AND FRAGMENT independently -- same seed,
+    same n_perturb, but each mode's OWN `derive_seeds` stream (so the two suites are
+    genuinely different draws under each model, not the same draws reinterpreted) --
+    and returns `{"perturb_mode": "both", "structured": ..., "fragment": ...,
+    "gate_ok": both}`, side by side, never merged into one set of numbers (see the
+    module docstring's Cycle 11 section for why merging would hide which model the
+    matcher is actually failing)."""
+    if perturb_mode == "both":
+        g_structured = _run_d2_gate_single(seed, n_perturb, "structured")
+        g_fragment = _run_d2_gate_single(seed, n_perturb, "fragment")
+        return {"perturb_mode": "both", "n_perturb": n_perturb, "seed": seed,
+                "structured": g_structured, "fragment": g_fragment,
+                "gate_ok": bool(g_structured["gate_ok"] and g_fragment["gate_ok"])}
+    return _run_d2_gate_single(seed, n_perturb, perturb_mode)
 
 
 # ==========================================================================================
@@ -1087,6 +1469,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help=f"perturbations in the D2 suite (default {GATE_N_PERTURB_DEFAULT}, the D2 gate size)")
     ap.add_argument("--seed", type=int, default=0,
                     help="base seed; same seed (+ same --n-perturb) -> same suite, reproducibly")
+    ap.add_argument("--perturb-mode", choices=["structured", "fragment", "both"], default="structured",
+                    help="CYCLE 11: 'structured' (default) edits whole walls (site-change model, see "
+                         "module docstring CYCLE 11 block); 'fragment' is Cycle-7's original scattered-"
+                         "fragment model (drawing-noise model), kept selectable, not deleted; 'both' runs "
+                         "and reports both independently, side by side, never merged")
     ap.add_argument("--selftest-only", action="store_true",
                     help="run ONLY the reproducibility self-test (2x generation, compare) and exit; "
                          "skips suite generation and the D2 gate")
@@ -1094,6 +1481,85 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="write the generated suite (segments + ground_truth per perturbation) plus the "
                          "D2 gate result (if it ran) as JSON")
     return ap
+
+
+def _print_single_gate_report(gate: dict) -> None:
+    """CYCLE 11: prints ONE mode's full D2 gate report (density/removal checks, clean
+    baseline, per-case summary, the P2 failure-reason breakdown, and ①②③) -- factored
+    out of `main` so `--perturb-mode both` can call this twice (structured, fragment)
+    and print them clearly labelled side by side, never averaged into one set of
+    numbers."""
+    mode = gate["perturb_mode"]
+    tag = f"[{mode}]"
+    dc = gate["density_check"]
+    print(f"{tag} P0-Perturb 밀도 보정(Cycle 7 item A): raw N={dc['raw_n_segments']} -> "
+          f"densified N={dc['densified_n_segments']} (target_piece_len={DENSIFY_TARGET_PIECE_LEN_M} m); "
+          f"무섭동 스켈레톤 불변식(legs/corners/doors/leg-lengths 동일) = "
+          f"{'PASS' if dc['ok'] else 'FAIL'} "
+          f"(legs {dc['raw_n_legs']}->{dc['densified_n_legs']}, "
+          f"corners {dc['raw_n_corners']}->{dc['densified_n_corners']}, "
+          f"doors {dc['raw_n_doors']}->{dc['densified_n_doors']})")
+    src = gate["single_removal_check"]
+    print(f"{tag} 단일 조각 제거 회귀 테스트(이 사이클이 고치려던 버그): {src['n_graceful']}/{src['n_trials']} "
+          f"무섭동 위상 유지 = {'PASS' if src['ok'] else 'FAIL'}")
+
+    succ, recall, hold = gate["success"], gate["outlier_recall"], gate["hold"]
+    cb = gate["clean_baseline"]
+    print(f"{tag} 무섭동 기준해(clean baseline, STAIR, densified): status={cb['status']} "
+          f"within_D2={cb['within_d2']}")
+    print(f"{tag} D2 게이트 섭동 케이스별 요약 (STAIR, seed={gate['seed']}, mode={mode}):")
+    for cs in gate["case_summaries"]:
+        print(f"  #{cs['index']:02d} removed={cs['n_removed']} shifted={cs['n_shifted']} "
+              f"noise={cs['n_noise']} -> status={cs['status']} hold_reason={cs['hold_reason']} "
+              f"margin={cs['margin']} n_cand={cs['n_candidates']} top_score={cs['top_score']} "
+              f"top_inlier_ratio={cs['top_inlier_ratio']} error={cs['error']}")
+    if gate["contract_violations"]:
+        print(f"{tag} [경고] plan_skeleton.validate_match_result 계약 위반 "
+              f"{len(gate['contract_violations'])}건 (D2 게이트 판정에는 미반영, 참고용): "
+              f"{gate['contract_violations']}", file=sys.stderr)
+
+    print(f"{tag} ① 성공률: {succ['n_ok_within_d2']}/{succ['n']} = {succ['rate']*100:.1f}% "
+          f"(gate >= {GATE_SUCCESS_RATE_MIN*100:.0f}%) "
+          f"[ok_outside_d2(위험: 확정오답)={succ['n_ok_outside_d2']} hold={succ['n_hold']} "
+          f"reject={succ['n_reject']} error={succ['n_error']}]")
+
+    fr = gate["failure_reasons"]
+    print(f"{tag}    실패 사유 분포(P2 입력, ①에서 ok_within_d2 아닌 모든 케이스): "
+          f"{json.dumps(fr, ensure_ascii=False)}")
+    if fr:
+        top_reason, top_n = max(fr.items(), key=lambda kv: kv[1])
+        n_fail = sum(fr.values())
+        if top_reason == "inlier_ratio_below_min":
+            print(f"{tag}    해석: inlier_ratio_below_min 이 실패 사유 중 최다({top_n}/{n_fail}건) -- "
+                  f"'변경된 벽을 outlier 로 빼는 대신 후보 전체를 거부'하고 있다는 뜻 -- "
+                  f"부분매칭(trimmed/RANSAC) 설계의 핵심 실패모드로 보고, 완화 아님.")
+
+    print(f"{tag} ② outlier recall (Cycle 7 분모 교정): 변경 세그먼트 총 {recall['n_all_changed_segments']}건 중 "
+          f"not_observable(워크에서 {OUTLIER_RECALL_RADIUS_M:.2f}m 밖)={recall['n_not_observable']}건, "
+          f"not_scoreable(shift의 lateral 성분이 매처 leg_lat 톨러런스 이내로 흡수)={recall['n_not_scoreable']}건 "
+          f"제외 -- 이 둘은 '측정 대상 아님'이지 '통과'가 아니며 항상 이렇게 보고됨.")
+    if recall["recall"] is None:
+        print(f"{tag}    scoreable 0건 (case 미확정 전이 exclude={recall['n_excluded_case_no_confirmed_transform']}, "
+              f"no_candidate={recall['n_case_no_candidate']}) -> recall 계산 불가 "
+              f"(gate >= {GATE_OUTLIER_RECALL_MIN*100:.0f}%)")
+    else:
+        print(f"{tag}    recall: {recall['n_detected']}/{recall['n_total']} (scoreable, transform-confirmed case만) "
+              f"= {recall['recall']*100:.1f}% (radius={recall['radius_m']:.2f}m, "
+              f"gate >= {GATE_OUTLIER_RECALL_MIN*100:.0f}%) "
+              f"[case 미확정 전이 exclude={recall['n_excluded_case_no_confirmed_transform']} "
+              f"no_candidate={recall['n_case_no_candidate']}]")
+
+    print(f"{tag} ③ 모호 시 HOLD(자동확정 금지, 이번 사이클 미변경): 고정 픽스처(2-leg L, 무-door) -> "
+          f"status={hold['fixture_status']} hold_reason={hold['fixture_hold_reason']} "
+          f"margin={hold['fixture_margin']} => {'PASS' if hold['fixture_ok'] else 'FAIL'}; "
+          f"섭동 {gate['n_perturb']}건 중 margin<margin_min인데 status=='ok'로 자동확정된 위반="
+          f"{len(hold['perturbation_invariant_violations'])}건 "
+          f"{hold['perturbation_invariant_violations'] or ''} "
+          f"(reject 는 정상 -- finalize_match 의 하드게이트 우선순위, verify_hold_on_ambiguous 참고)")
+    print(f"{tag} 게이트 판정: {'PASS' if gate['gate_ok'] else 'FAIL'} "
+          f"(①{'PASS' if gate['gate1_ok'] else 'FAIL'} "
+          f"②{'PASS' if gate['gate2_ok'] else 'FAIL'} "
+          f"③{'PASS' if gate['gate3_ok'] else 'FAIL'})")
 
 
 def main(argv=None) -> int:
@@ -1112,28 +1578,45 @@ def main(argv=None) -> int:
         plan_src = (f"synthetic L-corridor (QA fixture, width={DEFAULT_CORRIDOR_WIDTH} m) -- "
                     "no real SXX/Gasan DXF exists in this repo as of this cycle")
 
+    #: CYCLE 11: trivial 1-fragment-per-wall tagging for the CLI's OWN demo/self-test
+    #: section only (this raw base is NOT densified, unlike the D2 gate's STAIR harness
+    #: -- see `_run_d2_gate_single`, which builds its own properly-densified `wall_ids`).
+    #: Harmless for 'fragment' mode (ignored there).
+    demo_wall_ids = np.arange(len(base_segments), dtype=np.int64)
+
     print(f"plan source (generator self-test only): {plan_src}")
     print(f"base wall segments: N={len(base_segments)}")
     if args.upload is not None:
         print(f"--upload {args.upload} accepted but UNUSED by the D2 gate (see module docstring)")
 
-    repro = selftest_reproducibility(base_segments, seed=args.seed, n_perturb=min(args.n_perturb, 5))
-    print(f"reproducibility selftest: seed={args.seed} n={repro['n_perturb']} -> "
-          f"{'PASS' if repro['ok'] else 'FAIL'} (mismatches={len(repro['mismatches'])})")
-    if not repro["ok"]:
-        print(json.dumps(repro, indent=2, ensure_ascii=False), file=sys.stderr)
+    modes_to_run = ("structured", "fragment") if args.perturb_mode == "both" else (args.perturb_mode,)
+
+    repro_all_ok = True
+    for m in modes_to_run:
+        repro = selftest_reproducibility(base_segments, seed=args.seed, n_perturb=min(args.n_perturb, 5),
+                                         mode=m, wall_ids=demo_wall_ids)
+        print(f"reproducibility selftest [{m}]: seed={args.seed} n={repro['n_perturb']} -> "
+              f"{'PASS' if repro['ok'] else 'FAIL'} (mismatches={len(repro['mismatches'])})")
+        if not repro["ok"]:
+            print(json.dumps(repro, indent=2, ensure_ascii=False), file=sys.stderr)
+            repro_all_ok = False
+    if not repro_all_ok:
         return 1
 
     if args.selftest_only:
         return 0
 
-    suite = generate_perturbation_suite(base_segments, args.seed, args.n_perturb)
-    print(f"generated {len(suite)} perturbations (seed={args.seed}):")
-    for item in suite:
-        gt = item["ground_truth"]
-        p = gt["params"]
-        print(f"  #{item['index']:02d} child_seed={item['child_seed']} N_out={gt['n_output']} "
-              f"removed={p['n_removed']} shifted={p['n_shifted']} noise={p['n_noise']}")
+    suites = {}
+    for m in modes_to_run:
+        suite = generate_perturbation_suite(base_segments, args.seed, args.n_perturb, mode=m,
+                                            wall_ids=demo_wall_ids)
+        suites[m] = suite
+        print(f"generated {len(suite)} perturbations (seed={args.seed}, mode={m}):")
+        for item in suite:
+            gt = item["ground_truth"]
+            p = gt["params"]
+            print(f"  #{item['index']:02d} child_seed={item['child_seed']} N_out={gt['n_output']} "
+                  f"removed={p['n_removed']} shifted={p['n_shifted']} noise={p['n_noise']}")
 
     matcher = try_import_matcher()
     if matcher is None:
@@ -1145,19 +1628,20 @@ def main(argv=None) -> int:
         print("matcher_missing: import scan2bim.coarse_match failed (module not found)",
               file=sys.stderr)
         if args.json is not None:
-            args.json.write_text(json.dumps(
-                [{"index": it["index"], "seed": it["seed"], "child_seed": it["child_seed"],
-                  "segments": it["segments"].tolist(), "ground_truth": it["ground_truth"]}
-                 for it in suite], indent=2, ensure_ascii=False), encoding="utf-8")
+            dump = {m: [{"index": it["index"], "seed": it["seed"], "child_seed": it["child_seed"],
+                        "segments": it["segments"].tolist(), "ground_truth": it["ground_truth"]}
+                       for it in suites[m]] for m in suites}
+            args.json.write_text(json.dumps(dump, indent=2, ensure_ascii=False), encoding="utf-8")
             print(f"suite written: {args.json}")
         return 2
 
     print("")
     print(f"[D2 게이트 실배선] tests/test_coarse_match.py 하네스(STAIR corridor, "
           f"4 legs/3 corners/5 doors) 재사용 -- QA 섭동 생성기(seed={args.seed}, "
-          f"n={args.n_perturb})로, 밀도 보정(densify_wall_segments) 후의 벽만 섭동, 문/워크는 고정.")
+          f"n={args.n_perturb}, mode={args.perturb_mode})로, 밀도 보정(densify_wall_segments) 후의 "
+          f"벽만 섭동, 문/워크는 고정.")
     try:
-        gate = run_d2_gate(args.seed, args.n_perturb)
+        gate = run_d2_gate(args.seed, args.n_perturb, perturb_mode=args.perturb_mode)
     except ImportError as e:
         print(f"[D2 게이트 평가 불가] {e}", file=sys.stderr)
         return 2
@@ -1165,80 +1649,55 @@ def main(argv=None) -> int:
         print(f"[D2 게이트 평가 불가] {e}", file=sys.stderr)
         return 2
 
-    dc = gate["density_check"]
-    print(f"P0-Perturb 밀도 보정(Cycle 7 item A): raw N={dc['raw_n_segments']} -> "
-          f"densified N={dc['densified_n_segments']} (target_piece_len={DENSIFY_TARGET_PIECE_LEN_M} m); "
-          f"무섭동 스켈레톤 불변식(legs/corners/doors/leg-lengths 동일) = "
-          f"{'PASS' if dc['ok'] else 'FAIL'} "
-          f"(legs {dc['raw_n_legs']}->{dc['densified_n_legs']}, "
-          f"corners {dc['raw_n_corners']}->{dc['densified_n_corners']}, "
-          f"doors {dc['raw_n_doors']}->{dc['densified_n_doors']})")
-    src = gate["single_removal_check"]
-    print(f"단일 조각 제거 회귀 테스트(이 사이클이 고치려던 버그): {src['n_graceful']}/{src['n_trials']} "
-          f"무섭동 위상 유지 = {'PASS' if src['ok'] else 'FAIL'}")
-
-    succ, recall, hold = gate["success"], gate["outlier_recall"], gate["hold"]
-    cb = gate["clean_baseline"]
-    print(f"무섭동 기준해(clean baseline, STAIR, densified): status={cb['status']} within_D2={cb['within_d2']}")
-    print("D2 게이트 섭동 케이스별 요약 (STAIR, seed=%d):" % args.seed)
-    for cs in gate["case_summaries"]:
-        print(f"  #{cs['index']:02d} removed={cs['n_removed']} shifted={cs['n_shifted']} "
-              f"noise={cs['n_noise']} -> status={cs['status']} hold_reason={cs['hold_reason']} "
-              f"margin={cs['margin']} n_cand={cs['n_candidates']} top_score={cs['top_score']} "
-              f"top_inlier_ratio={cs['top_inlier_ratio']} error={cs['error']}")
-    if gate["contract_violations"]:
-        print(f"[경고] plan_skeleton.validate_match_result 계약 위반 {len(gate['contract_violations'])}건 "
-              f"(D2 게이트 판정에는 미반영, 참고용): {gate['contract_violations']}", file=sys.stderr)
-
-    print(f"① 성공률: {succ['n_ok_within_d2']}/{succ['n']} = {succ['rate']*100:.1f}% "
-          f"(gate >= {GATE_SUCCESS_RATE_MIN*100:.0f}%) "
-          f"[ok_outside_d2(위험: 확정오답)={succ['n_ok_outside_d2']} hold={succ['n_hold']} "
-          f"reject={succ['n_reject']} error={succ['n_error']}]")
-
-    print(f"② outlier recall (Cycle 7 분모 교정): 변경 세그먼트 총 {recall['n_all_changed_segments']}건 중 "
-          f"not_observable(워크에서 {OUTLIER_RECALL_RADIUS_M:.2f}m 밖)={recall['n_not_observable']}건, "
-          f"not_scoreable(shift의 lateral 성분이 매처 leg_lat 톨러런스 이내로 흡수)={recall['n_not_scoreable']}건 "
-          f"제외 -- 이 둘은 '측정 대상 아님'이지 '통과'가 아니며 항상 이렇게 보고됨.")
-    if recall["recall"] is None:
-        print(f"   scoreable 0건 (case 미확정 전이 exclude={recall['n_excluded_case_no_confirmed_transform']}, "
-              f"no_candidate={recall['n_case_no_candidate']}) -> recall 계산 불가 "
-              f"(gate >= {GATE_OUTLIER_RECALL_MIN*100:.0f}%)")
+    if args.perturb_mode == "both":
+        _print_single_gate_report(gate["structured"])
+        print("")
+        _print_single_gate_report(gate["fragment"])
     else:
-        print(f"   recall: {recall['n_detected']}/{recall['n_total']} (scoreable, transform-confirmed case만) "
-              f"= {recall['recall']*100:.1f}% (radius={recall['radius_m']:.2f}m, "
-              f"gate >= {GATE_OUTLIER_RECALL_MIN*100:.0f}%) "
-              f"[case 미확정 전이 exclude={recall['n_excluded_case_no_confirmed_transform']} "
-              f"no_candidate={recall['n_case_no_candidate']}]")
-
-    print(f"③ 모호 시 HOLD(자동확정 금지, 이번 사이클 미변경): 고정 픽스처(2-leg L, 무-door) -> "
-          f"status={hold['fixture_status']} hold_reason={hold['fixture_hold_reason']} "
-          f"margin={hold['fixture_margin']} => {'PASS' if hold['fixture_ok'] else 'FAIL'}; "
-          f"섭동 {args.n_perturb}건 중 margin<margin_min인데 status=='ok'로 자동확정된 위반="
-          f"{len(hold['perturbation_invariant_violations'])}건 "
-          f"{hold['perturbation_invariant_violations'] or ''} "
-          f"(reject 는 정상 -- finalize_match 의 하드게이트 우선순위, verify_hold_on_ambiguous 참고)")
+        _print_single_gate_report(gate)
 
     if args.json is not None:
-        dump = {"suite": [{"index": it["index"], "seed": it["seed"], "child_seed": it["child_seed"],
-                           "segments": it["segments"].tolist(), "ground_truth": it["ground_truth"]}
-                          for it in suite],
+        dump = {"perturb_mode": args.perturb_mode,
+                "suites": {m: [{"index": it["index"], "seed": it["seed"], "child_seed": it["child_seed"],
+                                "segments": it["segments"].tolist(), "ground_truth": it["ground_truth"]}
+                               for it in suites[m]] for m in suites},
                 "d2_gate": gate}
         args.json.write_text(json.dumps(dump, indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"suite + D2 gate result written: {args.json}")
 
     print("")
     if gate["gate_ok"]:
-        print("D2 게이트: PASS (①②③ 모두 통과)")
+        extra = " (both 모드 모두 통과)" if args.perturb_mode == "both" else ""
+        print(f"D2 게이트: PASS (mode={args.perturb_mode}, ①②③ 모두 통과{extra})")
         return 0
+
+    if args.perturb_mode == "both":
+        misses = []
+        for m in ("structured", "fragment"):
+            g = gate[m]
+            if g["gate_ok"]:
+                continue
+            sub = []
+            if not g["gate1_ok"]:
+                sub.append(f"①{g['success']['rate']*100:.1f}%<{GATE_SUCCESS_RATE_MIN*100:.0f}%")
+            if not g["gate2_ok"]:
+                rr = "계산불가" if g["outlier_recall"]["recall"] is None else f"{g['outlier_recall']['recall']*100:.1f}%"
+                sub.append(f"②{rr}(<{GATE_OUTLIER_RECALL_MIN*100:.0f}%)")
+            if not g["gate3_ok"]:
+                sub.append("③HOLD위반")
+            misses.append(f"[{m}] " + "; ".join(sub))
+        print("D2 게이트: FAIL -- " + " | ".join(misses), file=sys.stderr)
+        return 1
+
     misses = []
     if not gate["gate1_ok"]:
-        misses.append(f"①성공률 {succ['rate']*100:.1f}% < {GATE_SUCCESS_RATE_MIN*100:.0f}%")
+        misses.append(f"①성공률 {gate['success']['rate']*100:.1f}% < {GATE_SUCCESS_RATE_MIN*100:.0f}%")
     if not gate["gate2_ok"]:
-        rr = "계산불가" if recall["recall"] is None else f"{recall['recall']*100:.1f}%"
+        rr = "계산불가" if gate["outlier_recall"]["recall"] is None else f"{gate['outlier_recall']['recall']*100:.1f}%"
         misses.append(f"②outlier recall {rr} (gate >= {GATE_OUTLIER_RECALL_MIN*100:.0f}%)")
     if not gate["gate3_ok"]:
         misses.append("③모호 시 HOLD 위반")
-    print("D2 게이트: FAIL -- " + "; ".join(misses), file=sys.stderr)
+    print(f"D2 게이트: FAIL(mode={args.perturb_mode}) -- " + "; ".join(misses), file=sys.stderr)
     return 1
 
 
