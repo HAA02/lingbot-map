@@ -90,7 +90,9 @@ CANDIDATE_FIELDS = {
     "inlier_ratio": "float in [0, 1] = n_inliers / n_events",
     "n_inliers": "int",
     "n_events": "int, recon events offered to the matcher",
-    "residual": "float metres, robust (median) residual over the INLIERS",
+    "residual": "float metres, robust residual over the INLIERS ONLY (outliers are "
+                "excluded, never absorbed); the reducer is the matcher's — see "
+                "coarse_match.RESID_AGG",
     "matches": "list of [recon_event_index:int, plan_event_id:str] inlier pairs",
     "outliers": "list of OUTLIER_FIELDS dicts — the events this candidate does NOT "
                 "explain. MUST be emitted even when the candidate wins (partial "
@@ -762,21 +764,42 @@ def plan_events(skel: dict) -> list:
 
         {"id": "leg:0",    "kind": "leg",    "length", "width", "a", "b"}
         {"id": "corner:3", "kind": "corner", "xy", "turn_deg", "legs"}
-        {"id": "door:2",   "kind": "door",   "xy", "leg", "s"}
+        {"id": "door:2",   "kind": "door",   "xy", "xy_pass", "leg", "s"}
 
-    Order: legs (by id), then corners/tees (by node id), then doors (by id)."""
+    Order: legs (by id), then corners/tees (by node id), then doors (by id).
+
+    `xy_pass` IS THE ONE A MATCHER MUST COMPARE AGAINST, and the distinction is not
+    cosmetic. `xy` is where the door IS — on a wall FACE, half the clear width off the
+    centreline (`attach_doors` records that as `offset`). A walk observes a door as a
+    PASSING event, i.e. on the centreline. Scoring the walk's passing point against the
+    door's own `xy` therefore builds a fixed |offset| ~ W/2 error into every correct
+    match — 0.91 m on a 1.82 m corridor, which is the FULL D2 offset budget — and a
+    matcher that minimises it slides the whole placement sideways by that much to make
+    the doors "fit" (measured: it traded an inlier on the untouched corridor for one on
+    the moved wall and still reported median residual 0.0015 m). `xy_pass` projects the
+    door back onto its leg's centreline (a + s*dir), which is the event the walk actually
+    produced. Doors with no host leg keep `xy_pass = xy`."""
     ev = []
+    legs_by_id = {}
     for g in skel.get("legs", []):
         ev.append({"id": f"leg:{g['id']}", "kind": "leg", "length": g["length"],
                    "width": g["width"], "a": g["a"], "b": g["b"]})
+        legs_by_id[int(g["id"])] = g
     for nd in skel.get("nodes", []):
         if nd["kind"] in ("corner", "tee"):
             ev.append({"id": f"corner:{nd['id']}", "kind": "corner", "xy": nd["xy"],
                        "turn_deg": nd.get("turn_deg"), "legs": nd["legs"],
                        "node_kind": nd["kind"]})
     for d in skel.get("doors", []):
+        g = legs_by_id.get(int(d["leg"])) if d.get("leg") is not None else None
+        if g is None:
+            xy_pass = list(d["xy"])
+        else:
+            p = (np.asarray(g["a"], dtype=np.float64)
+                 + float(d["s"]) * np.asarray(g["dir"], dtype=np.float64))
+            xy_pass = _pt(p)
         ev.append({"id": f"door:{d['id']}", "kind": "door", "xy": d["xy"],
-                   "leg": d["leg"], "s": d["s"]})
+                   "xy_pass": xy_pass, "leg": d["leg"], "s": d["s"]})
     return ev
 
 

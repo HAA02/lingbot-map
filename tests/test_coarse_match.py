@@ -322,6 +322,101 @@ class TestExactRecovery(_MatchAssertions):
 
 
 # --------------------------------------------------------------------------------------
+# 2b — P2: what the placement is allowed to be steered BY
+# --------------------------------------------------------------------------------------
+
+class TestWhatSteersThePlacement(_MatchAssertions):
+    """Three P2 fixes, each pinned by the measurement that motivated it. All three are
+    about the same failure: the matcher was being pulled onto landmarks that cannot
+    carry the accuracy this pipeline claims, and then confirming the result."""
+
+    def setUp(self):
+        self.skel = _stair_skeleton()
+        self.tf, self.traj, self.plan_walk, self.ds = _make_walk(STAIR, STAIR_WALK_DOORS)
+        self.res = cm.coarse_match(self.skel, self.traj, door_s=self.ds)
+        self.step = float(np.linalg.norm(np.diff(self.plan_walk, axis=0), axis=1).max())
+
+    def test_a_door_is_matched_on_the_centreline_not_on_its_leaf(self):
+        """A walk observes a door as a PASSING event, on the centreline; the drawing puts
+        the leaf on a wall FACE. Comparing those two builds a fixed W/2 = 0.91 m error
+        into every CORRECT match — the whole D2 offset budget — so the plan side must
+        offer the passing point (plan_events['xy_pass']) and the matcher must use it.
+        Both halves are checked here: each matched door is within half a walk sample of
+        its passing point AND still a full half-width from its leaf."""
+        self.assertEqual(self.res["status"], "ok")
+        by_id = {e["id"]: e for e in ps.plan_events(self.skel)}
+        rev = cm.recon_events(self.traj, door_s=self.ds)
+        doors = [(ri, pid) for ri, pid in self.res["best"]["matches"] if pid.startswith("door")]
+        self.assertGreaterEqual(len(doors), 4, self.res["best"]["matches"])
+        for ri, pid in doors:
+            e = next(x for x in rev if x["index"] == ri)
+            p = ps.apply_candidate_transform(self.res["best"]["transform"], [e["xy"]])[0]
+            pe = by_id[pid]
+            to_pass = float(np.linalg.norm(p - np.asarray(pe["xy_pass"], dtype=np.float64)))
+            to_leaf = float(np.linalg.norm(p - np.asarray(pe["xy"], dtype=np.float64)))
+            self.assertLess(to_pass, 0.5 * self.step, f"{pid}: {to_pass:.4f} m off its passing point")
+            self.assertAlmostEqual(to_leaf, 0.5 * W, delta=0.05,
+                                   msg=f"{pid}: the leaf really is half a corridor away")
+
+    def test_the_reported_residual_charges_every_inlier(self):
+        """`residual` is the MEAN over inliers (coarse_match.RESID_AGG). The median it
+        replaced let HALF the inliers sit anywhere inside the association tolerance for
+        free — and those tolerances are wider than the D2 offset, which is the slack a
+        slid placement lives in. On the clean plan every inlier really is exact, so the
+        two agree here; what this pins is that the number is not a median in disguise."""
+        best = self.res["best"]
+        self.assertEqual(best["inlier_ratio"], 1.0)
+        self.assertLess(best["residual"], 0.5 * self.step)
+        self.assertGreater(best["residual"], 0.0)          # ...and it is not rounded away
+
+    def test_a_truncated_plan_leg_no_longer_drags_the_placement(self):
+        """One wall segment of leg A deleted, so the plan keeps 3 legs / 2 corners while
+        the walk still has 4 legs — the shape of every confident-wrong answer in the
+        cycle-12 sweep. The old scoring confirmed a placement 0.746 m off (an exactly
+        fitting SLID subset: residual 0.0 on 9 of 12 events); it must now land on the
+        truth."""
+        segs = _corridor_walls(STAIR)
+        skel = ps.corridor_skeleton(segs[[i for i in range(len(segs)) if i != 0]],
+                                    doors=list(STAIR_PLAN_DOORS))
+        self.assertEqual(len(skel["legs"]), 3)
+        res = cm.coarse_match(skel, self.traj, door_s=self.ds)
+        self.assert_contract(res, skel, self.traj, self.ds)
+        self.assertEqual(res["status"], "ok", (res["hold_reason"], res["margin"]))
+        off = float(np.linalg.norm(np.asarray(res["best"]["transform"]["translation"])
+                                   - np.asarray(self.tf["translation"])))
+        self.assertLess(off, 0.05, f"placement slid {off:.3f} m onto the truncated leg")
+        self.assert_transform_close(res["best"]["transform"], self.tf)
+
+    def test_without_door_evidence_the_same_walk_only_holds(self):
+        """THE operating condition of the real upload (upload_1781521406685 has no
+        physical doors at all). Stripped of doors, the 4-leg staircase is exactly as
+        ambiguous as the 2-leg L — corner and leg geometry alone cannot tell the walk
+        from its mirror — and the matcher must HOLD rather than pick. Measured across the
+        qa perturbation sweep this condition confirms NOTHING and, just as importantly,
+        gets NOTHING wrong: 0 confident answers, 0 outside D2."""
+        skel = ps.corridor_skeleton(_corridor_walls(STAIR))
+        res = cm.coarse_match(skel, self.traj)
+        self.assert_contract(res, skel, self.traj)
+        self.assertEqual((res["status"], res["hold_reason"]), ("hold", "ambiguous_margin"))
+        self.assertIsNone(res["best"])
+        self.assertLess(res["margin"], res["gates"]["margin_min"])
+        top = res["candidates"][:2]
+        self.assertNotEqual(int(top[0]["transform"]["chi"]), int(top[1]["transform"]["chi"]))
+
+    def test_an_independent_lateral_prior_is_what_replaces_the_doors(self):
+        """...and the way out is evidence, not a relaxed margin: the corridor-width wall
+        anchor is an INDEPENDENT lateral scale, and at +-20 % it resolves the door-free
+        staircase to the true placement (margin 0.36). Stated because it is the only
+        route the real, door-free upload has."""
+        skel = ps.corridor_skeleton(_corridor_walls(STAIR))
+        res = cm.coarse_match(skel, self.traj, s_h_prior=TRUE["s_h"], s_h_rel_tol=0.20)
+        self.assert_contract(res, skel, self.traj)
+        self.assertEqual(res["status"], "ok", (res["hold_reason"], res["margin"]))
+        self.assertGreaterEqual(res["margin"], res["gates"]["margin_min"])
+        self.assert_transform_close(res["best"]["transform"], self.tf)
+
+
+# --------------------------------------------------------------------------------------
 # 3 — SCENARIO 2: perturbed drawing -> recovered anyway, changes reported as outliers
 # --------------------------------------------------------------------------------------
 
@@ -562,9 +657,20 @@ class TestRefusals(_MatchAssertions):
             self.assertGreater(abs(c["transform"]["s_h"] - 0.5), 0.25 * 0.5)
 
     def test_a_correct_prior_prunes_mirrored_candidates(self):
-        """The measured, honest benefit of s_h_prior: it does not resolve the 2-leg L
-        (see TestAmbiguityHolds), but on a richer plan it removes the mirrored fits,
-        which widens the margin."""
+        """The measured, honest benefit of s_h_prior, RE-MEASURED after the P2 scoring
+        fix: it prunes candidates that disagree with it — every one of them mirrored —
+        and it never makes the answer more ambiguous.
+
+        What it no longer does on this fixture is WIDEN the margin, and that is a result,
+        not a slackened assertion: the mirrors used to reach the runner-up slot, so
+        deleting them opened the gap (the old measurement, 0.22 -> 0.37). Scoring the
+        residual on the fraction it actually explains already keeps them out of that slot
+        (plain margin 0.263, top-2 gap now set by a NON-mirrored fit), so at the default
+        +-25 % the prior removes only lower-ranked mirrors and the margin is unchanged to
+        the last digit. The benefit is still there and still measurable — it just needs a
+        tolerance tight enough to reach the surviving mirror (s_h 1.491, inside +-25 % of
+        1.97 but outside +-20 %), which `test_a_tighter_prior_reaches_the_last_mirror`
+        pins."""
         skel = _stair_skeleton()
         tf, traj, _, ds = _make_walk(STAIR, STAIR_WALK_DOORS)
         plain = cm.coarse_match(skel, traj, door_s=ds)
@@ -572,8 +678,35 @@ class TestRefusals(_MatchAssertions):
         self.assert_contract(primed, skel, traj, ds)
         self.assertEqual(primed["status"], "ok")
         self.assertLess(len(primed["candidates"]), len(plain["candidates"]))
-        self.assertGreater(primed["margin"], plain["margin"])
+        # ...and what it removed is exactly what disagreed with the PRIOR (that is the
+        # mechanism — s_h, not handedness), mirrors among them.
+        kept = {c["method"] for c in primed["candidates"]}
+        dropped = [c for c in plain["candidates"] if c["method"] not in kept]
+        self.assertTrue(dropped)
+        for c in dropped:
+            self.assertGreater(abs(c["transform"]["s_h"] - TRUE["s_h"]), 0.25 * TRUE["s_h"], c)
+        self.assertTrue(any(int(c["transform"]["chi"]) != int(tf["chi"]) for c in dropped),
+                        dropped)
+        self.assertGreaterEqual(primed["margin"], plain["margin"])   # never MORE ambiguous
         self.assert_transform_close(primed["best"]["transform"], tf,
+                                    yaw_tol=0.05, scale_rel=2e-3, offset=0.01)
+
+    def test_a_tighter_prior_reaches_the_last_mirror(self):
+        """The prior's margin benefit, still real, now stated at the tolerance where it
+        actually applies: +-20 % excludes the surviving mirror's s_h (1.491) and the
+        top-2 gap opens 0.263 -> 0.472. A prior is evidence with a reach, and this pins
+        the reach instead of claiming it holds at every tolerance."""
+        skel = _stair_skeleton()
+        tf, traj, _, ds = _make_walk(STAIR, STAIR_WALK_DOORS)
+        plain = cm.coarse_match(skel, traj, door_s=ds)
+        tight = cm.coarse_match(skel, traj, door_s=ds, s_h_prior=TRUE["s_h"],
+                                s_h_rel_tol=0.20)
+        self.assert_contract(tight, skel, traj, ds)
+        self.assertEqual(tight["status"], "ok")
+        self.assertGreater(tight["margin"], plain["margin"] + 0.15)
+        for c in tight["candidates"][1:]:
+            self.assertEqual(int(c["transform"]["chi"]), int(tf["chi"]), c)  # no mirror left
+        self.assert_transform_close(tight["best"]["transform"], tf,
                                     yaw_tol=0.05, scale_rel=2e-3, offset=0.01)
 
     def test_no_refusal_ever_carries_a_transform(self):

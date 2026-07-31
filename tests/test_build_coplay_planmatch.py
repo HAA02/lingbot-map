@@ -463,7 +463,21 @@ class TestDoorEvidenceResolvesTheTie(_DoorFixture):
         self.assertLess(float(np.abs(np.asarray(got["translation"], dtype=np.float64)
                                      - np.asarray(self.tf["translation"], dtype=np.float64)).max()),
                         0.01, got["translation"])
-        self.assertEqual(self.pm_yes["best"]["residual"], 0.0)
+        # `residual` is now the MEAN over the inliers, not the median (dev-core P2, see
+        # coarse_match.RESID_AGG), so this can no longer be `== 0.0` — and it never
+        # should have been readable as "everything fits exactly": with 4 inliers the
+        # median simply DISCARDED the door, which under the old plan-side door position
+        # (the leaf, on the wall face) was mismatched by 0.911 m. It is now matched to
+        # the door's centreline PASSING point (plan_skeleton.plan_events['xy_pass']) and
+        # the only error left is this fixture's own walk sampling: the door time is the
+        # nearest pose index, so the door event can sit up to half a sample step off the
+        # annotated point, and nothing else contributes. Bound derived from the fixture,
+        # not a tolerance picked to pass.
+        step = float(np.linalg.norm(np.diff(self.plan_walk, axis=0), axis=1).max())
+        self.assertEqual(self.pm_yes["best"]["n_inliers"], 4)
+        self.assertLess(self.pm_yes["best"]["residual"],
+                        0.5 * step / self.pm_yes["best"]["n_inliers"],
+                        f"door match off by more than half a {step:.3f} m sample step")
 
     def test_door_s_is_what_actually_reached_coarse_match(self):
         """The wiring itself: --door-times seconds -> pose time axis -> door_arclengths ->

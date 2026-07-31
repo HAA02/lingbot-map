@@ -47,9 +47,12 @@ which evidence works - tests/test_coarse_match.py pins each line below:
   * `s_h_prior=` DOES NOT break the 2-leg L either, contrary to what this docstring
     claimed before it was measured: only s_f is rescaled by the backwards fit (s_h 1.97
     -> 2.01 on the 1.82 m L fixture), so no usable s_h tolerance separates the two. What
-    it DOES buy is pruning the MIRRORED candidates on a richer plan (measured on the
-    4-leg staircase: 8 -> 5 candidates, margin 0.22 -> 0.37), and a prior that agrees
-    with no candidate is a REJECT 'scale_out_of_band' - never a fit pulled onto it.
+    it DOES buy is pruning the MIRRORED candidates on a richer plan (re-measured on the
+    4-leg staircase after the P2 scoring fix: 8 -> 6 candidates at the default +-25 %,
+    where the margin is ALREADY 0.263 and does not move because the surviving mirror's
+    s_h 1.49 is just inside that band; at +-20 % it is 8 -> 3 and the margin opens to
+    0.472). A prior that agrees with no candidate is a REJECT 'scale_out_of_band' -
+    never a fit pulled onto it.
 
 TRIMMING / ROBUSTNESS
 ---------------------
@@ -60,10 +63,16 @@ TRIMMING / ROBUSTNESS
   translation) plus a coordinate-descent search over multiplicative scale factors -
   partial traversal makes the seed's leg-length ratio biased LOW, and the factor 1.0 is
   always tried first so an already-exact seed is never moved (ties keep the seed);
-* leg residuals are point-to-SEGMENT distances, which is deliberately asymmetric:
-  walking only part of a plan leg costs nothing (partial match), walking PAST its end
-  costs immediately (the walk would go through a wall);
-* `residual` is the MEDIAN over inliers, so a few field changes cannot inflate it;
+* leg association is asymmetric: walking only part of a plan leg costs nothing (partial
+  match), walking PAST its end DISQUALIFIES the pairing (the walk would go through a
+  wall) — but the over-run never enters the cost that is minimised, because leg ends move
+  whenever a wall is edited and a fit must not be steered by them (see OVER_WEIGHT);
+* `residual` is the MEAN LATERAL error over the INLIERS ONLY — bounded by the
+  association tolerances by construction, so a field change still cannot blow it up, but
+  no inlier is free (see RESID_AGG for why the median it replaced was exploitable) — and
+  the score credits it only in proportion to how much of the walk the candidate actually
+  explains (see Q_BASE/W_RESID — a self-chosen subset always fits better, so an
+  unnormalised residual bonus rewards explaining LESS);
 * candidates that differ only numerically are deduped, otherwise one answer found from
   several corners would look like a tie and force a spurious HOLD.
 
@@ -109,15 +118,45 @@ TOL_PER_WIDTH = {"corner_pos": 0.60, "leg_lat": 0.30, "door_pos": 0.80}
 #: sideways. A DISCOUNT and not a free slack on purpose: a free slack has a cliff, and
 #: with a 0.9 m cliff a placement that starts the walk 1 m inside a dead-end wall became
 #: a confident 'ok' with the moved corridor unreported (measured). See `_pt_line` for why
-#: the two directions differ at all. P2 tunes this against the qa perturbation suite.
+#: the two directions differ at all.
+#:
+#: WHERE IT APPLIES (P2, measured — see `_associate`): over-run is an ASSOCIATION VETO
+#: (a leg that runs too far past a plan leg's end is not that leg) but it is NOT part of
+#: the residual VALUE that scoring and refinement minimise. Charging it as residual made
+#: the matcher PAY to keep the walk inside a leg whose END had moved, and the cheapest
+#: way to stop paying is to shrink the scale and slide the placement: every 'ok'
+#: confirmation outside the D2 band in the cycle-12 sweep (T>=15 %) was that slide —
+#: e.g. a truncated leg (0.91 m of wall removed at its start) pulled s_h 1.97 -> 1.80 and
+#: the translation 1.05 m off, while the residual it reported fell to 3e-5. Ends are the
+#: unreliable landmark (`_pt_line`); a fit must not be steered by them.
 OVER_WEIGHT = 0.5
 
 #: Event weights in the score: a corner pins position AND rotation, a leg only its own
 #: line, a door only a point.
 EVENT_WEIGHTS = {"corner": 1.5, "leg": 1.0, "door": 1.0}
 
-#: score = weighted_inlier_fraction * (Q_BASE + W_RESID*resid_term + W_COV*coverage),
-#: Q_BASE + W_RESID + W_COV == 1 so score stays in [0, 1].
+#: How the per-inlier residuals are reduced to the one number `residual` that the score
+#: and the `max_residual` gate see. It is the MEAN, and it used to be the median.
+#:
+#: The median was chosen so "a few field changes cannot inflate it" — but under this
+#: matcher's own design a field change is supposed to leave the inlier set entirely (it
+#: becomes an OUTLIER), so the median was not protecting against field changes, it was
+#: giving HALF the inliers a free pass up to the association tolerance. Those tolerances
+#: (corner_pos 1.09 m, door_pos 1.46 m on a 1.82 m corridor) are WIDER THAN THE ACCURACY
+#: THIS PIPELINE CLAIMS (D2 offset 0.5 x W = 0.91 m), so a placement can slide by more
+#: than the whole D2 budget, keep every landmark inside tolerance, and still report a
+#: median residual of ~0. MEASURED on the moved-wall fixture: a fit slid 0.88 m — far
+#: enough to blame the UNTOUCHED corridor and miss the moved one — reported median
+#: 0.0125 m and outscored the correct fit; on the mean it reports 0.43 m and loses, and
+#: the correct fit lands 0.14 m out with a clean change report.
+#:
+#: This does NOT reintroduce the least-squares behaviour the module rejects: outliers are
+#: still excluded from the number entirely, and every value entering the mean is capped
+#: by its kind's tolerance, so one changed landmark can move it by at most tol/N.
+RESID_AGG = "mean"
+
+#: score = f * (Q_BASE + W_RESID*resid_term*f + W_COV*coverage) with f the weighted
+#: inlier fraction; Q_BASE + W_RESID + W_COV == 1 so score stays in [0, 1].
 #:
 #: MEASURED reason for the MULTIPLICATIVE form (an additive score was tried first and
 #: was too flat): with `score = a*inliers + b*resid + c*coverage`, a candidate that
@@ -126,6 +165,18 @@ EVENT_WEIGHTS = {"corner": 1.5, "leg": 1.0, "door": 1.0}
 #: the right one on a perturbed plan — inside margin_min — turning a recoverable match
 #: into a spurious HOLD. Multiplying by the inlier fraction makes "how much of the walk
 #: is explained" the dominant axis and residual/coverage only refine it.
+#:
+#: WHY resid_term IS MULTIPLIED BY f A SECOND TIME (P2): the residual is a median over
+#: the candidate's OWN, SELF-CHOSEN inlier set, so it is not comparable across
+#: candidates that explain different amounts of the walk — a smaller subset can always
+#: be fitted better (selection bias, the same effect the paragraph above found and only
+#: half-corrected). Left unnormalised, W_RESID's 0.25 swing outranked a two-event
+#: difference in explanatory power, and MEASURED that is what lifted mirrored/backwards
+#: placements into the top two: at the lowest perturbation point of the cycle-12 sweep a
+#: MIRROR sat in the top two of 10 of the 12 'ambiguous_margin' HOLDs, always with a
+#: near-zero residual on 2-3 fewer events than the true fit. Crediting the residual bonus
+#: only for the fraction actually explained ("no credit for fitting data you excluded")
+#: is the fix; it is a change of BASIS, not of any threshold.
 Q_BASE, W_RESID, W_COV = 0.60, 0.25, 0.15
 
 #: Two candidates that agree to within THE ACCURACY THIS PIPELINE CLAIMS (team DoD D2:
@@ -369,7 +420,10 @@ def _prep_plan(pev: list) -> dict:
             "corner_xy": np.asarray([e["xy"] for e in c], dtype=np.float64).reshape(-1, 2),
             "corner_turn": np.asarray([np.nan if e.get("turn_deg") is None else e["turn_deg"]
                                        for e in c], dtype=np.float64),
-            "door_xy": np.asarray([e["xy"] for e in d], dtype=np.float64).reshape(-1, 2),
+            # the door's CENTRELINE passing point, never the door leaf's own position —
+            # see plan_skeleton.plan_events, where the W/2 bias this avoids is measured.
+            "door_xy": np.asarray([e.get("xy_pass", e["xy"]) for e in d],
+                                  dtype=np.float64).reshape(-1, 2),
             "leg_a": ga, "leg_b": gb,
             "leg_dir": gd / (np.linalg.norm(gd, axis=1, keepdims=True) + 1e-12),
             "leg_len": np.asarray([e["length"] for e in g], dtype=np.float64),
@@ -446,26 +500,32 @@ def _associate(tf: dict, R: dict, P: dict, tol: dict, gates: dict, weights: dict
         latB, ovB, pB = _pt_line(b_t, P["leg_a"], P["leg_dir"], P["leg_len"])
         latM = _pt_line(m_t, P["leg_a"], P["leg_dir"], P["leg_len"])[0]
         over = OVER_WEIGHT * np.maximum(ovA, ovB)
-        resid = np.maximum(np.maximum(np.maximum(latA, latB), latM), over)
+        lat = np.maximum(np.maximum(latA, latB), latM)
+        # `gate` decides WHETHER the walk leg can be that plan leg (over-run included:
+        # walking past the end means walking through a wall); `lat` is what the match
+        # COSTS once accepted. Keeping the end out of the cost is the whole point — see
+        # OVER_WEIGHT. The outlier report still quotes `gate`, so a leg rejected for
+        # over-running says so with the over-run in its number.
+        gate_leg = np.maximum(lat, over)
         dir_t = (b_t - a_t)
         dir_t = dir_t / (np.linalg.norm(dir_t, axis=1, keepdims=True) + 1e-12)
         cosang = np.abs(dir_t @ P["leg_dir"].T)
         aligned = cosang >= np.cos(np.deg2rad(tol["leg_ang_deg"]))
         for i, e in enumerate(R["leg"]):
-            j = int(np.argmin(resid[i]))
-            ok = aligned[i] & (resid[i] <= tol["leg_lat"])
+            j = int(np.argmin(gate_leg[i]))
+            ok = aligned[i] & (gate_leg[i] <= tol["leg_lat"])
             for jj in np.nonzero(ok)[0]:
-                pairs.append((float(resid[i, jj]), e["index"], P["leg"][int(jj)]["id"], "leg",
+                pairs.append((float(lat[i, jj]), e["index"], P["leg"][int(jj)]["id"], "leg",
                               [pA[i, int(jj)] - a_t[i], pB[i, int(jj)] - b_t[i]]))
             if aligned[i].any():
-                ja = int(np.asarray(np.nonzero(aligned[i])[0])[np.argmin(resid[i][aligned[i]])])
-                reason = ("no_plan_leg_within_tol" if resid[i, ja] > tol["leg_lat"]
+                ja = int(np.asarray(np.nonzero(aligned[i])[0])[np.argmin(gate_leg[i][aligned[i]])])
+                reason = ("no_plan_leg_within_tol" if gate_leg[i, ja] > tol["leg_lat"]
                           else "plan_leg_taken")
-                near[e["index"]] = (float(resid[i, ja]),
-                                    P["leg"][ja]["id"] if resid[i, ja] <= 3.0 * tol["leg_lat"] else None,
+                near[e["index"]] = (float(gate_leg[i, ja]),
+                                    P["leg"][ja]["id"] if gate_leg[i, ja] <= 3.0 * tol["leg_lat"] else None,
                                     reason)
             else:
-                near[e["index"]] = (float(resid[i, j]), None, "leg_heading_mismatch")
+                near[e["index"]] = (float(gate_leg[i, j]), None, "leg_heading_mismatch")
     else:
         for e in R["leg"]:
             near[e["index"]] = (float("inf"), None, "no_plan_leg")
@@ -496,16 +556,18 @@ def _associate(tf: dict, R: dict, P: dict, tol: dict, gates: dict, weights: dict
 
     w_all = sum(weights.get(k, 1.0) for k in kind_of.values()) or 1.0
     w_in = sum(weights.get(k, 1.0) for k in kinds)
-    resid_med = float(np.median(resids)) if resids else float("inf")
+    # MEAN, not median, over the inliers — see RESID_AGG.
+    resid_agg = float(np.mean(resids)) if resids else float("inf")
     # coverage: walked arclength explained by inlier legs / total walked arclength
     leg_index = {e["index"]: i for i, e in enumerate(R["leg"])}
     tot_arc = float(R["leg_arclen"].sum())
     arc_in = float(sum(R["leg_arclen"][leg_index[ri]] for ri, _ in matches if ri in leg_index))
     coverage = arc_in / tot_arc if tot_arc > 1e-9 else 0.0
-    resid_term = 0.0 if not resids else max(0.0, 1.0 - resid_med / max(gates["max_residual"], 1e-9))
-    score = (w_in / w_all) * (Q_BASE + W_RESID * resid_term + W_COV * coverage)
+    frac = w_in / w_all
+    resid_term = 0.0 if not resids else max(0.0, 1.0 - resid_agg / max(gates["max_residual"], 1e-9))
+    score = frac * (Q_BASE + W_RESID * resid_term * frac + W_COV * coverage)
     return {"score": float(score), "matches": matches, "outliers": outliers,
-            "n_inliers": len(matches), "residual": (resid_med if resids else float("inf")),
+            "n_inliers": len(matches), "residual": (resid_agg if resids else float("inf")),
             "corr": corr, "kinds": kinds, "coverage": float(coverage)}
 
 
@@ -619,7 +681,18 @@ def _refine(seed: dict, R: dict, P: dict, tol: dict, gates: dict, weights: dict,
             iters: int, factors) -> tuple:
     """Coordinate-descent trimmed refinement: scale factors then a median translation
     correction over the current inliers. Only STRICT improvements are taken and factor
-    1.0 comes first, so an exact seed is never perturbed."""
+    1.0 comes first, so an exact seed is never perturbed.
+
+    MEASURED LIMIT, recorded because the next cycle should not re-discover it: this
+    descent cannot reach a better answer that is separated from the seed by a JOINT move
+    in (scale, translation). The one confident-wrong answer left in the sweep is exactly
+    that — the true placement scores 0.622 against the winner's 0.597 on that perturbed
+    plan and is never generated, because the plan leg it needs is truncated, so at the
+    true scale the leg fails the over-run veto before the translation can catch up.
+    Letting the trimmed translation follow each scale trial IN THE SAME STEP was tried
+    and measured: it does NOT reach it either (winner unchanged at 0.597), so the fix is
+    a better SEED (a second corner correspondence pins scale and position at once), not
+    a better local search."""
     st = {"s_f": seed["s_f"], "s_h": seed["s_h"], "dt": np.asarray(seed["dt"], dtype=np.float64)}
 
     def ev(state):
