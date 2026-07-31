@@ -148,7 +148,8 @@ densified base plan; only the perturbation step differs.
 CLI:
     .venv/bin/python tools/check_plan_match_robust.py [--upload PATH] \\
         [--plan-dxf PLAN.dxf] [--n-perturb 20] [--seed 0] \\
-        [--perturb-mode {structured,fragment,both}] [--selftest-only] [--json OUT.json]
+        [--perturb-mode {structured,fragment,both}] [--selftest-only] \\
+        [--total-ratio 0.20] [--legacy-gate] [--json OUT.json]
 
 `--upload` is accepted but UNUSED by the D2 gate: no real recon-walk-from-upload
 extraction exists in this repo as of this cycle (that is separate P3 scope), and the
@@ -156,19 +157,44 @@ D2 gate needs a walk with a CONSTRUCTIVELY known correct answer to measure accur
 against, which only the synthetic harness provides (dev-core's own test suite is
 synthetic-only for the same reason, see its module docstring).
 
-`--perturb-mode` (Cycle 11, default `structured`) selects the perturbation model: see
-the CYCLE 11 block above. `both` runs and reports both models independently -- exit 0
-only if EVERY item of BOTH suites passes; the printed report always separates them.
+`--perturb-mode` (Cycle 11, default `structured`) selects the perturbation model FOR
+`--legacy-gate` (see the CYCLE 11 block above). The CYCLE 20 default (T-axis) gate is
+structured-only (same restriction `--sweep` already had) and prints a note ignoring
+this flag if it is given without `--legacy-gate`. `both` (legacy path only) runs and
+reports both models independently -- PASS only if EVERY item of BOTH suites passes;
+the printed report always separates them.
 
-Exit codes: 0 = D2 gate PASS (success-rate AND outlier-recall AND ambiguous-HOLD all
-met, for every mode run -- BOTH modes if `--perturb-mode both`), or `--selftest-only`
-PASS for every mode run; 1 = a generator self-test failed, OR the D2 gate ran but one or
-more of its three items missed the threshold in ANY mode run (stated on stderr with the
-measured number -- thresholds are never relaxed to make a number pass); 2 = the D2
-gate could not be evaluated at all (matcher or tests/ harness import failed, the
-harness's own zero-perturbation baseline was not recovered exactly, the density pass
-changed the skeleton it was supposed to leave untouched, or the single-fragment-removal
-regression probe found a topology collapse) -- NEVER a fabricated pass.
+CYCLE 20 -- DEFAULT GATE REDEFINED (thresholds 90%/80% and every QA-owned perturbation
+budget range UNCHANGED; WHAT changed is WHERE on the total-change-ratio axis the gate
+judges -- full measured rationale in the CYCLE 20 block above `GATE_DEFAULT_TOTAL_
+RATIO`; short version: the pre-CYCLE-20 default's actual total-change ratio T was
+measured at ~52%, where even the harness's own CONSTRUCTIVELY KNOWN true transform
+clears the matcher's hard gates only 20% of the time (`compute_oracle_upper_bound`,
+oracle-measured, this cycle) -- no search strategy could ever have passed item①'s 90%
+bar there, so that setting measured harness severity, not the matcher). Without
+`--legacy-gate`, the default now judges items ①-⑤ at ONE point on the total-change-
+ratio axis, `--total-ratio` (default `GATE_DEFAULT_TOTAL_RATIO` = 0.20, measured this
+cycle to land at achieved T≈25.5%, inside the user-specified "실측 T≈25-26%" window).
+`--legacy-gate` reruns the PRE-CYCLE-20 default verbatim (Section 2b's independent-
+range stacked draws, kept, NOT deleted, per instruction) and prints a warning banner
+with the measured oracle/T numbers every run -- preserved for the historical record,
+not a recommended judging point any more. EVERY report (either path) also prints the
+ORACLE UPPER BOUND alongside item① -- "이 시험의 도달 가능 상한" -- so a low ① is never
+misread as a matcher weakness when it is actually a harness-severity ceiling, or vice
+versa.
+
+Exit codes: 0 = D2 gate PASS (items ①-⑤ -- success-rate, outlier-recall, ambiguous-
+HOLD, clean-plan false-alarm rate, span precision-over-prevalence -- ALL met, at the
+judged point: `--total-ratio` by default, or `--legacy-gate`'s point if that flag is
+given; for every mode run if `--perturb-mode both --legacy-gate`), or `--selftest-
+only`/`--selftest-flood` PASS; 1 = a generator self-test failed, OR the D2 gate ran but
+one or more of its FIVE items missed the threshold at the judged point (stated on
+stderr with the measured number -- thresholds/budget ranges are never relaxed to make a
+number pass, in EITHER path); 2 = the D2 gate could not be evaluated at all (matcher or
+tests/ harness import failed, the harness's own zero-perturbation baseline was not
+recovered exactly, the density pass changed the skeleton it was supposed to leave
+untouched, or the single-fragment-removal regression probe found a topology collapse)
+-- NEVER a fabricated pass.
 """
 from __future__ import annotations
 
@@ -998,6 +1024,33 @@ GATE_N_PERTURB_DEFAULT = 20        # D2: "섭동 20개"
 GATE_SUCCESS_RATE_MIN = 0.90       # D2: 성공률 >= 90%  -- UNCHANGED this cycle
 GATE_OUTLIER_RECALL_MIN = 0.80     # D2: outlier recall >= 80%  -- UNCHANGED this cycle
 
+# ---- CYCLE 20: T(총변경비율) 축을 기본 게이트의 1차 축으로 승격 (사용자 결정) ----
+#
+# 왜 고치는가 -- 오라클 실측(천장 리뷰어 실험, 메인 세션이 재현, 이 사이클에 QA가 다시 재현,
+# 아래 `compute_oracle_upper_bound`): 이전 기본 게이트(REMOVE/SHIFT/NOISE 각각 독립
+# 10-30%/10-30%/5-20% 범위에서 중첩 추첨, `run_d2_gate`/`_run_d2_gate_single`, 이번 사이클부터
+# `--legacy-gate`로만 남음)는 실측 총변경비율 T≈52.2%를 만든다(seed=7 n=20, 이번 사이클 재측정,
+# 아래 `--legacy-gate` 배너 참고). 이 T에서는 매처에게 정답 변환(harness의 CONSTRUCTIVELY KNOWN
+# true transform)을 그대로 건네줘도 매처 자신의 하드게이트(min_inlier_ratio/max_residual, 탐색과
+# 무관하게 status=='ok'의 필요조건)를 통과하는 케이스가 4/20=20.0%(이번 사이클 재측정치)뿐이다 --
+# 즉 정답을 줘도 90% 게이트를 못 넘는 시험이었다(산수, 매처의 결함이 아니다). "통과시키려고 고치는
+# 게 아니라, 정답을 줘도 20%인 시험은 매처를 측정하지 못하기 때문"에 판정 지점을 옮긴다 -- 임계값
+# (90%/80%)도, 섭동 크기 범위(REMOVE_FRAC_RANGE/SHIFT_FRAC_RANGE/SHIFT_DIST_RANGE/
+# NOISE_FRAC_RANGE, 10-30%/10-30%/0.3-1.0m/5-20%)도 이 사이클에서 전혀 손대지 않는다 -- 아래
+# `GATE_DEFAULT_TOTAL_RATIO`는 그 범위들 자체가 아니라, Section 2c가 이미 그 범위들의 중앙값
+# 비율로부터 계산해 둔 `SWEEP_ALLOC_WEIGHTS`(변경 없음)를 하나의 T 값에 적용하는 지점만 고른다.
+GATE_DEFAULT_TOTAL_RATIO = 0.20
+# ^ 목표 T=20%가 어느 실측 T에 대응하는지(사용자 지시: "네 배분 규칙으로 어느 목표 T 가 그 실측에
+# 대응하는지 확인해서 정하고, 그 근거를 적어라"): Section 2c의 배분 규칙을 그대로 목표 T=15/20/25%
+# 세 점에 적용해 재측정(이 사이클, seed=7/42/123 x n=20, `--sweep --sweep-ratios 0.15,0.20,0.25`) --
+#   목표T=15% -> 실측T평균=21.6%   목표T=20% -> 실측T평균=25.5%(seed=7 단독 26.3%)
+#   목표T=25% -> 실측T평균=29.7%
+# 사용자가 지정한 "실측 T≈25-26%" 창에 들어오는 목표 지점은 20%뿐이다(15%는 21.6%로 아래, 25%는
+# 29.7%로 위) -- 이미 있던 배분 규칙을 그 창에 맞는 목표 T에 그대로 적용한 결과이지, 현재 값에
+# 맞춰 임계나 범위를 역산한 것이 아니다(임계 90%/80%, 범위 10-30% 등은 이 상수와 무관하게 불변).
+GATE_LEGACY_ORACLE_RATE_MEASURED = 0.20    # 참고용 실측치(이 사이클 재현) -- 판정에 쓰이지 않음,
+GATE_LEGACY_ACHIEVED_T_MEASURED = 0.522    # `--legacy-gate` 경고 배너 문구에만 인용된다.
+
 #: D2 accuracy band ("이 파이프라인이 주장하는 정확도" -- 팀 DoD 문구 그대로), applied to a
 #: perturbed-plan candidate's transform against the harness's CONSTRUCTIVELY known true
 #: transform. Independently defined here (NOT imported from scan2bim/coarse_match.py or
@@ -1712,6 +1765,71 @@ def _build_d2_harness_context() -> dict:
             "clean_span_fired": clean_span_fired, "clean_span_fpr": clean_span_fpr}
 
 
+def compute_oracle_upper_bound(ctx: dict, suite: list) -> dict:
+    """CYCLE 20. THE measurement behind this cycle's gate redefinition (ceiling
+    reviewer's oracle experiment; reproduced by the main session; reproduced again here
+    as an always-on part of every gate report -- see the module docstring's CYCLE 20
+    paragraph and `GATE_DEFAULT_TOTAL_RATIO`'s comment block for the full narrative).
+
+    Hands the harness's CONSTRUCTIVELY KNOWN TRUE transform (`ctx['tf_true']`) DIRECTLY
+    to `scan2bim.coarse_match`'s own association/scoring step (`_associate` -- the SAME
+    function `coarse_match`'s search calls internally for every hypothesis it tries) for
+    every perturbed case in `suite`, and checks the result against the SAME hard gates
+    `finalize_match` requires for status=='ok' (`DEFAULT_GATES['min_inlier_ratio']` /
+    `['max_residual']`, read from `scan2bim.plan_skeleton` via `coarse_match`'s own
+    re-export -- never a QA-invented number). This performs NO search: no candidate
+    generation, no hypothesis scoring, no tie-breaking -- it asks only "if the matcher
+    were TOLD the exact right answer, would ITS OWN hard gates even accept it". Because
+    `coarse_match`'s search can only ever discover transforms and score them against
+    these SAME hard gates, no search strategy -- however good -- can produce a HIGHER
+    item① success rate than this number for this exact perturbed suite: it is a genuine
+    ceiling, not an estimate, and item① (`compute_success_rate`) can never legitimately
+    exceed it (see `_print_single_gate_report`'s bug-note if it ever does).
+
+    A case scores oracle_ok=False if EITHER (a) the perturbed plan has zero legs at all
+    (`plan_events`/`_prep_plan` return nothing to associate against -- 'no_plan_legs', a
+    harness/perturbation-severity condition, not a gate-threshold one), (b) the true
+    transform's own inlier_ratio/residual against that plan misses `DEFAULT_GATES`, or
+    (c) building the perturbed skeleton/association itself raises (recorded, never
+    swallowed). Returns {"n", "n_oracle_ok", "oracle_rate" (None only if `suite` is
+    empty -- never fabricated), "gate_min_inlier_ratio", "gate_max_residual",
+    "detail": [{"index", "oracle_ok", "inlier_ratio", "residual", "n_inliers",
+    "n_events"} or {"index", "oracle_ok": False, "reason"}]}."""
+    cm, ps = ctx["cm"], ctx["ps"]
+    tf_true, traj, door_s, plan_doors = ctx["tf_true"], ctx["traj"], ctx["door_s"], ctx["plan_doors"]
+    gates = dict(cm.DEFAULT_GATES)
+    weights = dict(cm.EVENT_WEIGHTS)
+    rev = cm.recon_events(traj, door_s=door_s)
+    R = cm._prep_recon(rev)
+    n_events = R["n_events"]
+    detail = []
+    n_ok = 0
+    for item in suite:
+        idx = item["index"]
+        try:
+            skel = ps.corridor_skeleton(item["segments"], doors=plan_doors)
+            pev = cm.plan_events(skel)
+            P = cm._prep_plan(pev)
+            if not P["leg"]:
+                detail.append({"index": idx, "oracle_ok": False, "reason": "no_plan_legs"})
+                continue
+            tol = cm._tolerances(P["width_med"], None)
+            a = cm._associate(tf_true, R, P, tol, gates, weights)
+            ratio = (a["n_inliers"] / n_events) if n_events else 0.0
+            ok = bool(ratio >= gates["min_inlier_ratio"] and a["residual"] <= gates["max_residual"])
+            if ok:
+                n_ok += 1
+            detail.append({"index": idx, "oracle_ok": ok, "inlier_ratio": round(ratio, 4),
+                           "residual": round(float(a["residual"]), 4),
+                           "n_inliers": int(a["n_inliers"]), "n_events": int(n_events)})
+        except Exception as e:                          # a perturbation crashing the oracle check is DATA
+            detail.append({"index": idx, "oracle_ok": False, "reason": f"{type(e).__name__}: {e}"})
+    n = len(suite)
+    return {"n": n, "n_oracle_ok": n_ok, "oracle_rate": ((n_ok / n) if n else None),
+            "gate_min_inlier_ratio": float(gates["min_inlier_ratio"]),
+            "gate_max_residual": float(gates["max_residual"]), "detail": detail}
+
+
 def _evaluate_suite(ctx: dict, suite: list) -> dict:
     """CYCLE 12: the per-suite matching + scoring tail of `_run_d2_gate_single`, factored
     out so `--sweep` can call it once per (ratio, seed) point against the ONE shared
@@ -1754,6 +1872,10 @@ def _evaluate_suite(ctx: dict, suite: list) -> dict:
                                     ps.apply_candidate_transform, transform_confirmed_indices)
     span_stats = compute_span_precision(cases, ctx["base_segments"], ctx["spans_all"],
                                         transform_confirmed_indices, ps.apply_candidate_transform)
+    # CYCLE 20: the oracle ceiling for THIS suite (see compute_oracle_upper_bound's own
+    # docstring) -- computed unconditionally, every suite evaluation, never opt-in, so a
+    # low item① can never again be silently misread without the ceiling right next to it.
+    oracle = compute_oracle_upper_bound(ctx, suite)
 
     ambiguous = build_ambiguous_fixture(cm, ps, ctx["tcm"], ctx["tps"])
     hold = verify_hold_gate(cases, ambiguous)
@@ -1784,7 +1906,7 @@ def _evaluate_suite(ctx: dict, suite: list) -> dict:
     return {"cases": cases, "case_summaries": case_summaries, "contract_violations": contract_violations,
             "success": succ, "failure_reasons": failure_reasons,
             "outlier_recall": recall, "hold": hold,
-            "span_precision": span_stats,
+            "span_precision": span_stats, "oracle": oracle,
             "clean_span_fired": ctx["clean_span_fired"], "clean_span_fpr": ctx["clean_span_fpr"],
             "n_spans_total": ctx["n_spans_total"],
             "gate1_ok": gate1_ok, "gate2_ok": gate2_ok, "gate3_ok": gate3_ok,
@@ -1826,7 +1948,7 @@ def _run_d2_gate_single(seed: int, n_perturb: int, perturb_mode: str) -> dict:
             "contract_violations": ev["contract_violations"],
             "success": ev["success"], "failure_reasons": ev["failure_reasons"],
             "outlier_recall": ev["outlier_recall"], "hold": ev["hold"],
-            "span_precision": ev["span_precision"],
+            "span_precision": ev["span_precision"], "oracle": ev["oracle"],
             "clean_span_fired": ev["clean_span_fired"], "clean_span_fpr": ev["clean_span_fpr"],
             "n_spans_total": ev["n_spans_total"],
             "gate1_ok": ev["gate1_ok"], "gate2_ok": ev["gate2_ok"], "gate3_ok": ev["gate3_ok"],
@@ -1852,6 +1974,68 @@ def run_d2_gate(seed: int, n_perturb: int, perturb_mode: str = "structured") -> 
                 "structured": g_structured, "fragment": g_fragment,
                 "gate_ok": bool(g_structured["gate_ok"] and g_fragment["gate_ok"])}
     return _run_d2_gate_single(seed, n_perturb, perturb_mode)
+
+
+def run_d2_gate_at_ratio(seed: int, n_perturb: int,
+                         total_frac: float = GATE_DEFAULT_TOTAL_RATIO) -> dict:
+    """CYCLE 20 -- the redefined DEFAULT D2 gate: judges items ①-⑤ at ONE point on the
+    TOTAL-CHANGE-RATIO axis (Section 2c's `generate_perturbation_suite_at_total_ratio`,
+    UNCHANGED mechanism, already exercised by `--sweep`) instead of Section 2b's
+    independent-range stacked draws (`run_d2_gate`/`_run_d2_gate_single`, preserved
+    verbatim, reachable via `--legacy-gate` -- see `GATE_DEFAULT_TOTAL_RATIO`'s own
+    comment block and the module docstring's CYCLE 20 paragraph for the full measured
+    rationale: the independent-range default's actual T≈52% left even the harness's own
+    CONSTRUCTIVELY KNOWN true transform clearing the matcher's hard gates only 20% of
+    the time, oracle-measured -- no search strategy could ever pass ①'s 90% bar there).
+
+    `total_frac` defaults to `GATE_DEFAULT_TOTAL_RATIO` (0.20) -- see that constant's own
+    comment for the measured mapping (target T=20% -> achieved T≈25.5% mean over 3
+    seeds, re-measured this cycle, landing inside the user-specified "실측 T≈25-26%"
+    window). `REMOVE_FRAC_RANGE`/`SHIFT_FRAC_RANGE`/`SHIFT_DIST_RANGE`/
+    `NOISE_FRAC_RANGE` (10-30%/10-30%/0.3-1.0m/5-20%, QA-owned, UNCHANGED) still define
+    the split via `SWEEP_ALLOC_WEIGHTS` (Section 2c, unchanged) -- this function invents
+    no new perturbation budget; it reuses the DoD's own ranges' relative weights at a
+    single point instead of drawing each independently across its own full range every
+    case (Section 2b's behaviour, kept exactly as-is under `--legacy-gate`).
+
+    Returns the SAME shape `_run_d2_gate_single` returns (`case_summaries`, `success`,
+    `outlier_recall`, `hold`, `span_precision`, `oracle`, `gate1_ok`..`gate5_ok`,
+    `gate_ok`, ...) PLUS `total_ratio_target`/`achieved_ratio_mean`/`achieved_ratio_min`/
+    `achieved_ratio_max` (Section 2c's own achieved-ratio bookkeeping, `run_sweep`'s
+    identical computation, reused verbatim here) and `perturb_mode: 'structured'` (the
+    total-ratio generator is structured-only, same restriction `--sweep` already has --
+    `--legacy-gate` is the only path where `fragment`/`both` remain selectable). Raises
+    ImportError/RuntimeError exactly as `_build_d2_harness_context` does -- the caller
+    (`main`) turns either into exit 2, never a fabricated verdict."""
+    ctx = _build_d2_harness_context()
+    base_segments, wall_ids = ctx["base_segments"], ctx["wall_ids"]
+    n_base = len(base_segments)
+    suite = generate_perturbation_suite_at_total_ratio(base_segments, wall_ids, seed, n_perturb,
+                                                        total_frac)
+    ev = _evaluate_suite(ctx, suite)
+    achieved = []
+    for item in suite:
+        p = item["ground_truth"]["params"]
+        achieved.append((p["n_removed"] + p["n_shifted"] + p["n_noise"]) / n_base)
+
+    return {"n_perturb": n_perturb, "seed": seed, "perturb_mode": "structured",
+            "total_ratio_target": float(total_frac),
+            "achieved_ratio_mean": float(np.mean(achieved)),
+            "achieved_ratio_min": float(np.min(achieved)),
+            "achieved_ratio_max": float(np.max(achieved)),
+            "density_check": ctx["density_check"],
+            "single_removal_check": ctx["single_removal_check"],
+            "clean_baseline": ctx["clean_baseline"],
+            "case_summaries": ev["case_summaries"],
+            "contract_violations": ev["contract_violations"],
+            "success": ev["success"], "failure_reasons": ev["failure_reasons"],
+            "outlier_recall": ev["outlier_recall"], "hold": ev["hold"],
+            "span_precision": ev["span_precision"], "oracle": ev["oracle"],
+            "clean_span_fired": ev["clean_span_fired"], "clean_span_fpr": ev["clean_span_fpr"],
+            "n_spans_total": ev["n_spans_total"],
+            "gate1_ok": ev["gate1_ok"], "gate2_ok": ev["gate2_ok"], "gate3_ok": ev["gate3_ok"],
+            "gate4_ok": ev["gate4_ok"], "gate5_ok": ev["gate5_ok"],
+            "gate_ok": ev["gate_ok"]}
 
 
 def selftest_flood_detection(seed: int = 7, n_perturb: int = 20) -> dict:
@@ -2065,6 +2249,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="comma-separated seeds, e.g. '7,42,123' (the default -- at least 3 recommended "
                          "so mean AND range are meaningful, per this cycle's instruction). Only used "
                          "with --sweep.")
+    ap.add_argument("--total-ratio", type=float, default=GATE_DEFAULT_TOTAL_RATIO,
+                    help=f"CYCLE 20: target total-change ratio T (fraction of the densified STAIR "
+                         f"base's fragment count) the DEFAULT D2 gate judges ①-⑤ at -- Section 2c's "
+                         f"allocation weights (REMOVE/SHIFT/NOISE_FRAC_RANGE midpoints, UNCHANGED) "
+                         f"split this single T into remove/shift/noise, the SAME mechanism --sweep "
+                         f"already uses. Default {GATE_DEFAULT_TOTAL_RATIO} (measured this cycle to "
+                         f"land at achieved T~25.5%%, seed=7 alone 26.3%% -- see "
+                         f"GATE_DEFAULT_TOTAL_RATIO's own comment for the full mapping derivation). "
+                         f"Ignored (with a printed note) if --legacy-gate is also given -- that path "
+                         f"uses REMOVE_FRAC_RANGE/SHIFT_FRAC_RANGE/NOISE_FRAC_RANGE directly, drawn "
+                         f"independently per case, unchanged from before CYCLE 20.")
+    ap.add_argument("--legacy-gate", action="store_true",
+                    help="CYCLE 20: run the PRE-CYCLE-20 default D2 gate verbatim (Section 2b's "
+                         "independent-range stacked draws, REMOVE/SHIFT/NOISE_FRAC_RANGE each drawn "
+                         "independently every case -- measured actual total-change ratio T~52%%, at "
+                         "which even the harness's CONSTRUCTIVELY KNOWN true transform clears the "
+                         "matcher's own hard gates only 4/20=20.0%% of the time (oracle-measured, "
+                         "this cycle, compute_oracle_upper_bound) -- this setting cannot measure the "
+                         "matcher, because the perfect answer already fails it. Kept runnable for the "
+                         "historical record, NOT deleted, per instruction -- prints a warning banner "
+                         "with the measured numbers every run. Without this flag, the default gate "
+                         "judges at --total-ratio instead (CYCLE 20).")
     return ap
 
 
@@ -2076,6 +2282,11 @@ def _print_single_gate_report(gate: dict) -> None:
     numbers."""
     mode = gate["perturb_mode"]
     tag = f"[{mode}]"
+    if "total_ratio_target" in gate:
+        print(f"{tag} [판정 지점, CYCLE 20] 목표 총변경비율 T={gate['total_ratio_target']*100:.1f}% "
+              f"-> 실측 T평균={gate['achieved_ratio_mean']*100:.1f}% "
+              f"(범위 {gate['achieved_ratio_min']*100:.1f}-{gate['achieved_ratio_max']*100:.1f}%, "
+              f"n={gate['n_perturb']}건, seed={gate['seed']}) -- 사용자 지정 창(실측 T≈25-26%) 내부")
     dc = gate["density_check"]
     print(f"{tag} P0-Perturb 밀도 보정(Cycle 7 item A): raw N={dc['raw_n_segments']} -> "
           f"densified N={dc['densified_n_segments']} (target_piece_len={DENSIFY_TARGET_PIECE_LEN_M} m); "
@@ -2118,6 +2329,19 @@ def _print_single_gate_report(gate: dict) -> None:
             print(f"{tag}    해석: inlier_ratio_below_min 이 실패 사유 중 최다({top_n}/{n_fail}건) -- "
                   f"'변경된 벽을 outlier 로 빼는 대신 후보 전체를 거부'하고 있다는 뜻 -- "
                   f"부분매칭(trimmed/RANSAC) 설계의 핵심 실패모드로 보고, 완화 아님.")
+
+    oracle = gate.get("oracle")
+    if oracle is not None and oracle["oracle_rate"] is not None:
+        headroom = oracle["oracle_rate"] - succ["rate"]
+        bug_note = (" [경고: 실측이 오라클 상한을 초과 -- 원리적으로 불가능, 즉시 재확인 필요]"
+                   if headroom < -1e-9 else "")
+        print(f"{tag} [오라클 상한, CYCLE 20] 정답 변환을 그대로 매처의 하드게이트(min_inlier_ratio>="
+              f"{oracle['gate_min_inlier_ratio']:.2f}, residual<={oracle['gate_max_residual']:.2f})에 "
+              f"통과시켰을 때: {oracle['n_oracle_ok']}/{oracle['n']} = {oracle['oracle_rate']*100:.1f}% "
+              f"-- 이 섭동 지점에서 어떤 검색 전략도 ①을 이 값보다 높일 수 없다(탐색 품질과 무관, "
+              f"정답을 이미 줬으므로). ①실측 대비 헤드룸={headroom*100:+.1f}%p{bug_note}")
+    elif oracle is not None:
+        print(f"{tag} [오라클 상한, CYCLE 20] 계산 불가(n=0)")
 
     print(f"{tag} ② outlier recall (Cycle 7 분모 교정): 변경 세그먼트 총 {recall['n_all_changed_segments']}건 중 "
           f"not_observable(워크에서 {OUTLIER_RECALL_RADIUS_M:.2f}m 밖)={recall['n_not_observable']}건, "
@@ -2364,12 +2588,105 @@ def main(argv=None) -> int:
         return 2
 
     print("")
-    print(f"[D2 게이트 실배선] tests/test_coarse_match.py 하네스(STAIR corridor, "
-          f"4 legs/3 corners/5 doors) 재사용 -- QA 섭동 생성기(seed={args.seed}, "
-          f"n={args.n_perturb}, mode={args.perturb_mode})로, 밀도 보정(densify_wall_segments) 후의 "
-          f"벽만 섭동, 문/워크는 고정.")
+
+    def _print_fail_misses(g: dict, tag_prefix: str = "") -> list:
+        """Shared FAIL-reason decomposition for ONE mode's gate dict -- factored out
+        (CYCLE 20) so both the --legacy-gate path (may run 'both' modes) and the new
+        T-axis default path (always structured-only, single dict) share identical
+        wording instead of two independently-maintained copies."""
+        sub = []
+        if not g["gate1_ok"]:
+            sub.append(f"①{g['success']['rate']*100:.1f}%<{GATE_SUCCESS_RATE_MIN*100:.0f}%")
+        if not g["gate2_ok"]:
+            rr = "계산불가" if g["outlier_recall"]["recall"] is None else f"{g['outlier_recall']['recall']*100:.1f}%"
+            sub.append(f"②{rr}(<{GATE_OUTLIER_RECALL_MIN*100:.0f}%)")
+        if not g["gate3_ok"]:
+            sub.append("③HOLD위반")
+        if not g["gate4_ok"]:
+            sub.append(f"④무섭동오경보{g['clean_span_fired']}/{g['n_spans_total']}>0")
+        if not g["gate5_ok"]:
+            pv = "N/A" if g["span_precision"]["precision"] is None else f"{g['span_precision']['precision']*100:.1f}%"
+            sub.append(f"⑤precision{pv}<{GATE_SPAN_PRECISION_PREVALENCE_FACTOR}x prevalence")
+        oc = g.get("oracle")
+        if oc is not None and oc["oracle_rate"] is not None:
+            sub.append(f"[오라클상한={oc['oracle_rate']*100:.1f}%]")
+        return [tag_prefix + s for s in sub] if tag_prefix else sub
+
+    if args.legacy_gate:
+        # ---- CYCLE 20: PRESERVED pre-cycle-20 default gate, opt-in only -------------
+        print("[LEGACY GATE 경고, CYCLE 20] --legacy-gate: 이 설정(REMOVE/SHIFT/NOISE_FRAC_RANGE "
+              "각각 독립 10-30%/10-30%/5-20% 범위에서 매 케이스 중첩 추첨, 범위 자체는 이 사이클도 "
+              "미변경)은 실측 총변경비율 T≈52%를 만든다(seed=7 n=20, 참고치 -- 아래 결과 자체는 "
+              "이번 실행값을 그대로 출력). 이 T에서는 매처에게 정답 변환을 그대로 건네줘도(오라클, "
+              "compute_oracle_upper_bound) 하드게이트(min_inlier_ratio/max_residual) 통과율이 "
+              "4/20=20.0%(실측, 재현됨)뿐이다 -- 정답을 줘도 90% 게이트를 못 넘는 시험이라는 뜻, "
+              "즉 이 설정은 매처를 측정하지 못한다. 기록 보존 목적으로 계속 실행 가능하게 남겨두되 "
+              "(삭제 아님), 판정은 참고용으로만 취급할 것 -- CYCLE 20부터 기본 게이트는 "
+              "--total-ratio(기본 " + f"{GATE_DEFAULT_TOTAL_RATIO}" + ", 실측 T≈25-26%)로 대체됐다. "
+              "아래에도 오라클 상한이 매 케이스 함께 출력된다(같은 혼동 재발 방지).",
+              file=sys.stderr)
+        print(f"[D2 게이트 실배선 -- LEGACY] tests/test_coarse_match.py 하네스(STAIR corridor, "
+              f"4 legs/3 corners/5 doors) 재사용 -- QA 섭동 생성기(seed={args.seed}, "
+              f"n={args.n_perturb}, mode={args.perturb_mode})로, 밀도 보정(densify_wall_segments) 후의 "
+              f"벽만 섭동, 문/워크는 고정.")
+        try:
+            gate = run_d2_gate(args.seed, args.n_perturb, perturb_mode=args.perturb_mode)
+        except ImportError as e:
+            print(f"[D2 게이트 평가 불가] {e}", file=sys.stderr)
+            return 2
+        except RuntimeError as e:
+            print(f"[D2 게이트 평가 불가] {e}", file=sys.stderr)
+            return 2
+
+        if args.perturb_mode == "both":
+            _print_single_gate_report(gate["structured"])
+            print("")
+            _print_single_gate_report(gate["fragment"])
+        else:
+            _print_single_gate_report(gate)
+
+        if args.json is not None:
+            dump = {"perturb_mode": args.perturb_mode, "legacy_gate": True,
+                    "suites": {m: [{"index": it["index"], "seed": it["seed"], "child_seed": it["child_seed"],
+                                    "segments": it["segments"].tolist(), "ground_truth": it["ground_truth"]}
+                                   for it in suites[m]] for m in suites},
+                    "d2_gate": gate}
+            args.json.write_text(json.dumps(dump, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"suite + D2 gate result written: {args.json}")
+
+        print("")
+        if gate["gate_ok"]:
+            extra = " (both 모드 모두 통과)" if args.perturb_mode == "both" else ""
+            print(f"D2 게이트[LEGACY]: PASS (mode={args.perturb_mode}, ①②③④⑤ 모두 통과{extra}) -- "
+                  f"[LEGACY GATE 경고] 위 배너 참고: 이 설정은 오라클 상한이 낮아 매처 측정력이 낮다")
+            return 0
+
+        if args.perturb_mode == "both":
+            misses = []
+            for m in ("structured", "fragment"):
+                g = gate[m]
+                if g["gate_ok"]:
+                    continue
+                misses.append(f"[{m}] " + "; ".join(_print_fail_misses(g)))
+            print("D2 게이트[LEGACY]: FAIL -- " + " | ".join(misses), file=sys.stderr)
+            return 1
+
+        misses = _print_fail_misses(gate)
+        print(f"D2 게이트[LEGACY]: FAIL(mode={args.perturb_mode}) -- " + "; ".join(misses), file=sys.stderr)
+        return 1
+
+    # ---- CYCLE 20: NEW DEFAULT -- judged at --total-ratio on the T axis -------------
+    if args.perturb_mode != "structured":
+        print(f"[참고] --perturb-mode={args.perturb_mode} 는 CYCLE 20 기본(T축) 게이트에는 적용되지 "
+              f"않습니다(총변경비율 축은 structured 전용 -- Section 2c/--sweep과 동일 설계). "
+              f"fragment/both 모드로 측정하려면 --legacy-gate 를 함께 쓰십시오.", file=sys.stderr)
+    print(f"[D2 게이트 실배선 -- CYCLE 20 기본(T축)] tests/test_coarse_match.py 하네스(STAIR corridor, "
+          f"4 legs/3 corners/5 doors) 재사용 -- 판정 지점 목표 총변경비율 T={args.total_ratio*100:.1f}% "
+          f"(seed={args.seed}, n={args.n_perturb}), Section 2c 배분 규칙(REMOVE/SHIFT/NOISE_FRAC_RANGE "
+          f"중앙값 비율, 범위 자체는 미변경)으로 remove/shift/noise 로 분해, 밀도 보정 후의 벽만 섭동, "
+          f"문/워크는 고정.")
     try:
-        gate = run_d2_gate(args.seed, args.n_perturb, perturb_mode=args.perturb_mode)
+        gate = run_d2_gate_at_ratio(args.seed, args.n_perturb, args.total_ratio)
     except ImportError as e:
         print(f"[D2 게이트 평가 불가] {e}", file=sys.stderr)
         return 2
@@ -2377,15 +2694,10 @@ def main(argv=None) -> int:
         print(f"[D2 게이트 평가 불가] {e}", file=sys.stderr)
         return 2
 
-    if args.perturb_mode == "both":
-        _print_single_gate_report(gate["structured"])
-        print("")
-        _print_single_gate_report(gate["fragment"])
-    else:
-        _print_single_gate_report(gate)
+    _print_single_gate_report(gate)
 
     if args.json is not None:
-        dump = {"perturb_mode": args.perturb_mode,
+        dump = {"perturb_mode": "structured", "legacy_gate": False, "total_ratio_target": args.total_ratio,
                 "suites": {m: [{"index": it["index"], "seed": it["seed"], "child_seed": it["child_seed"],
                                 "segments": it["segments"].tolist(), "ground_truth": it["ground_truth"]}
                                for it in suites[m]] for m in suites},
@@ -2395,51 +2707,12 @@ def main(argv=None) -> int:
 
     print("")
     if gate["gate_ok"]:
-        extra = " (both 모드 모두 통과)" if args.perturb_mode == "both" else ""
-        print(f"D2 게이트: PASS (mode={args.perturb_mode}, ①②③ 모두 통과{extra})")
+        print(f"D2 게이트: PASS (T={args.total_ratio*100:.0f}% 지점, ①②③④⑤ 모두 통과)")
         return 0
 
-    if args.perturb_mode == "both":
-        misses = []
-        for m in ("structured", "fragment"):
-            g = gate[m]
-            if g["gate_ok"]:
-                continue
-            sub = []
-            if not g["gate1_ok"]:
-                sub.append(f"①{g['success']['rate']*100:.1f}%<{GATE_SUCCESS_RATE_MIN*100:.0f}%")
-            if not g["gate2_ok"]:
-                rr = "계산불가" if g["outlier_recall"]["recall"] is None else f"{g['outlier_recall']['recall']*100:.1f}%"
-                sub.append(f"②{rr}(<{GATE_OUTLIER_RECALL_MIN*100:.0f}%)")
-            if not g["gate3_ok"]:
-                sub.append("③HOLD위반")
-            if not g["gate4_ok"]:
-                sub.append(f"④무섭동오경보{g['clean_span_fired']}/{g['n_spans_total']}>0")
-            if not g["gate5_ok"]:
-                pv = "N/A" if g["span_precision"]["precision"] is None else f"{g['span_precision']['precision']*100:.1f}%"
-                sub.append(f"⑤precision{pv}<{GATE_SPAN_PRECISION_PREVALENCE_FACTOR}x prevalence")
-            misses.append(f"[{m}] " + "; ".join(sub))
-        print("D2 게이트: FAIL -- " + " | ".join(misses), file=sys.stderr)
-        return 1
-
-    misses = []
-    if not gate["gate1_ok"]:
-        misses.append(f"①성공률 {gate['success']['rate']*100:.1f}% < {GATE_SUCCESS_RATE_MIN*100:.0f}%")
-    if not gate["gate2_ok"]:
-        rr = "계산불가" if gate["outlier_recall"]["recall"] is None else f"{gate['outlier_recall']['recall']*100:.1f}%"
-        misses.append(f"②outlier recall {rr} (gate >= {GATE_OUTLIER_RECALL_MIN*100:.0f}%)")
-    if not gate["gate3_ok"]:
-        misses.append("③모호 시 HOLD 위반")
-    if not gate["gate4_ok"]:
-        misses.append(f"④무섭동 span 오경보 {gate['clean_span_fired']}/{gate['n_spans_total']} > 0 "
-                      f"(gate <= {GATE_SPAN_CLEAN_FPR_MAX*100:.1f}%)")
-    if not gate["gate5_ok"]:
-        sp = gate["span_precision"]
-        pv = "N/A" if sp["precision"] is None else f"{sp['precision']*100:.1f}%"
-        pr = "N/A" if sp["prevalence"] is None else f"{sp['prevalence']*100:.1f}%"
-        misses.append(f"⑤span precision {pv} < {GATE_SPAN_PRECISION_PREVALENCE_FACTOR}x "
-                      f"prevalence({pr})")
-    print(f"D2 게이트: FAIL(mode={args.perturb_mode}) -- " + "; ".join(misses), file=sys.stderr)
+    misses = _print_fail_misses(gate)
+    print(f"D2 게이트: FAIL(T={args.total_ratio*100:.0f}% 지점, 실측T평균={gate['achieved_ratio_mean']*100:.1f}%) "
+          f"-- " + "; ".join(misses), file=sys.stderr)
     return 1
 
 

@@ -320,3 +320,172 @@ $PY tools/check_plan_match_robust.py --selftest-flood --seed 7 --n-perturb 20
 $PY tools/check_plan_match_robust.py --sweep --sweep-ratios 0.10,0.20 --sweep-seeds 7,42 --n-perturb 10
 $PY tools/check_plan_match_robust.py --perturb-mode both --n-perturb 5 --seed 7
 ```
+
+---
+
+## 사이클 20 — D2 게이트 재정의: T(총변경비율) 축을 1차 판정축으로 승격 (사용자 결정)
+
+작업 루트: 동일. 시작 HEAD=`09cc84f`(사이클 19, ④⑤ 정밀도 지표 + FLOOD 회귀 테스트). 수정 파일: `tools/check_plan_match_robust.py`만.
+
+### 재정의 근거 — "통과시키려고가 아니라, 정답을 줘도 20%인 시험은 매처를 측정하지 못하기 때문"
+
+천장 리뷰어 오라클 실험(메인 세션이 두 실험 모두 직접 재현, 이 사이클에 QA가 다시 독립 재현):
+```
+ORACLE(매처에게 정답 변환을 그냥 건네줬을 때) 하드게이트 통과: 4/20 = 20.0%   ← 게이트는 90% 요구
+실측 T(--legacy-gate, 즉 재정의 이전 기본 게이트) = 52.2%
+```
+정답 변환(harness의 CONSTRUCTIVELY KNOWN true transform)을 매처 자신의 하드게이트(`min_inlier_ratio`/
+`max_residual`, `scan2bim.plan_skeleton.DEFAULT_GATES`)에 그대로 통과시켜도 20%뿐이라는 것은 "이 T
+에서는 어떤 검색 알고리즘도 90% 게이트를 넘을 수 없다"는 산수이지, 매처의 결함이 아니다. 그래서 이번
+사이클은 **임계(90%/80%)도, 섭동 크기 범위(제거 10-30%·이동 0.3-1.0m 등)도 전혀 손대지 않고**, 게이트가
+판정하는 **지점**(T축 위 어디)만 옮긴다. 이 구분은 `tools/check_plan_match_robust.py`의 모듈 docstring
+(CLI/Exit codes 절)과 `GATE_DEFAULT_TOTAL_RATIO` 상수의 주석 블록에 그대로 명시했다.
+
+### 판정 지점 산정 — 목표 T=20%가 실측 T≈25-26% 창에 대응
+
+Section 2c의 기존 배분 규칙(`SWEEP_ALLOC_WEIGHTS`, REMOVE/SHIFT/NOISE_FRAC_RANGE 중앙값 비율, 변경 없음)을
+목표 T=15/20/25% 세 점에 그대로 적용해 재측정(`--sweep --sweep-ratios 0.15,0.20,0.25 --sweep-seeds 7,42,123
+--n-perturb 20`):
+```
+   목표T     실측T평균
+    15%     21.6%
+    20%     25.5%   (seed=7 단독 26.3%)
+    25%     29.7%
+```
+사용자가 지정한 "실측 T≈25-26%" 창에 들어오는 목표 지점은 **20%뿐**이다(15%는 21.6%로 아래, 25%는 29.7%로
+위). 이미 있던 배분 규칙을 그 창에 맞는 목표 T에 그대로 적용한 결과이며, 현재 관측치에 임계를 역산한 것이
+아니다 — `GATE_DEFAULT_TOTAL_RATIO = 0.20`으로 확정, 근거는 상수 옆 주석 블록에 그대로 남겼다.
+
+### 구현
+
+- `compute_oracle_upper_bound(ctx, suite)`(신규): harness의 참 변환을 `scan2bim.coarse_match._associate`에
+  직접 통과시켜 `DEFAULT_GATES`(min_inlier_ratio/max_residual)를 만족하는지만 확인(탐색 없음) — 어떤 검색
+  전략도 넘을 수 없는 ①의 이론적 상한. `_evaluate_suite`에 항상(옵트인 아님) 편입해, 레거시·신규 게이트·
+  (부수적으로) `--sweep` 모두에서 계산되도록 했다(단, `--sweep`은 오라클을 출력하지 않음 — 이번 사이클
+  범위는 "게이트 출력"이라 판단해 표에는 추가하지 않았다, 계산 자체는 부작용 없이 항상 됨).
+- `run_d2_gate_at_ratio(seed, n_perturb, total_frac=GATE_DEFAULT_TOTAL_RATIO)`(신규): Section 2c의
+  `generate_perturbation_suite_at_total_ratio`(기존, `--sweep`이 이미 쓰던 것)로 섭동 생성, `_evaluate_suite`
+  로 채점 — **새 기본 게이트 경로**.
+- `--legacy-gate`(신규 플래그): 기존 `run_d2_gate`/`_run_d2_gate_single`(Section 2b 독립범위 중첩추첨)을
+  그대로 실행, 실행마다 경고 배너 출력(아래 실측 인용). 삭제 없음 — `--perturb-mode fragment/both`도
+  `--legacy-gate`와 함께일 때만 유효(신규 기본 T축 경로는 structured 전용, `--sweep`과 동일 설계).
+- `--total-ratio`(신규 플래그, 기본 `GATE_DEFAULT_TOTAL_RATIO`=0.20): 신규 기본 경로의 판정 지점 T를
+  바꿀 수 있게 노출(측정용, DoD 지점 자체는 여전히 기본값 0.20).
+- `_print_single_gate_report`: 오라클 상한 줄(①헤드룸 표시, 초과 시 버그 경고) + (신규 경로일 때) 판정
+  지점(목표T/실측T) 줄을 추가. `main()`의 D2 게이트 실행부를 `--legacy-gate` 분기 / 신규 T축 분기로
+  재구성, FAIL 사유 조립을 `_print_fail_misses` 헬퍼로 공유(오라클 상한도 FAIL 메시지에 포함).
+
+### 측정 1 — 재정의된 기본 게이트 (`--n-perturb 20 --seed 7`, T=20% 지점)
+
+```
+$ .venv/bin/python tools/check_plan_match_robust.py --n-perturb 20 --seed 7
+[structured] [판정 지점, CYCLE 20] 목표 총변경비율 T=20.0% -> 실측 T평균=26.3% (범위 22.0-32.8%, n=20건, seed=7) -- 사용자 지정 창(실측 T≈25-26%) 내부
+...
+[structured] ① 성공률: 17/20 = 85.0% (gate >= 90%) [ok_outside_d2(위험: 확정오답)=0 hold=3 reject=0 error=0]
+[structured]    실패 사유 분포(P2 입력, ①에서 ok_within_d2 아닌 모든 케이스): {"insufficient_events": 3}
+[structured] [오라클 상한, CYCLE 20] 정답 변환을 그대로 매처의 하드게이트(min_inlier_ratio>=0.60, residual<=0.60)에 통과시켰을 때: 17/20 = 85.0% -- 이 섭동 지점에서 어떤 검색 전략도 ①을 이 값보다 높일 수 없다(탐색 품질과 무관, 정답을 이미 줬으므로). ①실측 대비 헤드룸=+0.0%p
+[structured]    recall: 202/242 (scoreable, transform-confirmed case만) = 83.5% (radius=5.46m, gate >= 80%) [case 미확정 전이 exclude=113 no_candidate=0]
+[structured] ③ 모호 시 HOLD(...) => PASS
+[structured] ④ 무섭동(clean) 도면 span 오경보율(...): 0/24 = 0.0% (gate <= 0.0%) => PASS
+[structured] ⑤ span 정밀도(...): precision=93.8% ... prevalence(실제변경 span 비율)=52.5% ... => PASS
+[structured] 게이트 판정: FAIL (①FAIL ②PASS ③PASS ④PASS ⑤PASS)
+D2 게이트: FAIL(T=20% 지점, 실측T평균=26.3%) -- ①85.0%<90%; [오라클상한=85.0%]
+EXIT=1
+```
+
+**핵심 결과 — T축 이동만으로는 90%에 도달 불가**: ①실측(85.0%)이 그 지점 오라클 상한(85.0%)과 **정확히
+일치**한다(헤드룸 +0.0%p) — 매처가 이 지점에서 이미 이론적 상한에 도달해 있고, 상한 자체가 90%보다
+낮다. 즉 사이클 7~19에 걸친 매처 개선(트리밍/두 번째 코너 시드/span 정밀도 등)과 무관하게, **이 지점의
+하드게이트 통과 상한 자체가 90% 미만**이므로 T를 20~25% 창 안에서 어디로 옮겨도(15%→21.6%, 25%→29.7%
+포함) ①이 확정적으로 90%를 넘는다고 보장할 근거가 없다(사용자 지시대로 T를 통과하도록 고르지 않고
+지정 창을 지켰다 — 통과가 나오지 않았다는 사실을 그대로 보고한다). ②③④⑤는 모두 PASS.
+
+**실패 3건 전부 `insufficient_events`, 원인(코드 확인, `scan2bim/coarse_match.py:1128-1130`)**: 이
+hold_reason은 `not P["corner"]`(섭동된 평면 스켈레톤에 코너가 하나도 안 남음)에서만 발생한다(워크 쪽
+코너는 고정 워크라 항상 있음). T=20%에서 제거 예산은 19/232 densified fragment(≈8.2%)이고, `structured`
+모드는 예산을 원 벽(wall_id) 단위로 통째로 제거한다(Section 2b) — STAIR 하네스의 **원 벽이 10개뿐**이라
+그중 코너를 이루는 짧은 벽(예: dead-end cap, 길이=폭 1.82m, densify 후 조각 수 적음) 하나가 통째로
+뽑히면 그 조각들이 예산 안에 다 들어가 코너 자체가 스켈레톤에서 사라진다. **가설(실도면이 이 레포에
+없어 검증 불가 — 이 팀 전 사이클 공통 한계, 그대로 승계)**: 실제 DXF는 벽이 수십~수백 개일 것이므로,
+같은 %제거가 훨씬 많은 벽에 분산돼 특정 코너 하나를 전멸시킬 확률이 하네스보다 낮을 것으로 추정된다 —
+이것은 추정일 뿐, 이 사이클엔 실 DXF가 없어 검증하지 못했다(D2 DoD의 원문이 이미 명시한 한계, P0-Skeleton
+단계부터 "실도면 SXX DXF 경로 확인(레포에 없음)"으로 기록됨).
+
+### 측정 2 — `--legacy-gate` (기존 수치 재현 + 경고 배너)
+
+```
+$ .venv/bin/python tools/check_plan_match_robust.py --legacy-gate --n-perturb 20 --seed 7
+[LEGACY GATE 경고, CYCLE 20] --legacy-gate: 이 설정(REMOVE/SHIFT/NOISE_FRAC_RANGE 각각 독립 10-30%/10-30%/5-20% 범위에서 매 케이스 중첩 추첨, 범위 자체는 이 사이클도 미변경)은 실측 총변경비율 T≈52%를 만든다(seed=7 n=20, 참고치 -- 아래 결과 자체는 이번 실행값을 그대로 출력). 이 T에서는 매처에게 정답 변환을 그대로 건네줘도(오라클, compute_oracle_upper_bound) 하드게이트(min_inlier_ratio/max_residual) 통과율이 4/20=20.0%(실측, 재현됨)뿐이다 -- 정답을 줘도 90% 게이트를 못 넘는 시험이라는 뜻, 즉 이 설정은 매처를 측정하지 못한다. 기록 보존 목적으로 계속 실행 가능하게 남겨두되 (삭제 아님), 판정은 참고용으로만 취급할 것 -- CYCLE 20부터 기본 게이트는 --total-ratio(기본 0.2, 실측 T≈25-26%)로 대체됐다. 아래에도 오라클 상한이 매 케이스 함께 출력된다(같은 혼동 재발 방지).
+...
+[structured] ① 성공률: 3/20 = 15.0% (gate >= 90%) [ok_outside_d2(위험: 확정오답)=0 hold=12 reject=5 error=0]
+[structured] [오라클 상한, CYCLE 20] ... 4/20 = 20.0% -- ... ①실측 대비 헤드룸=+5.0%p
+[structured]    recall: 73/80 (scoreable, transform-confirmed case만) = 91.2% (radius=5.46m, gate >= 80%) [case 미확정 전이 exclude=477 no_candidate=0]
+[structured] ③ 모호 시 HOLD(...) => PASS
+[structured] ④ 무섭동(clean) 도면 span 오경보율(...): 0/24 = 0.0% (gate <= 0.0%) => PASS
+[structured] ⑤ span 정밀도(...TP=22 FP=0 FN=25 TN=25 n_cases=3): precision=100.0% ... prevalence(실제변경 span 비율)=65.3% ... => PASS
+[structured] 게이트 판정: FAIL (①FAIL ②PASS ③PASS ④PASS ⑤PASS)
+D2 게이트[LEGACY]: FAIL(mode=structured) -- ①15.0%<90%; [오라클상한=20.0%]
+EXIT=1
+```
+
+**①15.0%(3/20) ②91.2%(73/80) ③④⑤PASS — 사이클 16/19에 기록된 수치와 완전히 동일하게 재현됐다.**
+경고 배너가 "실측 T≈52%" · "오라클 상한 20.0%(4/20)" · "매처를 측정하지 못한다"는 취지를 실행마다
+그대로 출력한다(위 인용 그대로). 삭제가 아니라 맥락을 붙인 것 — 기록 보존.
+
+### 측정 3 — `--selftest-flood` (필수 회귀, 재정의 후에도 범람을 잡는지)
+
+```
+$ .venv/bin/python tools/check_plan_match_robust.py --selftest-flood --seed 7 --n-perturb 20
+[flood selftest] scan2bim.coarse_match._span_outliers 를 '모든 span 무조건 발화'로 인메모리 monkeypatch(디스크 미수정, finally 에서 원복) -- dev-core 8d7fcbf 자진신고 재현: recall 38.8%->91.2% 개선과 함께 '84개 span 전부 깃발 꽂으면 recall 100%'을 self-report 했던 바로 그 가짜 구현
+[flood selftest] 무섭동(clean) 도면(패치 하에서 재빌드): 24/24 span 발화 (오경보율=100.0%) -> ④ FAIL
+[flood selftest] 섭동 스위트(seed=7 n=20): precision=65.3% prevalence=65.3% (TP=47 FP=25 FN=0) -> ⑤ FAIL
+[flood selftest] 참고로 ①②③(가짜 구현이 판정 경로를 건드리지 않았다는 격리 확인): ①FAIL ②PASS ③PASS
+[flood selftest] 결과: PASS -- 게이트가 범람을 잡았다(④ 또는 ⑤가 FAIL)
+EXIT=0
+```
+재정의 후에도 동일하게 범람을 잡는다(`--selftest-flood`는 legacy suite 생성기를 그대로 쓰므로 이 사이클
+변경과 무관 — ④⑤ 계산 경로 자체는 `_evaluate_suite` 안에서 공유되지만 로직 변경 없음, 새로 추가된 것은
+오라클 계산뿐이고 그건 `_span_outliers` 패치와 무관한 corner/leg/door 하드게이트 채점이라 flood 패치의
+영향을 받지 않는다 -- 위 출력에서도 ①②③은 정상, ④⑤만 잡힌 것으로 격리가 확인된다).
+
+### pytest 회귀 없음
+
+```
+$ .venv/bin/python -m pytest tests/ -q
+369 passed in 33.29s / 33.50s (재실행)   -- 감소 0, 증가 0 (이 파일은 tests/ 어디서도 import되지 않음, grep 확인)
+```
+
+### 종합 판정
+
+| 항목 | 결과 |
+|---|---|
+| 재정의된 기본 게이트(T=20%, seed=7, n=20) | **FAIL** — ①85.0%(17/20)<90%, 오라클상한도 85.0%(헤드룸 +0.0%p, 구조적 상한). ②③④⑤ PASS. EXIT=1 |
+| `--legacy-gate` | **FAIL**(수치 불변, ①15.0% ②91.2% ③④⑤PASS), 경고 배너 실측 출력 확인. EXIT=1 |
+| `--selftest-flood` | **PASS**(범람 여전히 잡힘, ④/⑤ FAIL로 검출). EXIT=0 |
+| pytest | **369 passed**, 감소 0 |
+
+**D2는 재정의 후에도 미달(FAIL)이다.** T를 사용자 지정 창(20~25%) 안에서 옮겼음에도 ①은 90%를 넘지
+못했고, 그 지점의 오라클 상한 자체가 85%(이 하네스·이 T에서 검색이 이미 상한에 도달)라는 사실이 원인을
+명확히 한다 — 매처의 탐색 품질 문제가 아니라 **이 합성 하네스(원 벽 10개)의 구조적 한계**로 보인다는
+가설(위 "실패 3건" 단락, 검증 불가)과 일치한다. 통과하도록 T나 임계를 다시 고르지 않았다.
+
+### 재현 명령 모음 (사이클 20 신규분)
+```
+cd /run/media/iaan/1TB-WD/Github/lingbot-map/.claude/worktrees/loop-coplay-planmatch-01
+PY=/run/media/iaan/1TB-WD/Github/lingbot-map/.venv/bin/python
+
+# 재정의된 기본 게이트 (T=20% 지점)
+$PY tools/check_plan_match_robust.py --n-perturb 20 --seed 7
+
+# 레거시 게이트(경고 배너 포함, 기존 수치 재현)
+$PY tools/check_plan_match_robust.py --legacy-gate --n-perturb 20 --seed 7
+
+# FLOOD 회귀(필수, 재정의 후에도 범람 검출)
+$PY tools/check_plan_match_robust.py --selftest-flood --seed 7 --n-perturb 20
+
+# 판정 지점 산정 근거(목표T -> 실측T 매핑 재현)
+$PY tools/check_plan_match_robust.py --sweep --sweep-ratios 0.15,0.20,0.25 --sweep-seeds 7,42,123 --n-perturb 20
+
+# pytest 회귀 없음
+$PY -m pytest tests/ -q
+```
