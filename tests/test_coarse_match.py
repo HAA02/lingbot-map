@@ -160,19 +160,30 @@ class _MatchAssertions(unittest.TestCase):
             self.assertIsNone(res["best"])
             self.assertIn(res["hold_reason"], ps.HOLD_REASONS + ps.REJECT_REASONS)
         json.dumps(res)                                # the wire format must survive JSON
-        n_ev = len(cm.recon_events(traj, door_s=door_s))
+        rev = cm.recon_events(traj, door_s=door_s)
+        # The ASSOCIABLE events (corner/door/leg) are what a candidate explains; SPAN
+        # events are the change report's resolution and are matched against nothing, so
+        # the partition invariant and n_events are stated over the associable ones only.
+        # Keeping spans out of n_events is what keeps `inlier_ratio` (and every gate that
+        # reads it) independent of how finely the change report is sampled.
+        assoc = [e["index"] for e in rev if e["kind"] in ("leg", "corner", "door")]
+        span_idx = {e["index"] for e in rev if e["kind"] == "span"}
         plan_ids = {e["id"] for e in ps.plan_events(skel)}
         for c in res["candidates"]:
-            self.assertEqual(c["n_events"], n_ev, c["method"])
+            self.assertEqual(c["n_events"], len(assoc), c["method"])
             seen = [int(a) for a, _ in c["matches"]] + [int(o["event_index"])
-                                                        for o in c["outliers"]]
-            self.assertEqual(sorted(seen), list(range(n_ev)),
-                             f"matches+outliers must partition the recon events: {c}")
+                                                        for o in c["outliers"]
+                                                        if o["kind"] != "span"]
+            self.assertEqual(sorted(seen), sorted(assoc),
+                             f"matches+outliers must partition the associable events: {c}")
             self.assertEqual(len(c["matches"]), c["n_inliers"])
             for _, pid in c["matches"]:
                 self.assertIn(pid, plan_ids)
+            spans_seen = [int(o["event_index"]) for o in c["outliers"] if o["kind"] == "span"]
+            self.assertEqual(len(spans_seen), len(set(spans_seen)), "span reported twice")
+            self.assertTrue(set(spans_seen) <= span_idx, "span outlier off the event list")
             for o in c["outliers"]:
-                self.assertIn(o["kind"], ("leg", "corner", "door"))
+                self.assertIn(o["kind"], ("leg", "corner", "door", "span"))
                 self.assertTrue(o["plan_event_id"] is None or o["plan_event_id"] in plan_ids, o)
                 self.assertIsInstance(o["reason"], str)
                 self.assertTrue(o["reason"])
@@ -632,6 +643,136 @@ class TestOutlierTolerance(_MatchAssertions):
                          ("reject", "inlier_ratio_below_min"))
         self.assertIsNone(r["best"])
         self.assertTrue(r["candidates"])                # ...but the evidence is still shown
+
+
+class TestSpanChangeScan(_MatchAssertions):
+    """SCENARIO 2b: the change report's RESOLUTION. `_associate` can only blame a whole
+    walk event, and this walk has 4 legs over 56 m — a leg outlier says "something along
+    these 17 m" and its reported position is the leg's midpoint. Measured against the QA
+    gate's answer key (seed 7): 48 of 49 undetected changed wall segments had the walk
+    pass within 5.5 m of them, while the nearest reported outlier sat 6-16 m away.
+
+    The span scan adds a finer report. These tests pin the two properties that make it a
+    MEASUREMENT and not a way to colour more of the walk red: it says NOTHING about a
+    drawing that is correct, and it can never move a verdict."""
+
+    def setUp(self):
+        self.tf, self.traj, self.plan_walk, self.ds = _make_walk(STAIR, STAIR_WALK_DOORS)
+
+    def _spans(self, res):
+        return [o for o in res["candidates"][0]["outliers"] if o["kind"] == "span"]
+
+    def _span_xy(self, res, o):
+        rev = {e["index"]: e for e in cm.recon_events(self.traj, door_s=self.ds)}
+        return ps.apply_candidate_transform(res["candidates"][0]["transform"],
+                                            [rev[int(o["event_index"])]["xy"]])[0]
+
+    def test_a_correct_drawing_is_reported_as_correct(self):
+        """THE honesty test. Flagging pieces of the walk raises outlier recall for free
+        (flagging ALL of them scores 100 % on the QA gate), so the number that decides
+        whether this is detection is how much it says about a drawing with nothing wrong
+        in it. That number must be zero — measured 0 of 28 spans on the unperturbed
+        plan, every local width exactly 1.820 m."""
+        skel = _stair_skeleton()
+        res = cm.coarse_match(skel, self.traj, door_s=self.ds)
+        self.assert_contract(res, skel, self.traj, self.ds)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(self._spans(res), [], "the drawing is correct — say nothing")
+        self.assertEqual(res["best"]["inlier_ratio"], 1.0)
+
+    def test_a_wall_that_moved_under_the_leg_tolerance_is_still_reported(self):
+        """The gap this closes. ONE wall of the last corridor moves 0.8 m: the corridor's
+        CENTRELINE only moves 0.4 m — inside `leg_lat` — so the leg association absorbs
+        it and the walk is still explained. The width, however, moved the full 0.8 m, and
+        that is what the span report states, at the spans that actually walked past it."""
+        skel = _stair_skeleton(wall_shift=([2], 0.8, 0.0))
+        res = cm.coarse_match(skel, self.traj, door_s=self.ds)
+        self.assert_contract(res, skel, self.traj, self.ds)
+        spans = self._spans(res)
+        self.assertTrue(spans, "a wall moved 0.8 m must not vanish silently")
+        for o in spans:
+            self.assertEqual(o["reason"], "corridor_width_mismatch", o)
+            self.assertAlmostEqual(o["residual"], 0.8, delta=0.05)
+            xy = self._span_xy(res, o)
+            self.assertGreaterEqual(float(xy[0]), 15.0,
+                                    f"span blamed on the UNCHANGED corridor: {o} at {xy}")
+
+    def test_the_report_localises_to_the_walked_piece_not_the_whole_leg(self):
+        """Resolution: the moved wall is on ONE corridor, and the reported spans cover
+        that corridor's walked length (several ~2 m pieces) instead of one leg midpoint."""
+        skel = _stair_skeleton(wall_shift=([2], 0.8, 0.0))
+        res = cm.coarse_match(skel, self.traj, door_s=self.ds)
+        ys = sorted(float(self._span_xy(res, o)[1]) for o in self._spans(res))
+        self.assertGreaterEqual(len(ys), 2, "one point is not a localisation")
+        self.assertLessEqual(max(np.diff(ys)) if len(ys) > 1 else 0.0, 2.0 * W,
+                             f"gaps in the reported stretch: {ys}")
+
+    def test_a_walk_through_a_drawn_wall_is_a_hard_contradiction(self):
+        """The other rule: the walked path passes from one side of a drawing wall to the
+        other. Reported with the traversal DEPTH, not merely 'near a wall'."""
+        skel = _stair_skeleton(plan_doors=TestOutlierTolerance.KEPT_DOORS,
+                               wall_shift=TestOutlierTolerance.MOVED_WALLS)
+        res = cm.coarse_match(skel, self.traj, door_s=self.ds)
+        crossed = [o for o in self._spans(res) if o["reason"] == "walk_crosses_plan_wall"]
+        self.assertTrue(crossed, self._spans(res))
+        for o in crossed:
+            self.assertGreater(o["residual"], cm.SPAN_CROSS_MARGIN)
+
+    def test_the_walks_own_ends_are_not_a_contradiction(self):
+        """Why `SPAN_CROSS_MARGIN` exists: this walk BEGINS and ENDS on the corridor's end
+        cap. Without a both-sides clearance requirement those two thresholds were the only
+        crossings the correct plan ever reported (measured 2 of 28 spans)."""
+        skel = _stair_skeleton()
+        res = cm.coarse_match(skel, self.traj, door_s=self.ds)
+        self.assertEqual([o for o in self._spans(res)
+                          if o["reason"] == "walk_crosses_plan_wall"], [])
+
+    def test_span_rows_can_never_move_a_verdict(self):
+        """The containment invariant, A/B: the SAME skeleton with its walls withheld
+        produces the same status, margin, scores, inliers, residuals, matches and
+        association outliers — only the span rows differ. A change report that could
+        alter ok/hold/reject would be a way to argue a match into existence."""
+        skel = _stair_skeleton(wall_shift=([2], 0.8, 0.0))
+        with_walls = cm.coarse_match(skel, self.traj, door_s=self.ds)
+        without = cm.coarse_match({**skel, "walls": []}, self.traj, door_s=self.ds)
+
+        def verdict(r):
+            return (r["status"], r["hold_reason"], r["margin"],
+                    [(c["score"], c["n_inliers"], c["n_events"], c["residual"],
+                      [tuple(m) for m in c["matches"]],
+                      [o for o in c["outliers"] if o["kind"] != "span"])
+                     for c in r["candidates"]])
+
+        self.assertEqual(verdict(with_walls), verdict(without))
+        self.assertTrue(self._spans(with_walls))
+        self.assertEqual(self._spans(without), [],
+                         "no walls in the skeleton is a MISSING MEASUREMENT, not a change")
+
+    def test_spans_are_never_associated_and_never_counted_as_events(self):
+        skel = _stair_skeleton()
+        rev = cm.recon_events(self.traj, door_s=self.ds)
+        spans = [e for e in rev if e["kind"] == "span"]
+        self.assertTrue(spans)
+        R = cm._prep_recon(rev)
+        self.assertEqual(R["n_events"], len(rev) - len(spans))
+        self.assertEqual(len(R["corner"]) + len(R["door"]) + len(R["leg"]), R["n_events"])
+        res = cm.coarse_match(skel, self.traj, door_s=self.ds)
+        for c in res["candidates"]:
+            self.assertEqual(c["n_events"], R["n_events"])
+            self.assertTrue(all(int(a) not in {e["index"] for e in spans}
+                                for a, _ in c["matches"]))
+
+    def test_span_events_leave_every_pre_existing_index_alone(self):
+        """Spans are appended LAST, so `matches`/`outliers` indices from before this
+        scan still mean the same events."""
+        rev = cm.recon_events(self.traj, door_s=self.ds)
+        assoc = [e for e in rev if e["kind"] != "span"]
+        self.assertEqual([e["index"] for e in assoc], list(range(len(assoc))))
+        self.assertEqual([e["kind"] for e in rev[len(assoc):]], ["span"] * (len(rev) - len(assoc)))
+        for e in rev:
+            if e["kind"] == "span":
+                self.assertGreaterEqual(len(e["poly"]), 2)
+                self.assertLess(e["s0"], e["s1"])
 
 
 # --------------------------------------------------------------------------------------

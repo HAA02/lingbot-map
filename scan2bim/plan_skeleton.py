@@ -102,7 +102,12 @@ CANDIDATE_FIELDS = {
 
 #: An unexplained event. `plan_event_id` is None when nothing plausible was near.
 OUTLIER_FIELDS = {
-    "kind": "one of 'leg' | 'corner' | 'door' (the recon event kind)",
+    "kind": "one of 'leg' | 'corner' | 'door' (an ASSOCIABLE recon event the candidate "
+            "could not explain) or 'span' (a ~one-corridor-width piece of the walk at "
+            "which the DRAWING contradicts the walked path — see coarse_match's span "
+            "change scan. 'span' outliers are a CHANGE REPORT, not an association "
+            "failure: they are never counted in n_events/inlier_ratio, so they cannot "
+            "move a verdict)",
     "event_index": "int, index into the recon event list",
     "plan_event_id": "str id from plan_events(), or None",
     "residual": "float metres (or degrees for a corner turn), how badly it missed",
@@ -547,8 +552,19 @@ def corridor_skeleton(segments, doors=None, width_range=DEFAULT_WIDTH_RANGE,
                  forward_scale.corridor_open_boundary's L_end).
       nodes     [{"id","kind":"corner"|"tee"|"end"|"door","xy","legs",...}]
       doors     [{"id","xy","leg","s","offset"}]  s = arclength from that leg's a end
-      info      {"theta0_deg","n_segments","n_wall_lines","n_legs","median_width",...}
-                and "fail" when nothing usable was found (no fabricated leg, ever).
+      walls     [[[x0,y0],[x1,y1]], ...] — every input segment longer than `min_seg`,
+                 verbatim (metres, plan frame). The skeleton is a REDUCTION (facing wall
+                 pairs -> centrelines) and necessarily drops what it cannot pair: a new
+                 partition across the corridor, a wall that moved out of its offset
+                 cluster. `coarse_match`'s span change scan needs those raw walls to ask
+                 "does the drawing put a wall where the walk actually went, and is the
+                 drawing's corridor as wide there as the rest of the walk found it" —
+                 questions the leg/corner/door graph alone cannot answer. Carrying them
+                 here (rather than re-reading the DXF) keeps the matcher's input ONE
+                 object. Never used for centreline geometry.
+      info      {"theta0_deg","n_segments","n_walls","n_wall_lines","n_legs",
+                 "median_width",...} and "fail" when nothing usable was found (no
+                 fabricated leg, ever).
 
     `doors` may be an (M,2) array of plan-frame door positions; `plan_skeleton()` fills
     it from the DXF's A-DOOR inserts instead.
@@ -557,7 +573,7 @@ def corridor_skeleton(segments, doors=None, width_range=DEFAULT_WIDTH_RANGE,
     info: dict = {"n_segments": int(len(seg0)), "width_range": list(width_range),
                   "min_leg": float(min_leg)}
     empty = {"schema": SKELETON_SCHEMA, "legs": [], "nodes": [], "doors": [],
-             "centerline": [], "info": info}
+             "centerline": [], "walls": [], "info": info}
     if len(seg0) == 0:
         info["fail"] = "no wall segments"
         return empty
@@ -685,7 +701,10 @@ def corridor_skeleton(segments, doors=None, width_range=DEFAULT_WIDTH_RANGE,
                       "doors": []} for g in legs],
             "nodes": [{k: v for k, v in nd.items() if not k.startswith("_")} for nd in nodes],
             "doors": [], "centerline": [[_pt(g["a"]), _pt(g["b"])] for g in legs],
+            "walls": [[_pt(p), _pt(q)] for p, q in seg0
+                      if float(np.linalg.norm(q - p)) > min_seg],
             "info": info}
+    info["n_walls"] = len(skel["walls"])
     info["n_legs"] = len(skel["legs"])
     info["median_width"] = round(float(np.median([g["width"] for g in skel["legs"]])), 3)
     info["total_leg_length"] = round(float(sum(g["length"] for g in skel["legs"])), 3)

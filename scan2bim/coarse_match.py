@@ -218,6 +218,70 @@ DEFAULT_ANISO_BAND = (0.2, 5.0)
 #: Metres per recon unit; deliberately wide (a monocular recon has no scale prior).
 DEFAULT_SCALE_BAND = (0.05, 50.0)
 
+# ---- SPAN CHANGE SCAN (P2 cycle 17) ---------------------------------------------------
+#
+# WHY IT EXISTS, measured. `_associate` reports an unexplained WALK EVENT — and this walk
+# has 12 of them (4 legs, 3 corners, 5 doors) spread over a 32 x 24 m floor, of which a
+# typical winning candidate leaves 3-4 unexplained. A leg outlier is located at its own
+# MIDPOINT, so one 17 m leg reports "something is different somewhere along here" and
+# nothing finer. Measured against the QA gate's changed-wall answer key (seed 7, 20
+# perturbations, the 3 cases whose transform was independently confirmed): 48 of the 49
+# undetected changed segments had the walk pass WITHIN 5.5 m of them — 25 of those within
+# 1 m — while the nearest reported outlier sat 6-16 m away. The walk went right past the
+# changed wall; the report simply had no place to say so.
+#
+# So the scan adds a SECOND, FINER report — one entry per ~one-corridor-width piece of the
+# walk ("span") — that answers a question the leg/corner/door association cannot:
+#
+#   R1 walk_crosses_plan_wall  — the walked path passes from one side of a drawing wall to
+#                                the other. A hard contradiction: we walked through it.
+#   R2 corridor_width_mismatch — the drawing's corridor width AT THIS PIECE OF THE WALK
+#                                (ray-cast left and right from the walked point onto the
+#                                drawing's own walls) differs from what the SAME walk
+#                                measured over its whole length (median). A wall that
+#                                moved 0.7 m changes the width by 0.7 m while moving the
+#                                centreline only 0.35 m — under `leg_lat`, which is
+#                                exactly why the leg association absorbs it.
+#
+# WHAT IT MUST NOT DO. Span outliers are a CHANGE REPORT and are deliberately kept out of
+# every verdict path: spans are not associated, not weighted, not counted in `n_events`
+# (`_prep_recon`), so `score`, `residual`, `inlier_ratio` and therefore ok/hold/reject are
+# bit-identical with and without them (asserted in tests). The scan cannot rescue a bad
+# match and cannot manufacture a confirmation.
+#
+# HONESTY CHECK (the one that matters, measured): on the CORRECT drawing the scan reports
+# NOTHING — 0 of 28 spans on the unperturbed STAIR plan, every local width exactly 1.820 m.
+# "Flag more of the walk" would raise recall trivially (flagging all 84 spans of the 3
+# confirmed cases scores 100 %); the number that shows this is detection and not flooding
+# is the zero false-alarm rate on an unchanged plan, so that is a test, not a footnote.
+#
+#: Span length as a fraction of the walked arclength — RELATIVE, like every other recon
+#: tolerance (recon units are arbitrary; see `recon_events`). 0.04 puts ~25 spans on the
+#: fixture walk, i.e. ~2 m ≈ one corridor width of plan-frame resolution. Finer is not
+#: better: at 1 m the "no drawing corridor here" evidence starts firing on the CORRECT
+#: plan near corners (measured 6/56), which is why that third rule is not in the scan.
+SPAN_FRAC = 0.04
+
+#: R1: metres of walked clearance required on BOTH sides of a wall before calling it
+#: CROSSED. Without it the walk's own start/end fire (measured 2/28 on the correct plan):
+#: this walk begins and ends ON the corridor's end cap, which is a threshold, not a
+#: contradiction. 0.20 m keeps that out while still catching a wall 0.3 m inside the walk.
+SPAN_CROSS_MARGIN = 0.20
+
+#: R2: metres of local-width deviation that count as a contradiction. Compared against
+#: the walk's OWN median local width (robust, and it needs no external prior); the plan's
+#: median leg width is the fallback when too few spans measured a width at all.
+SPAN_WIDTH_TOL = 0.30
+
+#: R2: how far to look sideways for the corridor's wall, as a multiple of the plan's
+#: median corridor width. Beyond this the span simply reports no width (NOT a change —
+#: an open area is not a contradiction).
+SPAN_RAY_MAX_WIDTHS = 3.0
+
+#: R2 needs a robust reference; under this many measured spans it uses the plan's median
+#: leg width instead of the walk's own median.
+SPAN_MIN_WIDTH_SAMPLES = 3
+
 
 # --------------------------------------------------------------------------------------
 # small geometry helpers
@@ -348,20 +412,30 @@ def door_arclengths(traj_xz, times, door_times) -> list:
 
 def recon_events(traj_xz, door_s=None, simplify_tol=None, simplify_frac: float = 0.02,
                  min_turn_deg: float = 35.0, min_leg_len=None,
-                 min_leg_frac: float = 0.06) -> list:
-    """The WALK as legs / corners / doors, mirroring `plan_skeleton.plan_events()`.
+                 min_leg_frac: float = 0.06, span_frac: float = SPAN_FRAC) -> list:
+    """The WALK as legs / corners / doors, mirroring `plan_skeleton.plan_events()`,
+    plus SPANS (the change-report resolution, see the SPAN CHANGE SCAN block).
 
     traj_xz  (N,2) gravity-aligned recon plan points (recon units), time-ordered.
     door_s   arclengths (recon units) at which a door was passed (see
              `door_arclengths` to get them from timestamps).
 
-    Tolerances are RELATIVE (`simplify_frac`, `min_leg_frac` of the total walked
-    arclength) because recon units are arbitrary. Returns
+    Tolerances are RELATIVE (`simplify_frac`, `min_leg_frac`, `span_frac` of the total
+    walked arclength) because recon units are arbitrary. Returns
         [{"index", "kind": "leg",    "a","b","arclen","chord","heading_deg","s0","s1"},
          {"index", "kind": "corner", "xy","turn_deg","turn_signed_deg","s","legs"},
-         {"index", "kind": "door",   "xy","s","leg"}]
+         {"index", "kind": "door",   "xy","s","leg"},
+         {"index", "kind": "span",   "xy","a","b","s0","s1","leg","poly"}]
     with "index" the position in the returned list (that is what candidate['matches']
-    and outliers refer to). An empty/degenerate walk gives []."""
+    and outliers refer to). An empty/degenerate walk gives [].
+
+    ORDER MATTERS AND IS FIXED: legs, then corners, then doors, then spans. Spans are
+    appended LAST so every pre-existing index is unchanged, and they are a DIFFERENT
+    KIND so `_prep_recon` never offers them for association — a span is a place to
+    report a drawing/walk contradiction, not a landmark to match. `poly` is the walk's
+    actual sampled polyline over that piece (not the leg chord): the crossing test has
+    to ask where the walker really went, and near a corner the chord cuts through the
+    wall the walker went around."""
     traj = np.asarray(traj_xz, dtype=np.float64).reshape(-1, 2)
     if len(traj) >= 2:                                   # drop repeated poses
         keep = np.r_[True, np.linalg.norm(np.diff(traj, axis=0), axis=1) > 1e-9]
@@ -398,7 +472,32 @@ def recon_events(traj_xz, door_s=None, simplify_tol=None, simplify_frac: float =
         xy = np.array([float(np.interp(sc, s, traj[:, 0])), float(np.interp(sc, s, traj[:, 1]))])
         leg = next((g["leg"] for g in legs if g["s0"] - 1e-9 <= sc <= g["s1"] + 1e-9), None)
         ev.append({"index": len(ev), "kind": "door", "xy": xy, "s": sc, "leg": leg})
+
+    span_len = max(float(span_frac) * total, 1e-9)
+    for g in legs:
+        k = max(1, int(round(g["arclen"] / span_len)))
+        for i in range(k):
+            s0 = g["s0"] + (i / k) * (g["s1"] - g["s0"])
+            s1 = g["s0"] + ((i + 1) / k) * (g["s1"] - g["s0"])
+            ev.append({"index": len(ev), "kind": "span",
+                       "xy": _at_s(traj, s, 0.5 * (s0 + s1)),
+                       "a": _at_s(traj, s, s0), "b": _at_s(traj, s, s1),
+                       "s0": float(s0), "s1": float(s1), "leg": g["leg"],
+                       "poly": _walked_piece(traj, s, s0, s1)})
     return ev
+
+
+def _at_s(traj: np.ndarray, s: np.ndarray, sc: float) -> np.ndarray:
+    """The walked point at arclength `sc` (linear along the sampled path)."""
+    return np.array([float(np.interp(sc, s, traj[:, 0])), float(np.interp(sc, s, traj[:, 1]))])
+
+
+def _walked_piece(traj: np.ndarray, s: np.ndarray, s0: float, s1: float) -> np.ndarray:
+    """The sampled walk between arclengths s0..s1, with both ends interpolated exactly.
+    Used by the span scan's crossing test, which must follow the REAL path (a leg chord
+    would cut corners and cross walls the walker walked around)."""
+    m = (s > s0 + 1e-9) & (s < s1 - 1e-9)
+    return np.vstack([_at_s(traj, s, s0)[None, :], traj[m], _at_s(traj, s, s1)[None, :]])
 
 
 def recon_summary(rev: list) -> dict:
@@ -425,11 +524,17 @@ def _prep_recon(rev: list) -> dict:
               np.asarray([e["xy"] for e in d], dtype=np.float64).reshape(-1, 2),
               np.asarray([e["a"] for e in g], dtype=np.float64).reshape(-1, 2),
               np.asarray([e["b"] for e in g], dtype=np.float64).reshape(-1, 2)]
+    # `n_events` counts ASSOCIABLE events only (corner/door/leg). Spans are a change
+    # report, never a landmark: including them would divide `inlier_ratio` by a number
+    # that has nothing to do with how much of the walk was explained, and the
+    # min_inlier_ratio gate would start rejecting matches for the resolution of their
+    # own change report. Measured: counting them turned 43 passing tests red.
     return {"corner": c, "door": d, "leg": g, "pts": np.vstack(blocks) if blocks else np.zeros((0, 2)),
             "n": (len(c), len(d), len(g)),
             "corner_turn": np.asarray([e["turn_deg"] for e in c], dtype=np.float64),
             "leg_arclen": np.asarray([e["arclen"] for e in g], dtype=np.float64),
-            "n_events": len(rev)}
+            "span": [e for e in rev if e["kind"] == "span"],
+            "n_events": len(c) + len(d) + len(g)}
 
 
 def _prep_plan(pev: list) -> dict:
@@ -592,6 +697,114 @@ def _associate(tf: dict, R: dict, P: dict, tol: dict, gates: dict, weights: dict
     return {"score": float(score), "matches": matches, "outliers": outliers,
             "n_inliers": len(matches), "residual": (resid_agg if resids else float("inf")),
             "corr": corr, "kinds": kinds, "coverage": float(coverage)}
+
+
+# --------------------------------------------------------------------------------------
+# SECTION 3b — span change scan (the CHANGE REPORT, never a verdict input)
+# --------------------------------------------------------------------------------------
+
+def _ray_hit(p, u, A, D, max_t: float) -> float:
+    """Distance from `p` along unit `u` to the nearest wall segment (A, A+D) it hits
+    within `max_t`, or inf. Vectorised over walls."""
+    den = u[0] * D[:, 1] - u[1] * D[:, 0]
+    ok = np.abs(den) > 1e-12
+    safe = np.where(ok, den, 1.0)
+    ap = A - p
+    t = (ap[:, 0] * D[:, 1] - ap[:, 1] * D[:, 0]) / safe
+    s = (ap[:, 0] * u[1] - ap[:, 1] * u[0]) / safe
+    m = ok & (t > 1e-6) & (t <= max_t) & (s >= -1e-9) & (s <= 1.0 + 1e-9)
+    return float(t[m].min()) if m.any() else float("inf")
+
+
+def _walk_traverses(poly, A, D, Ln, N, off, margin: float):
+    """Did this walked piece pass from one side of a drawing wall to the other, with more
+    than `margin` of walked clearance on BOTH sides, crossing inside the wall's extent?
+
+    Returns the traversal DEPTH (metres, the smaller of the two side clearances) or None.
+    The margin is what separates "we walked through this wall" from "we started at this
+    threshold": a walk that begins ON a corridor's end cap and moves inward touches that
+    wall at zero depth, and measured on the CORRECT plan that touch was the only thing
+    the crossing test ever reported (2 of 28 spans, both the walk's own ends)."""
+    if not len(A):
+        return None
+    sd = poly @ N.T - off[None, :]                       # (n_pts, n_walls) signed distance
+    hi, lo = sd.max(axis=0), sd.min(axis=0)
+    cand = (Ln > 1e-9) & (hi > margin) & (lo < -margin)
+    for w in np.nonzero(cand)[0]:
+        u, L = D[w] / Ln[w], Ln[w]
+        for i in range(len(poly) - 1):
+            a, b = sd[i, w], sd[i + 1, w]
+            if a == b or (a > 0.0) == (b > 0.0):
+                continue
+            q = poly[i] + (a / (a - b)) * (poly[i + 1] - poly[i])
+            if -1e-9 <= float((q - A[w]) @ u) / L <= 1.0 + 1e-9:
+                return float(min(hi[w], -lo[w]))
+    return None
+
+
+def _span_outliers(tf: dict, R: dict, P: dict, walls: np.ndarray, width_ref: float) -> list:
+    """The span change scan (see the SPAN CHANGE SCAN block for what it is FOR and what
+    it must never do). For one candidate transform, walks the drawing's own wall segments
+    against the walked path and returns one OUTLIER_FIELDS dict per piece of the walk the
+    drawing contradicts. Emits NOTHING when the drawing agrees — including nothing at all
+    when the skeleton carried no walls (an older skeleton is a missing measurement, not a
+    change: no fabrication).
+
+    Never touches score/residual/inliers: it runs after association and only appends to
+    the report."""
+    spans = R.get("span") or []
+    if not len(spans) or not len(walls):
+        return []
+    A, B = walls[:, 0], walls[:, 1]
+    D = B - A
+    Ln = np.linalg.norm(D, axis=1)
+    keep = Ln > 1e-9
+    A, D, Ln = A[keep], D[keep], Ln[keep]
+    if not len(A):
+        return []
+    N = np.stack([-D[:, 1], D[:, 0]], axis=1) / Ln[:, None]
+    off = np.einsum("wi,wi->w", A, N)
+    max_t = SPAN_RAY_MAX_WIDTHS * float(width_ref)
+
+    rows = []
+    for e in spans:
+        pts = apply_candidate_transform(tf, [e["xy"], e["a"], e["b"]])
+        p, a_t, b_t = pts[0], pts[1], pts[2]
+        d = b_t - a_t
+        L = float(np.linalg.norm(d))
+        if L < 1e-9:
+            continue
+        u = d / L
+        nl = np.array([-u[1], u[0]])
+        w_local = _ray_hit(p, nl, A, D, max_t) + _ray_hit(p, -nl, A, D, max_t)
+        depth = _walk_traverses(apply_candidate_transform(tf, e["poly"]), A, D, Ln, N, off,
+                                SPAN_CROSS_MARGIN)
+        rows.append((e, p, w_local, depth))
+
+    widths = np.asarray([r[2] for r in rows], dtype=np.float64)
+    fin = widths[np.isfinite(widths)]
+    # The walk's OWN median local width is the reference: most of any real walk runs
+    # through unchanged corridor, so the changed pieces are the ones that disagree with
+    # it. Falls back to the plan's median leg width when too few spans measured a width.
+    med = float(np.median(fin)) if len(fin) >= SPAN_MIN_WIDTH_SAMPLES else float(width_ref)
+
+    out = []
+    for e, p, w_local, depth in rows:
+        if depth is not None:
+            reason, resid = "walk_crosses_plan_wall", depth
+        elif np.isfinite(w_local) and abs(w_local - med) > SPAN_WIDTH_TOL:
+            reason, resid = "corridor_width_mismatch", abs(w_local - med)
+        else:
+            continue                                     # the drawing agrees here
+        pid = None
+        if len(P["leg_a"]):
+            lat = _pt_line(p[None, :], P["leg_a"], P["leg_dir"], P["leg_len"])[0][0]
+            j = int(np.argmin(lat))
+            if float(lat[j]) <= max_t:
+                pid = P["leg"][j]["id"]
+        out.append({"kind": "span", "event_index": int(e["index"]), "plan_event_id": pid,
+                    "residual": round(float(resid), 4), "reason": reason})
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -906,6 +1119,10 @@ def coarse_match(skel: dict, traj_xz, door_s=None, gates=None, tol=None, weights
     rev = recon_events(traj_xz, door_s=door_s, **(recon_kwargs or {}))
     R = _prep_recon(rev)
     info["recon"] = recon_summary(rev)
+    # The drawing's raw walls, for the span change scan only (never for geometry). A
+    # skeleton without them simply gets no span report — see `_span_outliers`.
+    walls = np.asarray((skel or {}).get("walls") or [], dtype=np.float64).reshape(-1, 2, 2)
+    info["n_walls_for_span_scan"] = int(len(walls))
     t = _tolerances(P["width_med"], tol)
     info["tol"] = {k: round(float(v), 4) for k, v in t.items()}
     if not R["corner"] or not P["corner"]:
@@ -943,9 +1160,13 @@ def coarse_match(skel: dict, traj_xz, door_s=None, gates=None, tol=None, weights
     info["n_deduped"] = len(kept)
 
     def _cand(sc, tf, ass, method):
+        # `score`, `n_inliers`, `n_events`, `residual` are the association's, untouched;
+        # the span scan only ADDS report rows (SPAN CHANGE SCAN block).
         return make_candidate(tf, score=sc, n_inliers=ass["n_inliers"], n_events=R["n_events"],
                               residual=ass["residual"], matches=ass["matches"],
-                              outliers=ass["outliers"], method=method)
+                              outliers=ass["outliers"] + _span_outliers(tf, R, P, walls,
+                                                                        P["width_med"]),
+                              method=method)
 
     in_band, out_band = [], []
     for sc, tf, ass, method in kept:
