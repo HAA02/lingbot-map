@@ -1261,10 +1261,22 @@ def _upload_video_path(upload_id: str) -> Path | None:
     return None
 
 
+_DEMO_MIN_BYTES = 1_000_000
+
+
 def _demo_video_path(upload_id: str) -> Path | None:
-    """Browser-playable point-cloud demo render (H.264) for an upload, if built."""
+    """Browser-playable point-cloud demo render (H.264) for an upload, if built.
+
+    A truncated render (interrupted ffmpeg leaves a tiny file) must NOT count as
+    built: exists() alone would satisfy the caller, the raw-upload fallback would
+    be skipped, and the PiP would show a black frame instead of the footage. Real
+    renders are tens of MB, so anything under _DEMO_MIN_BYTES is treated as absent.
+    """
     p = UPLOAD_DIR / "_demo" / upload_id / f"{upload_id}_demo_format.mp4"
-    return p if p.exists() else None
+    try:
+        return p if p.stat().st_size >= _DEMO_MIN_BYTES else None
+    except OSError:
+        return None
 
 
 def _upload_ts_ms(upload_id: str) -> int:
