@@ -937,7 +937,7 @@ def _door_evidence(traj_xz, pose_times, door_times, skel_info=None):
     return door_s, diag
 
 
-def _plan_match_auto(dxf_path, traj_xz, door_times=None, pose_times=None):
+def _plan_match_auto(dxf_path, traj_xz, door_times=None, pose_times=None, s_h_prior=None):
     """Run the P1-Match coarse matcher (scan2bim.coarse_match) against the --dxf plan
     skeleton (scan2bim.plan_skeleton) for --plan-match auto.
 
@@ -963,7 +963,12 @@ def _plan_match_auto(dxf_path, traj_xz, door_times=None, pose_times=None):
     from scan2bim.coarse_match import coarse_match
     skel = ps.plan_skeleton(dxf_path)
     door_s, door_diag = _door_evidence(traj_xz, pose_times, door_times, skel.get("info", {}))
-    result = coarse_match(skel, traj_xz, door_s=door_s)
+    # s_h_prior: 독립 횡방향 스케일 앵커(복도폭 벽 앵커/DXF 폭)가 있을 때만 전달한다. coarse_match 는
+    # 이 값 ±25% 밖의 후보를 대역 밖으로 버린다 — DEFAULT_SCALE_BAND(0.05~50, 사실상 무제한)를
+    # 실측 앵커로 좁히는 유일한 경로. s_h 가 s_v 폴백이거나 --horizontal-scale-override(다운스트림 격리용,
+    # 매처에 영향 주지 않아야 함)면 전달하지 않는다.
+    result = (coarse_match(skel, traj_xz, door_s=door_s, s_h_prior=float(s_h_prior))
+              if s_h_prior else coarse_match(skel, traj_xz, door_s=door_s))
     ok, errs = ps.validate_match_result(result)
     if not ok:
         raise RuntimeError(
@@ -1297,7 +1302,10 @@ def place_rigid(poses, scan_pts, model_ceiling, bbox, fxx_file, anchor=None, dur
         pose_times = (np.linspace(0.0, float(duration), n)
                       if (duration and float(duration) > 0) else None)
         match_result = _plan_match_auto(dxf_path, Cg0[:, [0, 2]], door_times=door_times,
-                                        pose_times=pose_times)
+                                        pose_times=pose_times,
+                                        s_h_prior=(s_h if (not fallback_reason and wall_info.get("source")
+                                                           not in (None, "manual_override_bypasses_detection"))
+                                                   else None))
         pm = dict(match_result)
         pm["accepted_candidate_id"] = None
         pm["applied"] = False
