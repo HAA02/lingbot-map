@@ -191,8 +191,34 @@ def resolve_duration(lbp2_path: Path, parsed: dict, duration_arg: float | None) 
 # matching the Y-up convention build_coplay.py uses for its DTDX-decoded bbox[1].
 # ---------------------------------------------------------------------------
 
+def _assert_draco_decodable(model_path: Path) -> None:
+    """GLB 가 KHR_draco_mesh_compression 을 쓰면 DracoPy 가 있어야 한다. 없으면 trimesh 가
+    정점을 전부 0 으로 디코딩해 bbox 가 조용히 무너진다(docs/glb-auto-mapping-review.md 의
+    '12 m 불일치' 원인: 173/173 geometry 가 all-zero). 조용한 실패 대신 즉시 실패한다."""
+    import json
+    import struct
+    with open(model_path, "rb") as fh:
+        head = fh.read(12)
+        if len(head) < 12 or head[:4] != b"glTF":
+            return
+        clen, ctype = struct.unpack("<II", fh.read(8))
+        if ctype != 0x4E4F534A:  # JSON
+            return
+        doc = json.loads(fh.read(clen))
+    used = set(doc.get("extensionsUsed", []) or []) | set(doc.get("extensionsRequired", []) or [])
+    if "KHR_draco_mesh_compression" in used:
+        try:
+            import DracoPy  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError(
+                f"{model_path.name} uses KHR_draco_mesh_compression; install DracoPy "
+                "(pip install DracoPy) or re-export the GLB uncompressed — without it trimesh "
+                "returns all-zero vertices and the bbox height is wrong") from e
+
+
 def model_bbox_height(model_path: Path) -> float:
     import trimesh
+    _assert_draco_decodable(Path(model_path))
     mesh = trimesh.load(str(model_path), process=False)
     if hasattr(mesh, "geometry"):  # trimesh.Scene
         verts = [g.vertices for g in mesh.geometry.values() if len(g.vertices)]

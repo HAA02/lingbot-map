@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-vis = ["viser>=0.2.23", "trimesh", "matplotlib", "onnxruntime", "requests"]
+vis = ["viser>=0.2.23", "trimesh", "DracoPy", "matplotlib", "onnxruntime", "requests"]
 demo = ["lingbot-map[vis]"]
 
 [build-system]

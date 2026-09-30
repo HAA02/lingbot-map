@@ -2141,7 +2141,7 @@ def _auto_place_candidates(
             "quality": quality,
             "stable": False,
             "rmse_m": None,
-            "scale": scale,
+            "scale": al["scale"],  # 탐색된 스케일(가이드 모드 scale search)을 저장 — 이전엔 입력 scale 이 저장돼 채점값과 불일치
             "rotation": al["rotation"],
             "translation": al["translation"],
             "n": 0,
