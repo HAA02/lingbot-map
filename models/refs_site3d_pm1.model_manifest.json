@@ -1,0 +1,54 @@
+{
+  "id": "refs_site3d_pm1",
+  "model_id": "refs_site3d_pm1",
+  "name": "refs_site3d_pm1",
+  "glb": "refs_site3d_pm1.glb",
+  "metadata": null,
+  "manifest": "refs_site3d_pm1.model_manifest.json",
+  "units": "m",
+  "unit_scale_to_m": 1.0,
+  "up_axis": "Z_UP",
+  "metadata_kind": "glb_native",
+  "glb_axis_transform": "gltf_yup_to_zup",
+  "object_count": 1,
+  "counts_by_category": {
+    "Building": 1
+  },
+  "glb_url": "/models/refs_site3d_pm1.glb",
+  "metadata_url": null,
+  "manifest_url": "/models/refs_site3d_pm1.model_manifest.json",
+  "manifest_valid": true,
+  "guid_mapping_ratio": 1.0,
+  "guid_mapping_status": "direct",
+  "guid_mapped_count": 1,
+  "guid_total": 1,
+  "fallback_geometry": "pag_proxy",
+  "fallback_geometry_count": 0,
+  "coverage_geometry_source": "glb_guid_mesh",
+  "glb_role": "coverage_geometry",
+  "proxy_geometry_bounds": {
+    "min": [
+      -0.9241499900817871,
+      -7.609910011291504,
+      -9.449999809265137
+    ],
+    "max": [
+      7.6077799797058105,
+      0.5299999713897705,
+      0.800000011920929
+    ],
+    "span": [
+      8.531929969787598,
+      8.139909982681274,
+      10.249999821186066
+    ],
+    "center": [
+      3.3418149948120117,
+      -3.5399550199508667,
+      -4.324999898672104
+    ],
+    "diagonal_m": 15.624162693399875
+  },
+  "glb_bytes": 4129284,
+  "metadata_bytes": 0
+}

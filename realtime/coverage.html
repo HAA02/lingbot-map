@@ -233,11 +233,14 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0f13);
-const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.01, 5000);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 800);
 camera.up.set(0, 0, 1);
 camera.position.set(8, -8, 8);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
+controls.minDistance = 0.6;
+controls.maxDistance = 400;
+controls.zoomSpeed = 0.85;
 scene.add(new THREE.AmbientLight(0xffffff, 0.75));
 const sun = new THREE.DirectionalLight(0xffffff, 0.8);
 sun.position.set(6, 10, 8);
@@ -628,7 +631,7 @@ function updatePairUi() {
   $('pickPairBtn').className = state.pickMode ? 'primary' : '';
   $('pickHint').textContent = state.pendingPair?.scan
     ? '모델 proxy에서 같은 위치를 클릭하면 대응점이 저장됩니다.'
-    : (state.pickMode ? '스캔 GLB 또는 점군에서 기준점을 먼저 클릭하세요.' : '대응점 찍기를 켜면 스캔 GLB/점군 -> 모델 proxy 순서로 클릭합니다.');
+    : (state.pickMode ? '스캔 GLB 또는 점군에서 기준점을 먼저 클릭하세요.' : '대응점 찍기를 켜면 스캔 GLB/점군 -> 모델 proxy 순서로 클릭합니다. 자동 배치가 HOLD/red이면 여기로 승격합니다.');
   const list = $('pairList');
   const alignment = currentAlignment();
   const residuals = Array.isArray(alignment?.per_point_residuals) ? alignment.per_point_residuals : [];
@@ -1488,9 +1491,14 @@ async function autoPlaceAlignment() {
   if (autos.length) {
     const idx = (j.candidates || []).indexOf(autos[0]);
     previewAlignmentCandidate(idx >= 0 ? idx : 0);
-    setStatus(`자동 배치 후보 ${autos.length}개 · 1순위 미리보기 적용 · 확인 후 저장하세요`, 'warn');
+    const saveable = autos.filter(c => c.can_save);
+    if (saveable.length) {
+      setStatus(`자동 배치 후보 ${autos.length}개 · 저장 가능 ${saveable.length}개 · 1순위 미리보기 · 확인 후 저장하세요`, 'warn');
+    } else {
+      setStatus('자동 배치 후보는 미리보기만 · 저장 불가(red/HOLD) · 대응점 4개 이상으로 승격하세요', 'bad');
+    }
   } else {
-    setStatus('자동 배치 후보 없음 · 대응점 또는 시작 힌트가 필요합니다', 'bad');
+    setStatus('자동 배치 후보 없음 · 대응점 4개 이상으로 승격하세요', 'bad');
   }
 }
 
@@ -1747,8 +1755,15 @@ function fitView() {
   const center = box.getCenter(new THREE.Vector3());
   const size = box.getSize(new THREE.Vector3());
   const span = Math.max(size.x, size.y, size.z, 1);
+  if (!Number.isFinite(span) || span > 1e6) return;
   camera.position.set(center.x + span * 0.75, center.y - span * 0.85, center.z + span * 0.65);
   controls.target.copy(center);
+  const dist = camera.position.distanceTo(controls.target);
+  controls.minDistance = Math.max(0.6, span * 0.015);
+  controls.maxDistance = Math.max(120, span * 6);
+  camera.near = Math.max(0.05, dist / 80);
+  camera.far = Math.max(400, dist * 25, span * 8);
+  camera.updateProjectionMatrix();
   controls.update();
 }
 
@@ -1914,7 +1929,7 @@ async function handleStartPick(e) {
   }
   // ② 방향
   const dx = p.x - state.startHint[0], dy = p.y - state.startHint[1];
-  if (Math.hypot(dx, dy) < 0.3) {
+  if (Math.hypot(dx, dy) < 0.3) { // keep in sync with START_DIR_MIN_SEP_M
     setStatus('시작점과 더 떨어진 방향 지점을 클릭하세요', 'warn');
     return;
   }
@@ -2361,6 +2376,17 @@ async function init() {
 
 function animate() {
   requestAnimationFrame(animate);
+  const d = camera.position.distanceTo(controls.target);
+  if (!Number.isFinite(d) || d < 0.25) fitView();
+  else {
+    const near = Math.max(0.05, Math.min(1.5, d / 80));
+    const far = Math.max(400, d * 25);
+    if (Math.abs(camera.near - near) > 0.01 || Math.abs(camera.far - far) > 1) {
+      camera.near = near;
+      camera.far = far;
+      camera.updateProjectionMatrix();
+    }
+  }
   controls.update();
   renderer.render(scene, camera);
 }
@@ -2370,6 +2396,7 @@ addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
 });
+addEventListener('wheel', e => { if (e.ctrlKey) e.preventDefault(); }, { passive: false });
 
 // 헤드리스/개발 검증용 디버그 훅 (UI 영향 없음)
 window.__cov = { scene, groups, state, camera, controls, THREE, applyModelOpacity, fitView, loadModel };

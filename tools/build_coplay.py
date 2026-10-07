@@ -138,6 +138,12 @@ updCtl(); rebuildPath(); setFrame(0);
 {const _md=Math.max(sz.x,sz.y,sz.z),_fv=camera.fov*Math.PI/180,_d=Math.abs(_md/Math.sin(_fv/2))*0.85;
  camera.position.set(c0.x+_d*0.612,c0.y+_d*0.5,c0.z+_d*0.612); camera.up.set(0,1,0);}
 controls.target.copy(c0); controls.update();
+/* cov-orbit-clip */
+function _camOk(){return Number.isFinite(camera.position.x)&&Number.isFinite(controls.target.x)&&camera.position.distanceTo(controls.target)>0.25;}
+function _clipCam(){const d=Math.max(0.5,camera.position.distanceTo(controls.target));const near=Math.max(0.05,Math.min(1.5,d/80));const far=Math.max(400,d*25,Math.max(sz.x,sz.y,sz.z,1)*8);if(Math.abs(camera.near-near)>0.01||Math.abs(camera.far-far)>1){camera.near=near;camera.far=far;camera.updateProjectionMatrix();}}
+function _reframe(){const _md=Math.max(Math.max(sz.x,sz.y,sz.z),1);const _fv=camera.fov*Math.PI/180;const _d=Math.abs(_md/Math.sin(_fv/2))*0.85;camera.position.set(c0.x+_d*0.612,c0.y+_d*0.5,c0.z+_d*0.612);camera.up.set(0,1,0);controls.target.copy(c0);controls.update();_clipCam();}
+{const span=Math.max(sz.x,sz.y,sz.z,1);controls.minDistance=Math.max(0.6,span*0.015);controls.maxDistance=Math.max(120,span*6);controls.zoomSpeed=0.85;controls.maxPolarAngle=Math.PI*0.92;_clipCam();}
+addEventListener('wheel',e=>{if(e.ctrlKey)e.preventDefault();},{passive:false});
 renderer.domElement.addEventListener('click',e=>{ if(!placeMode)return;
   const rc=renderer.domElement.getBoundingClientRect();mouse.x=((e.clientX-rc.left)/rc.width)*2-1;mouse.y=-((e.clientY-rc.top)/rc.height)*2+1;raycaster.setFromCamera(mouse,camera);
   const hits=raycaster.intersectObjects(MESH_OBJS.map(o=>o.mesh),false);
@@ -162,16 +168,16 @@ addEventListener('mouseup',()=>{drag=null;rsz=null;});
 document.getElementById('pmin').onclick=()=>pip.classList.toggle('min');
 const rvid=document.getElementById('rvid'),seek=document.getElementById('seek'),tlab=document.getElementById('t'),playb=document.getElementById('play');
 let dur=Math.max(META.duration||1,0.1); rvid.addEventListener('loadedmetadata',()=>{dur=rvid.duration||dur;});
-playb.onclick=()=>{ if(rvid.paused){rvid.play();playb.textContent='⏸ 일시정지';}else{rvid.pause();playb.textContent='▶ 재생';} };
+playb.onclick=()=>{ const d=camera.position.distanceTo(controls.target);if(!_camOk()||d<controls.minDistance*1.05||d>controls.maxDistance*0.98)_reframe(); if(rvid.paused){const p=rvid.play();if(p&&p.catch)p.catch(()=>{});playb.textContent='⏸ 일시정지';}else{rvid.pause();playb.textContent='▶ 재생';} };
 seek.oninput=()=>{rvid.currentTime=(seek.value/1000)*dur;};
 function sync(t){const fr=Math.max(0,Math.min(1,t/dur));seek.value=Math.round(fr*1000);tlab.textContent=t.toFixed(1)+'s';setFrame(Math.round(fr*(RAWP.length-1)));}
 addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
-function loop(){requestAnimationFrame(loop);sync(rvid.currentTime||0);
+function loop(){requestAnimationFrame(loop);sync(rvid.currentTime||0);if(!_camOk())_reframe();_clipCam();
   if(followCam&&!placeMode){camera.position.lerp(_fe,0.12);_lt.lerp(_fl,0.12);camera.up.lerp(_fu,0.12);camera.lookAt(_lt);}
   else if(!placeMode){controls.update();}
   renderer.render(scene,camera);}
 loop();
-window.__coplay={scene,camera,box,RAWP,setFrame,setFollow:v=>{followCam=!!v;updCtl();}};
+window.__coplay={scene,camera,controls,box,RAWP,setFrame,setFollow:v=>{followCam=!!v;updCtl();}};
 </script></body></html>"""
 
 

@@ -190,12 +190,14 @@ def _serve_per_upload_coplay(upload: str) -> HTMLResponse:
     """Serve a built per-upload coplay.html, rewriting the PiP <video> src to the
     upload's video API so poses and footage come from the SAME upload."""
     import re as _re
+    from coplay_orbit_fix import apply_coplay_orbit_clip
     content = (UPLOAD_DIR / f"{upload}.coplay.html").read_text(encoding="utf-8")
     content = _re.sub(
         r'(<video\b[^>]*\s+src=")[^"]*(")',
         f'\\1/api/uploads/{upload}/video\\2',
         content,
     )
+    content = apply_coplay_orbit_clip(content)
     return HTMLResponse(content, headers={"Cache-Control": "no-store"})
 
 
@@ -230,7 +232,11 @@ async def coplay_page(upload: str | None = None):
     fallback = ROOT / "coplay.html"
     if not fallback.exists():
         return HTMLResponse("<html><body>coplay.html not found</body></html>", status_code=404)
-    return FileResponse(fallback, headers={"Cache-Control": "no-store"})
+    from coplay_orbit_fix import apply_coplay_orbit_clip
+    return HTMLResponse(
+        apply_coplay_orbit_clip(fallback.read_text(encoding="utf-8")),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/coplay.html", response_class=HTMLResponse)
@@ -2055,14 +2061,11 @@ def _auto_place_candidates(
         # primary(최대 분산) 수평 주축 1개만 사용한다. 양 직교 축을 모두 쓰면 90도 모호성으로
         # 사용자 방향이 상쇄돼 무의미해진다. flip(±180)은 PCA 축의 부호 모호성 보정용.
         sax = float(np.degrees(np.arctan2(evecs[1, 1], evecs[0, 1])) % 180.0)
-        m = float(direction_az) % 180.0
-        cand_yaws = set()
-        for flip in (0.0, 180.0):
-            base = (m - sax + flip) % 360.0
-            for dd in (-8.0, -4.0, 0.0, 4.0, 8.0):
-                cand_yaws.add(round((base + dd) % 360.0, 1))
-        yaws = sorted(cand_yaws)
-        warnings.append(f"yaw from user direction {round(m,1)}deg: {len(yaws)} candidates")
+        from lingbot_map.bim.alignment import yaw_candidates_from_user_direction
+        yaws = yaw_candidates_from_user_direction(direction_az, sax)
+        warnings.append(
+            f"yaw from user direction {round(float(direction_az) % 180.0, 1)}deg: {len(yaws)} candidates"
+        )
     elif lin_dirs and len(sub_score) >= 100:
         hist36 = np.zeros(36)
         for az, w in lin_dirs:
@@ -2137,17 +2140,8 @@ def _auto_place_candidates(
         final = _corroborate_alignment(sub_score, tree, al, max_points=20_000, sample_radii=sample_radii)
         # 표면 거리 척도 기준 캘리브레이션: +3m 오배치가 yellow를 통과하지 못하는 값
         quality = "yellow" if (final.get("median_nn_m", 9e9) <= 0.25 and final.get("inlier_ratio", 0.0) >= 0.50) else "red"
-        alignment = {
-            "quality": quality,
-            "stable": False,
-            "rmse_m": None,
-            "scale": scale,
-            "rotation": al["rotation"],
-            "translation": al["translation"],
-            "n": 0,
-            "note": "auto_geometric_gravity_aligned",
-            "pairs": [],
-        }
+        from lingbot_map.bim.alignment import auto_geometric_alignment_record
+        alignment = auto_geometric_alignment_record(al, quality)
         cand = _candidate_from_alignment(
             candidate_id=f"auto:{rank}",
             source="auto_geometric",
@@ -2317,87 +2311,13 @@ def _linear_hit_metrics(ts: np.ndarray, hit: np.ndarray, *, bins: int = 8) -> di
 
 
 def _correspondence_spread(points: np.ndarray) -> dict:
-    pts = np.asarray(points, dtype=np.float64)
-    if pts.size == 0:
-        return {"extent_m": 0.0, "rms_radius_m": 0.0, "rank": 0, "singular_values": []}
-    centered = pts - pts.mean(axis=0)
-    extent = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
-    rms = float(np.sqrt((centered ** 2).sum(axis=1).mean())) if pts.shape[0] else 0.0
-    if pts.shape[0] >= 2:
-        singular = np.linalg.svd(centered, compute_uv=False)
-        rel = singular / max(float(singular[0]), 1e-9)
-        rank = int((rel > 0.08).sum())
-    else:
-        singular = np.zeros(0, dtype=np.float64)
-        rank = 0
-    return {
-        "extent_m": extent,
-        "rms_radius_m": rms,
-        "rank": rank,
-        "singular_values": singular.astype(float).tolist(),
-    }
+    from lingbot_map.bim.alignment import correspondence_spread
+    return correspondence_spread(points)
 
 
 def _solve_scan_to_model_alignment(pairs: list[dict]) -> dict:
-    if len(pairs) < 4:
-        return {
-            "quality": "red",
-            "stable": False,
-            "rmse_m": None,
-            "scale": 1.0,
-            "rotation": np.eye(3).tolist(),
-            "translation": [0, 0, 0],
-            "n": len(pairs),
-            "note": "need >=4 correspondences; using identity for preview",
-        }
-    from lingbot_map.bim.alignment import solve_sim3_umeyama
-    src = np.asarray([p["scan"] for p in pairs], dtype=np.float64)
-    dst = np.asarray([p["model"] for p in pairs], dtype=np.float64)
-    src_spread = _correspondence_spread(src)
-    dst_spread = _correspondence_spread(dst)
-    spread_ok = (
-        src_spread["extent_m"] >= 0.15
-        and dst_spread["extent_m"] >= 0.50
-        and src_spread["rank"] >= 2
-        and dst_spread["rank"] >= 2
-    )
-    result = solve_sim3_umeyama(src, dst, rmse_green=0.10, rmse_yellow=0.25)
-    loo_errors = []
-    if len(pairs) >= 5:
-        for i in range(len(pairs)):
-            keep = [j for j in range(len(pairs)) if j != i]
-            r = solve_sim3_umeyama(src[keep], dst[keep], rmse_green=0.10, rmse_yellow=0.25)
-            pred = r.transform.apply(src[i])
-            loo_errors.append(float(np.linalg.norm(pred - dst[i])))
-    max_loo = max(loo_errors) if loo_errors else float(result.rmse)
-    quality = "red" if result.quality == "review" else result.quality
-    stable = bool(max_loo <= max(0.25, float(result.rmse) * 2.5))
-    if not stable and quality == "green":
-        quality = "yellow"
-    if not stable and quality == "yellow":
-        quality = "red"
-    spread_note = None
-    if not spread_ok:
-        quality = "red"
-        stable = False
-        spread_note = "correspondence points are too clustered or near-collinear; distribute points across the scan/model area"
-    return {
-        "quality": quality,
-        "stable": stable,
-        "rmse_m": float(result.rmse),
-        "max_leave_one_out_rmse_m": max_loo,
-        "correspondence_spread": {
-            "ok": spread_ok,
-            "scan": src_spread,
-            "model": dst_spread,
-            "note": spread_note,
-        },
-        "scale": float(result.transform.scale),
-        "rotation": result.transform.rotation.tolist(),
-        "translation": result.transform.translation.tolist(),
-        "n": int(result.n_correspondences),
-        "per_point_residuals": result.per_point_residuals.tolist(),
-    }
+    from lingbot_map.bim.alignment import solve_scan_to_model_alignment
+    return solve_scan_to_model_alignment(pairs)
 
 
 def _normalize_alignment_pairs(raw_pairs) -> list[dict]:
@@ -3362,7 +3282,8 @@ async def analyze_coverage(upload_id: str, payload: dict):
                     status_code=409,
                 )
             alignment_source = "saved_alignment"
-        if alignment.get("quality") == "red":
+        from lingbot_map.bim.alignment import alignment_permits_coverage_analysis
+        if not alignment_permits_coverage_analysis(alignment):
             return JSONResponse(
                 {
                     "ok": False,
